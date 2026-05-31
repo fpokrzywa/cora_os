@@ -1,0 +1,34 @@
+# ---- Secrets / environment ----
+.env
+.env.*
+!.env.example
+
+# ---- Python (cora-api, mcp servers) ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.Python
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+
+# ---- Node / frontend (cora-ui) ----
+node_modules/
+apps/cora-ui/dist/
+*.log
+npm-debug.log*
+
+# ---- Database dumps / backups (large, may contain data) ----
+*.sql
+*.dump
+*.sqlite
+
+# ---- OS / editor cruft ----
+.DS_Store
+Thumbs.db
+*.swp

@@ -1,0 +1,22 @@
+# Cora SearXNG — internal-only metasearch backing PULSE's web_search tool.
+# Not publicly exposed; reachable only on cora-internal as http://searxng:8080.
+use_default_settings: true
+
+general:
+  instance_name: "Cora PULSE Search"
+
+server:
+  # Placeholder — the searxng image entrypoint substitutes $SEARXNG_SECRET here.
+  secret_key: "8b2e557f58c41d421f608abbd1717e291e3e0fec77d81936233bead4108711c3"
+  # Internal server-to-server JSON calls only; disable bot-detection/limiter so
+  # the web_search runner isn't blocked, and keep the instance private.
+  limiter: false
+  public_instance: false
+  image_proxy: true
+
+search:
+  safe_search: 1
+  # The JSON format is required for the web_search runner; off by default.
+  formats:
+    - html
+    - json

@@ -1,0 +1,265 @@
+services:
+  cora-postgres:
+    # pgvector-enabled Postgres 16. Reuses the existing cluster volume from
+    # cora-stack, so the existing cora/n8n databases and all data are
+    # preserved across the image swap. A backup exists at
+    # ~/cora-ai-os/cora_backup_before_pgvector.sql.
+    image: pgvector/pgvector:pg16
+    container_name: cora-postgres
+    restart: unless-stopped
+    environment:
+      # Bootstrap-only — ignored on the existing PGDATA. The on-disk cluster
+      # already has the cora + n8n roles + databases.
+      POSTGRES_USER: ${POSTGRES_USER:-cora}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-cora}
+      PGDATA: /var/lib/postgresql/data
+    volumes:
+      - cora-stack_postgres_data:/var/lib/postgresql/data
+    networks:
+      cora-internal:
+        aliases:
+          - postgres
+          - cora-postgres
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - "pg_isready -U \"$${POSTGRES_USER:-cora}\" -d \"$${POSTGRES_DB:-cora}\" -h 127.0.0.1"
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  cora-api:
+    build:
+      context: ./apps/cora-api
+      dockerfile: Dockerfile
+    image: cora-api:latest
+    container_name: cora-api
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      CORA_ENV: ${CORA_ENV}
+      DGX_MODEL_ENDPOINT: ${DGX_MODEL_ENDPOINT}
+      DGX_MODEL_PROVIDER: ${DGX_MODEL_PROVIDER}
+      DGX_MODEL_NAME: ${DGX_MODEL_NAME}
+      N8N_WEBHOOK_HEALTH_URL: ${N8N_WEBHOOK_HEALTH_URL:-http://n8n:5678/webhook/cora-health}
+      EMBEDDING_ENDPOINT: ${EMBEDDING_ENDPOINT}
+      EMBEDDING_MODEL_NAME: ${EMBEDDING_MODEL_NAME}
+      EMBEDDING_DIM: ${EMBEDDING_DIM}
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_EXPIRES_MINUTES: ${JWT_EXPIRES_MINUTES:-10080}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      SEARXNG_ENDPOINT: ${SEARXNG_ENDPOINT:-http://searxng:8080}
+      WEB_SEARCH_MAX_RESULTS: ${WEB_SEARCH_MAX_RESULTS:-6}
+      CORA_TIMEZONE: ${CORA_TIMEZONE:-UTC}
+      CORA_CREDENTIAL_ENC_KEY: ${CORA_CREDENTIAL_ENC_KEY:-}
+      EXTERNAL_EXECUTION_ENABLED: ${EXTERNAL_EXECUTION_ENABLED:-false}
+      GOOGLE_OAUTH_CLIENT_ID: ${GOOGLE_OAUTH_CLIENT_ID:-}
+      GOOGLE_OAUTH_CLIENT_SECRET: ${GOOGLE_OAUTH_CLIENT_SECRET:-}
+      GOOGLE_OAUTH_REDIRECT_URI: ${GOOGLE_OAUTH_REDIRECT_URI:-}
+      MICROSOFT_OAUTH_CLIENT_ID: ${MICROSOFT_OAUTH_CLIENT_ID:-}
+      MICROSOFT_OAUTH_CLIENT_SECRET: ${MICROSOFT_OAUTH_CLIENT_SECRET:-}
+      MICROSOFT_OAUTH_REDIRECT_URI: ${MICROSOFT_OAUTH_REDIRECT_URI:-}
+    networks:
+      - cora-internal
+      - cora-proxy
+    ports:
+      - "8000:8000"
+    depends_on:
+      cora-postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  cora-worker:
+    build:
+      context: ./apps/cora-api
+      dockerfile: Dockerfile
+    image: cora-api:latest
+    container_name: cora-worker
+    restart: unless-stopped
+    command: ["python", "-m", "app.worker"]
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      CORA_ENV: ${CORA_ENV}
+      DGX_MODEL_ENDPOINT: ${DGX_MODEL_ENDPOINT}
+      DGX_MODEL_PROVIDER: ${DGX_MODEL_PROVIDER}
+      DGX_MODEL_NAME: ${DGX_MODEL_NAME}
+      N8N_WEBHOOK_HEALTH_URL: ${N8N_WEBHOOK_HEALTH_URL:-http://n8n:5678/webhook/cora-health}
+      EMBEDDING_ENDPOINT: ${EMBEDDING_ENDPOINT}
+      EMBEDDING_MODEL_NAME: ${EMBEDDING_MODEL_NAME}
+      EMBEDDING_DIM: ${EMBEDDING_DIM}
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_EXPIRES_MINUTES: ${JWT_EXPIRES_MINUTES:-10080}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      WORKER_POLL_INTERVAL_SECONDS: ${WORKER_POLL_INTERVAL_SECONDS:-5}
+      CORA_TIMEZONE: ${CORA_TIMEZONE:-UTC}
+      CORA_CREDENTIAL_ENC_KEY: ${CORA_CREDENTIAL_ENC_KEY:-}
+      EXTERNAL_EXECUTION_ENABLED: ${EXTERNAL_EXECUTION_ENABLED:-false}
+      GOOGLE_OAUTH_CLIENT_ID: ${GOOGLE_OAUTH_CLIENT_ID:-}
+      GOOGLE_OAUTH_CLIENT_SECRET: ${GOOGLE_OAUTH_CLIENT_SECRET:-}
+      GOOGLE_OAUTH_REDIRECT_URI: ${GOOGLE_OAUTH_REDIRECT_URI:-}
+      MICROSOFT_OAUTH_CLIENT_ID: ${MICROSOFT_OAUTH_CLIENT_ID:-}
+      MICROSOFT_OAUTH_CLIENT_SECRET: ${MICROSOFT_OAUTH_CLIENT_SECRET:-}
+      MICROSOFT_OAUTH_REDIRECT_URI: ${MICROSOFT_OAUTH_REDIRECT_URI:-}
+    networks:
+      - cora-internal
+    depends_on:
+      cora-postgres:
+        condition: service_healthy
+      cora-api:
+        condition: service_started
+    healthcheck:
+      # The worker serves no HTTP; override the image's curl :8000/health
+      # check with a heartbeat-file freshness check.
+      test: ["CMD", "python", "-m", "app.healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  cora-ui:
+    build:
+      context: ./apps/cora-ui
+      dockerfile: Dockerfile
+      args:
+        VITE_CORA_API_URL: ${CORA_API_URL:-http://api.cora.local.arpa}
+    image: cora-ui:latest
+    container_name: cora-ui
+    restart: unless-stopped
+    networks:
+      cora-proxy:
+        aliases:
+          - cora-ui
+    expose:
+      - "80"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/ >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  mcp-filesystem:
+    build:
+      context: ./apps/mcp-filesystem
+      dockerfile: Dockerfile
+    image: cora-mcp-filesystem:latest
+    container_name: cora-mcp-filesystem
+    restart: unless-stopped
+    environment:
+      MCP_SERVER_NAME: cora-mcp-filesystem
+      MCP_WORKSPACE: /workspace
+    volumes:
+      - ./:/workspace:ro
+    networks:
+      cora-internal:
+        aliases:
+          - mcp-filesystem
+    expose:
+      - "3000"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:3000/health')\" || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  mcp-postgres:
+    build:
+      context: ./apps/mcp-placeholder
+      dockerfile: Dockerfile
+    image: cora-mcp-placeholder:latest
+    container_name: cora-mcp-postgres
+    restart: unless-stopped
+    environment:
+      MCP_SERVER_NAME: cora-mcp-postgres
+    networks:
+      cora-internal:
+        aliases:
+          - mcp-postgres
+    expose:
+      - "3000"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:3000/health')\" || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  mcp-github:
+    build:
+      context: ./apps/mcp-placeholder
+      dockerfile: Dockerfile
+    image: cora-mcp-placeholder:latest
+    container_name: cora-mcp-github
+    restart: unless-stopped
+    environment:
+      MCP_SERVER_NAME: cora-mcp-github
+    networks:
+      cora-internal:
+        aliases:
+          - mcp-github
+    expose:
+      - "3000"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:3000/health')\" || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  searxng:
+    # Self-hosted metasearch backing PULSE's web_search tool. Placed on
+    # cora-proxy (not cora-internal) because cora-internal is internal=true with
+    # no outbound egress, and SearXNG must reach the public web to query search
+    # engines. cora-api already shares cora-proxy, so it resolves `searxng`
+    # there. Not published through NPM — no proxy host, no host port.
+    image: searxng/searxng:latest
+    container_name: cora-searxng
+    restart: unless-stopped
+    environment:
+      SEARXNG_BASE_URL: http://searxng:8080/
+      SEARXNG_SECRET: ${SEARXNG_SECRET}
+      UWSGI_WORKERS: ${SEARXNG_UWSGI_WORKERS:-2}
+      UWSGI_THREADS: ${SEARXNG_UWSGI_THREADS:-4}
+    # Substitute the real secret from $SEARXNG_SECRET into the placeholder in the
+    # mounted settings.yml, then hand off to the image's normal entrypoint.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - 'sed -i "s|ultrasecretkey|$${SEARXNG_SECRET:-ultrasecretkey}|g" /etc/searxng/settings.yml 2>/dev/null || true; exec /usr/local/searxng/entrypoint.sh'
+    volumes:
+      - ./apps/searxng:/etc/searxng:rw
+    networks:
+      cora-proxy:
+        aliases:
+          - searxng
+    expose:
+      - "8080"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/healthz >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+networks:
+  cora-internal:
+    external: true
+  cora-proxy:
+    external: true
+
+volumes:
+  # Existing volume created by the cora-stack compose project; we attach to
+  # it rather than create a new one so postgres data is preserved.
+  cora-stack_postgres_data:
+    external: true
+    name: cora-stack_postgres_data
