@@ -8,6 +8,9 @@ from app.clients import clients
 from app.config import settings
 
 WORKER_HEARTBEAT_STALE_SECONDS = 30
+# The news scheduler ticks ~every 60s; allow a wider margin before flagging it.
+NEWS_SCHEDULER_STALE_SECONDS = 150
+_SCHEDULER_WORKER_SUFFIX = ":news-scheduler"
 
 logger = logging.getLogger(__name__)
 
@@ -87,9 +90,21 @@ async def worker_health() -> JSONResponse:
                 SELECT worker_id, last_heartbeat_at, last_job_id,
                        last_job_at, started_at
                 FROM worker_heartbeats
+                WHERE worker_id NOT LIKE '%' || $1
                 ORDER BY last_heartbeat_at DESC
                 LIMIT 1
+                """,
+                _SCHEDULER_WORKER_SUFFIX,
+            )
+            sched_row = await conn.fetchrow(
                 """
+                SELECT worker_id, last_heartbeat_at, last_job_at
+                FROM worker_heartbeats
+                WHERE worker_id LIKE '%' || $1
+                ORDER BY last_heartbeat_at DESC
+                LIMIT 1
+                """,
+                _SCHEDULER_WORKER_SUFFIX,
             )
     except Exception as exc:
         logger.exception("worker health check failed")
@@ -125,6 +140,23 @@ async def worker_health() -> JSONResponse:
         "last_job_id": str(row["last_job_id"]) if row["last_job_id"] else None,
         "started_at": row["started_at"].isoformat(),
     }
+    if sched_row is None:
+        payload["news_scheduler"] = {"status": "no-tick"}
+    else:
+        sched_age = (
+            datetime.now(timezone.utc) - sched_row["last_heartbeat_at"]
+        ).total_seconds()
+        payload["news_scheduler"] = {
+            "status": "stale" if sched_age > NEWS_SCHEDULER_STALE_SECONDS else "ok",
+            "last_tick_age_seconds": round(sched_age, 1),
+            "stale_threshold_seconds": NEWS_SCHEDULER_STALE_SECONDS,
+            "last_tick_at": sched_row["last_heartbeat_at"].isoformat(),
+            "last_enqueued_at": (
+                sched_row["last_job_at"].isoformat()
+                if sched_row["last_job_at"]
+                else None
+            ),
+        }
     return JSONResponse(
         status_code=(
             status.HTTP_503_SERVICE_UNAVAILABLE if stale else status.HTTP_200_OK

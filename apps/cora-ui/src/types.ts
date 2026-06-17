@@ -783,40 +783,6 @@ export interface RuntimeTrace {
   created_at: string;
 }
 
-export interface NewsSource {
-  id: string;
-  workspace_id: string | null;
-  name: string;
-  feed_url: string;
-  category: string | null;
-  enabled: boolean;
-  last_fetched_at: string | null;
-  last_status: string | null;
-  last_error: string | null;
-  last_article_count: number;
-  total_article_count: number;
-  created_at: string;
-  updated_at: string;
-}
-
-export interface NewsFetchResult {
-  source_id: string;
-  name: string;
-  status: string;
-  entries_seen: number;
-  ingested: number;
-  duplicates: number;
-  embedded: number;
-  error: string | null;
-}
-
-export interface NewsArticle {
-  id: string;
-  title: string;
-  source_url: string | null;
-  created_at: string;
-}
-
 // ---------- SIGNAL communication drafts (Governed Tool Planning v0.1) ----------
 // Review-only. No send path; status stays within draft/reviewed/approved/archived.
 

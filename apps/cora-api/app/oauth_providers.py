@@ -38,7 +38,10 @@ PROVIDERS: dict[str, OAuthProvider] = {
         vendor="google",
         authorize_url=_GOOGLE_AUTH,
         token_url=_GOOGLE_TOKEN,
-        scopes=["https://www.googleapis.com/auth/gmail.send"],
+        # gmail.readonly enables the governed v2.7 inbox read (still gated by
+        # the inbox_read feature flag); granting a scope enables nothing alone.
+        scopes=["https://www.googleapis.com/auth/gmail.send",
+                "https://www.googleapis.com/auth/gmail.readonly"],
         requires_refresh_token=True,
         extra_authorize_params={"access_type": "offline", "prompt": "consent"},
     ),
@@ -58,7 +61,9 @@ PROVIDERS: dict[str, OAuthProvider] = {
         vendor="microsoft",
         authorize_url=_MS_AUTH,
         token_url=_MS_TOKEN,
-        scopes=["https://graph.microsoft.com/Mail.Send", "offline_access"],
+        # Mail.Read enables the governed v2.7 inbox read (flag-gated).
+        scopes=["https://graph.microsoft.com/Mail.Send",
+                "https://graph.microsoft.com/Mail.Read", "offline_access"],
         requires_refresh_token=True,
     ),
     "outlook_calendar": OAuthProvider(

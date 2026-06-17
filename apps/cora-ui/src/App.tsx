@@ -5,6 +5,7 @@ import { MemoryViewer } from "./components/MemoryViewer";
 import { Login } from "./components/Login";
 import { AdminConsole } from "./components/AdminConsole";
 import { listWorkspaces } from "./api";
+import { setScreenView } from "./screenContext";
 import type { Workspace } from "./types";
 
 const WORKSPACE_STORAGE_KEY = "cora_workspace_id";
@@ -48,6 +49,12 @@ export function App() {
   const [selectedMemoryId, setSelectedMemoryId] = useState<string | null>(null);
   const [viewMode, setViewMode] = useState<ViewMode>("chat");
   const [impersonating, setImpersonating] = useState<boolean>(false);
+
+  // Report the chat view for screen-context awareness; the Admin Console
+  // reports its own tab/sub-tab state.
+  useEffect(() => {
+    if (viewMode === "chat") setScreenView("chat", "chat", "Chat");
+  }, [viewMode]);
   const [selectedAgent, setSelectedAgent] = useState<string | null>(null);
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [currentWorkspaceId, setCurrentWorkspaceIdRaw] = useState<string | null>(

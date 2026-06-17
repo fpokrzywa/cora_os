@@ -1,27 +1,33 @@
-"""Chat-Native Inbox Assistant v2.3 — read-only inbox Q&A from chat.
+"""Chat-Native Inbox Assistant (v2.3 governance gate + v2.7 live read).
 
 Answer read-only mailbox questions — "Show my latest emails", "Search my inbox for
 emails from Mark", "Summarize unread emails", "Summarize this email thread", "Draft
 a reply to this email (do not send)". Access is GOVERNED and FAILS CLOSED: it
 requires the provider connected + a valid/refreshable token + the read scope
-(gmail.readonly / Mail.Read) present + an enabled `inbox_read` feature flag. None of
-those hold in this phase, so every inbox read is denied without calling any provider
-API. No send/reply/forward/delete/archive is ever performed; "draft a reply" creates
-an INTERNAL SIGNAL draft only, linked to the source email. No OAuth token is read or
-exposed. Inbox access is audited (inbox_access_events) + traced.
+(gmail.readonly / Mail.Read) present + an enabled `inbox_read` feature flag. With
+the gate passed, the token broker (`_get_access_token`) decrypts — refreshing via
+oauth_flow if expiring — the caller's OWN access token and hands it to the live
+read-only adapter for that single call; the token is never logged, traced, or
+included in any response. With the gate closed (the production default until an
+operator grants a read scope + enables the flag), every inbox read is denied
+without calling any provider API. No send/reply/forward/delete/archive is ever
+performed; "draft a reply" creates an INTERNAL SIGNAL draft only, linked to the
+source email. Inbox access is audited (inbox_access_events) + traced.
 """
 
 import logging
 import re
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from app.clients import clients
 from app import chat_email_lifecycle as cel
 from app import feature_flags as ff
 from app import inbox_adapters
+from app import oauth_flow
 from app import signal_tools
+from app.crypto import decrypt_secret
 from app.oauth_readiness import _scope_tail
 from app.runtime_traces import write_trace
 
@@ -34,6 +40,10 @@ TRACE_READ = "chat_inbox_message_read"
 TRACE_SUMMARY = "chat_inbox_summary_generated"
 TRACE_REPLY = "chat_inbox_draft_reply_created"
 TRACE_CAPABILITY_DENIED = "chat_inbox_capability_denied"
+TRACE_READ_FAILED = "chat_inbox_provider_read_failed"
+
+# Refresh the access token when it expires within this window.
+TOKEN_REFRESH_MARGIN_SECONDS = 120
 
 
 def _trunc(v, n=80):
@@ -139,6 +149,47 @@ async def _gate(provider: str, user_id: uuid.UUID) -> dict:
             "flag_ok": flag_ok, "reason": "; ".join(reasons) or "all checks pass"}
 
 
+async def _get_access_token(provider: str, user_id: uuid.UUID) -> Optional[str]:
+    """Token broker (v2.7) — only called AFTER `_gate` passes. Decrypts the
+    caller's own connected access token, refreshing first via oauth_flow when it
+    expires inside the margin and a refresh token exists. Returns None on any
+    failure (callers deny gracefully). The plaintext token is handed straight to
+    the adapter call — never logged, traced, stored, or rendered."""
+    pool = clients.db_pool
+
+    async def _fetch():
+        async with pool.acquire() as conn:
+            return await conn.fetchrow(
+                "SELECT access_token_encrypted, token_expires_at, "
+                "(refresh_token_encrypted IS NOT NULL) AS has_refresh "
+                "FROM provider_oauth_connectors WHERE user_id=$1 AND provider_name=$2 "
+                "AND status='connected' ORDER BY created_at DESC LIMIT 1",
+                user_id, provider)
+
+    row = await _fetch()
+    if row is None:
+        return None
+    exp = row["token_expires_at"]
+    expiring = bool(exp and exp <= datetime.now(timezone.utc)
+                    + timedelta(seconds=TOKEN_REFRESH_MARGIN_SECONDS))
+    if expiring and row["has_refresh"]:
+        try:
+            await oauth_flow.refresh_connection(provider, user_id=user_id,
+                                                is_admin=False)
+            row = await _fetch()
+        except oauth_flow.OAuthError as exc:
+            logger.warning("inbox token refresh failed: provider=%s err=%s",
+                           provider, exc)
+            return None
+        if row is None:
+            return None
+    try:
+        return decrypt_secret(row["access_token_encrypted"])
+    except Exception:
+        logger.warning("inbox token decrypt failed: provider=%s", provider)
+        return None
+
+
 async def _audit(user_id, workspace_id, provider, action, allowed, reason, message_ref=None):
     pool = clients.db_pool
     async with pool.acquire() as conn:
@@ -229,22 +280,35 @@ async def handle_inbox_command(
         await _audit(user_id, workspace_uuid, provider, kind, False, "no inbox adapter")
         return True, f"No read-only inbox adapter is available for {provider}."
 
-    # Gate passed — perform the read-only operation (skeleton refuses with a live
-    # call until a real read implementation exists; never sends/replies/deletes).
+    # Gate passed — obtain the caller's own access token (broker; never logged)
+    # and perform the read-only operation. Never sends/replies/deletes.
+    token = await _get_access_token(provider, user_id)
+    if not token:
+        await _audit(user_id, workspace_uuid, provider, kind, False,
+                     "no usable access token (broker)")
+        return True, (f"🔒 Inbox read for {provider} is enabled by policy, but I "
+                      "couldn't obtain a usable access token (it may need to be "
+                      "reconnected). No mailbox data was accessed and nothing was sent.")
     try:
         if kind in ("list", "summarize"):
-            msgs = adapter.list_messages(limit=10)
+            msgs = await adapter.list_messages(access_token=token, limit=10)
         elif kind == "search":
-            msgs = adapter.search_messages(query=query or "", limit=10)
-        elif kind == "read_thread":
-            msgs = [adapter.read_message(message_id="latest")]
-        else:  # draft_reply
-            msgs = [adapter.read_message(message_id="latest")]
+            msgs = await adapter.search_messages(access_token=token,
+                                                 query=query or "", limit=10)
+        else:  # read_thread / draft_reply both start from the latest message
+            msgs = [await adapter.read_message(access_token=token,
+                                               message_id="latest")]
     except inbox_adapters.InboxReadDisabled as exc:
         await _audit(user_id, workspace_uuid, provider, kind, False, str(exc))
-        return True, ("🔒 Inbox read is enabled by policy but the live read connector "
-                      "is not implemented in this phase — no mailbox data was accessed "
-                      "and nothing was sent.")
+        return True, ("🔒 Inbox read is enabled by policy but no live read could be "
+                      "performed — no mailbox data was accessed and nothing was sent.")
+    except inbox_adapters.InboxReadError as exc:
+        await _audit(user_id, workspace_uuid, provider, kind, False, str(exc))
+        await _trace(session_uuid, user_id, workspace_uuid,
+                     trace_type=TRACE_READ_FAILED, status="error",
+                     result={"provider": provider, "kind": kind, "error": str(exc)})
+        return True, (f"⚠️ The {provider} read-only request failed ({exc}). No "
+                      "mailbox changes were made and nothing was sent.")
 
     # Reached only when a real read returned data (e.g., a future live connector).
     if kind == "draft_reply":

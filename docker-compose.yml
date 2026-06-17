@@ -111,6 +111,9 @@ services:
       MICROSOFT_OAUTH_REDIRECT_URI: ${MICROSOFT_OAUTH_REDIRECT_URI:-}
     networks:
       - cora-internal
+      # cora-proxy gives the worker egress for scheduled news-feed/url fetches
+      # (cora-internal is internal=true, no DNS/egress) — same as cora-api.
+      - cora-proxy
     depends_on:
       cora-postgres:
         condition: service_healthy

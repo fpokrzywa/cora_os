@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
+
+import { clearScreenEntity, setScreenEntity } from "../screenContext";
 import {
   listReadinessIntents,
   cancelReadinessIntent,
@@ -151,6 +153,15 @@ export function IntegrationReadinessQueue({
   const [busyId, setBusyId] = useState<string | null>(null);
   const [toast, setToast] = useState<string | null>(null);
   const [detail, setDetail] = useState<ExternalIntegrationIntent | null>(null);
+
+  // Screen-context awareness: report the intent open in the detail drawer.
+  useEffect(() => {
+    if (detail) {
+      setScreenEntity({ type: "integration_intent", id: detail.id });
+    } else {
+      clearScreenEntity();
+    }
+  }, [detail]);
   const [credSim, setCredSim] = useState<CredentialUsageSimulation | null>(null);
   const [readiness, setReadiness] = useState<OAuthReadinessResult | null>(null);
   const [readinessLoading, setReadinessLoading] = useState(false);

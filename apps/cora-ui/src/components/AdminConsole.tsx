@@ -1,4 +1,6 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
+
+import { setScreenView } from "../screenContext";
 import { Admin } from "./Admin";
 import { AgentAdmin } from "./AgentAdmin";
 import { McpAdmin } from "./McpAdmin";
@@ -155,6 +157,16 @@ export function AdminConsole({
 
   const activeDef = TABS.find((t) => t.key === tab)!;
   const showSubtabs = activeDef.subs.length > 1;
+
+  // Report the active screen so chat can answer "what am I looking at?".
+  useEffect(() => {
+    const subDef = activeDef.subs.find((s) => s.key === sub);
+    const section = sub ? `${tab}/${sub}` : tab;
+    const label = subDef
+      ? `${activeDef.label} · ${subDef.label}`
+      : activeDef.label;
+    setScreenView("admin-console", section, label);
+  }, [tab, sub, activeDef]);
 
   const renderSection = () => {
     switch (tab) {

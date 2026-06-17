@@ -1,3 +1,4 @@
+import { getScreenContext } from "./screenContext";
 import type {
   AdminMemoryEntry,
   AdminUser,
@@ -80,9 +81,6 @@ import type {
   EmbeddingsStatus,
   MemoryEntry,
   MemorySearchResult,
-  NewsArticle,
-  NewsFetchResult,
-  NewsSource,
   SemanticSearchResponse,
   TokenResponse,
   ToolAdminRow,
@@ -230,6 +228,7 @@ export function sendChat(
       message,
       session_id: sessionId ?? undefined,
       workspace_id: workspaceId ?? undefined,
+      screen_context: getScreenContext(),
     }),
   });
 }
@@ -1014,53 +1013,6 @@ export function refreshKnowledgeSource(sourceId: string) {
 
 export function deleteKnowledgeSource(sourceId: string) {
   return request<void>(`/knowledge/sources/${sourceId}`, { method: "DELETE" });
-}
-
-// ---------- News sources ----------
-
-export function listNewsSources(workspaceId: string) {
-  return request<NewsSource[]>(`/workspaces/${workspaceId}/news/sources`);
-}
-
-export function createNewsSource(
-  workspaceId: string,
-  req: { name: string; feed_url: string; category?: string | null },
-) {
-  return request<NewsSource>(`/workspaces/${workspaceId}/news/sources`, {
-    method: "POST",
-    body: JSON.stringify(req),
-  });
-}
-
-export function updateNewsSource(
-  workspaceId: string,
-  sourceId: string,
-  enabled: boolean,
-) {
-  return request<NewsSource>(
-    `/workspaces/${workspaceId}/news/sources/${sourceId}`,
-    { method: "PATCH", body: JSON.stringify({ enabled }) },
-  );
-}
-
-export function deleteNewsSource(workspaceId: string, sourceId: string) {
-  return request<{ deleted: boolean; source_id: string }>(
-    `/workspaces/${workspaceId}/news/sources/${sourceId}`,
-    { method: "DELETE" },
-  );
-}
-
-export function fetchNewsSource(workspaceId: string, sourceId: string) {
-  return request<NewsFetchResult>(
-    `/workspaces/${workspaceId}/news/sources/${sourceId}/fetch`,
-    { method: "POST" },
-  );
-}
-
-export function listNewsArticles(workspaceId: string, limit = 50) {
-  return request<NewsArticle[]>(
-    `/workspaces/${workspaceId}/news/articles?limit=${limit}`,
-  );
 }
 
 // ---------- SIGNAL communication drafts (review-only, never sent) ----------

@@ -63,7 +63,28 @@
       "Bash(curl -s -o /dev/null -w \"%{http_code}\\\\n\" http://localhost:8000/execution-approvals)",
       "Bash(awk -F: '$1>1238 && $1<2790')",
       "Bash(xargs ls -la)",
-      "Read(//tmp/**)"
+      "Read(//tmp/**)",
+      "Bash(curl -s http://localhost:8000/worker/health)",
+      "Bash(awk '/^  cora-\\(api|worker|searxng\\):/{p=1} p&&/^  [a-z]/{svc=$0} p{print} /^$/{p=0}' docker-compose.yml)",
+      "Bash(docker inspect *)",
+      "Bash(grep -rn \"from app import news\\\\b\\\\|from app.news import\\\\|import news$\\\\|app\\\\.news\\\\.\" apps/cora-api/app --include=\"*.py\")",
+      "Bash(sed -n '30,40p' apps/cora-api/app/main.py)",
+      "Bash(sed -n '115,122p' apps/cora-api/app/main.py)",
+      "Bash(sed -n '320,348p' apps/cora-api/app/schema.py)",
+      "Bash(sed -n '1555,1565p' apps/cora-api/app/schema.py)",
+      "Bash(curl -s http://localhost:8000/health)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" \"http://localhost:8000/workspaces/00000000-0000-0000-0000-000000000000/news/sources\")",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" \"http://localhost:8000/workspaces/00000000-0000-0000-0000-000000000000/knowledge/news/briefing\")",
+      "Bash(curl -s -X POST http://localhost:8000/auth/login -H 'Content-Type: application/json' -d '{\"email\":\"x@x.com\",\"password\":\"y\"}')",
+      "Bash(awk '{print NR\": \"$0}')",
+      "Bash(sudo ss -ltnp)",
+      "Bash(curl -s -X POST http://localhost:8000/auth/login -H 'Content-Type: application/json' -d '{\"email\":\"probe@x.com\",\"password\":\"wrong\"}')",
+      "Bash(sed -n '258,330p' app/routers/chat.py)",
+      "Bash(sed -n '1044,1062p' app/routers/chat.py)",
+      "Bash(sed -n '180,190p' components/SignalDrafts.tsx)",
+      "Bash(sed -n '278,286p' components/SignalDrafts.tsx)",
+      "Bash(grep -nE '^#{1,3} |^## [0-9]|Next|Roadmap|TODO|Suggested|What.s next|Immediate|Backlog|Recommended' /home/owner/cora-ai-os/HANDOFF_SESSION.md)",
+      "Bash(git add *)"
     ]
   }
 }

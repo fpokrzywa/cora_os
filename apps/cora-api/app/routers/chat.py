@@ -38,6 +38,7 @@ from app.agents.planner import create_plan, match_plan_intent
 from app.agents.registry import get_active_version, load_active_routing_keywords
 from app.memory import is_embedding_configured, semantic_search
 from app.runtime_traces import write_trace
+from app.screen_context import build_screen_context_block
 from app import schema as schema_state
 from app.agents.scribe import (
     create_chat_memory,
@@ -262,6 +263,7 @@ def _build_prompt(
     system_prompt: str = CORA_SYSTEM_PROMPT,
     workspace_context: Optional[str] = None,
     web_results: Optional[str] = None,
+    screen_context: Optional[str] = None,
 ) -> tuple[str, dict]:
     """Build the Ollama prompt and return it with size stats.
 
@@ -273,6 +275,7 @@ def _build_prompt(
     separator = "\n\n"
     system_part = f"System: {system_prompt}"
     workspace_part = workspace_context if workspace_context else None
+    screen_part = screen_context if screen_context else None
     web_part = web_results if web_results else None
     memory_part = _format_memory_block(memories) if memories else None
     final_user_part = f"User: {user_message}"
@@ -283,6 +286,8 @@ def _build_prompt(
     fixed_parts = [system_part]
     if workspace_part:
         fixed_parts.append(workspace_part)
+    if screen_part:
+        fixed_parts.append(screen_part)
     if web_part:
         fixed_parts.append(web_part)
     if memory_part:
@@ -308,6 +313,8 @@ def _build_prompt(
     assembled_parts = [system_part]
     if workspace_part:
         assembled_parts.append(workspace_part)
+    if screen_part:
+        assembled_parts.append(screen_part)
     if web_part:
         assembled_parts.append(web_part)
     if memory_part:
@@ -324,6 +331,7 @@ def _build_prompt(
         "truncated": dropped > 0,
         "memories_included": len(memories) if memories else 0,
         "workspace_context_chars": len(workspace_part) if workspace_part else 0,
+        "screen_context_chars": len(screen_part) if screen_part else 0,
         "web_results_chars": len(web_part) if web_part else 0,
     }
     return prompt, stats
@@ -1053,6 +1061,11 @@ class ChatRequest(BaseModel):
         default=None,
         description="Optional workspace UUID. Falls back to the default "
         "workspace ('cora-ai-os') when omitted.",
+    )
+    screen_context: Optional[dict] = Field(
+        default=None,
+        description="Optional UI screen context (view/section/entity). "
+        "Sanitized and re-resolved server-side; see app.screen_context.",
     )
 
 
@@ -2522,6 +2535,27 @@ async def chat(
                 ctx["metadata"]["chars"],
             )
 
+    # ---------- Screen context (v0.1) ----------
+    # The UI reports what screen/entity the user is viewing; sanitize and
+    # re-resolve server-side (owner-scoped), then inject a compact block.
+    screen_context_text: Optional[str] = None
+    screen_context_meta: Optional[dict] = None
+    if request.screen_context:
+        built = await build_screen_context_block(
+            request.screen_context,
+            user_id=current.id,
+            is_admin=(current.role == "admin"),
+        )
+        if built:
+            screen_context_text, screen_context_meta = built
+            logger.info(
+                "screen context injected: session=%s section=%s entity=%s chars=%s",
+                session_id,
+                screen_context_meta.get("section"),
+                screen_context_meta.get("entity_type"),
+                screen_context_meta.get("chars"),
+            )
+
     # ---------- PULSE live web search (governed) ----------
     # Dispatched only when an explicit web-search cue matched. Results are
     # injected into the prompt as cited evidence; PULSE synthesizes from them.
@@ -2666,12 +2700,14 @@ async def chat(
         system_prompt=system_prompt,
         workspace_context=workspace_context_text,
         web_results=web_results_text,
+        screen_context=screen_context_text,
     )
 
     def _workspace_trace_metadata() -> dict:
+        meta_out = _screen_trace_metadata()
         if workspace_context_text and workspace_context_meta:
             m = workspace_context_meta
-            return {
+            return meta_out | {
                 "workspace_context_injected": True,
                 "workspace_id": str(workspace_uuid) if workspace_uuid else None,
                 "workspace_name": m.get("workspace_name"),
@@ -2690,13 +2726,26 @@ async def chat(
                     ),
                 },
             }
-        meta: dict = {
+        meta: dict = meta_out | {
             "workspace_context_injected": False,
             "workspace_id": str(workspace_uuid) if workspace_uuid else None,
         }
         if workspace_context_error:
             meta["workspace_context_error"] = workspace_context_error
         return meta
+
+    def _screen_trace_metadata() -> dict:
+        if screen_context_text and screen_context_meta:
+            return {
+                "screen_context_injected": True,
+                "screen_section": screen_context_meta.get("section"),
+                "screen_entity_type": screen_context_meta.get("entity_type"),
+                "screen_entity_resolved": screen_context_meta.get(
+                    "entity_resolved", False
+                ),
+                "screen_context_chars": screen_context_meta.get("chars", 0),
+            }
+        return {"screen_context_injected": False}
 
     logger.info(
         "ollama prompt session=%s selected_agent=%s history_loaded=%s "

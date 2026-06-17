@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
+
+import { clearScreenEntity, setScreenEntity } from "../screenContext";
 import {
   listSignalDrafts,
   createSignalDraft,
@@ -106,6 +108,15 @@ export function SignalDrafts({
   const [manageId, setManageId] = useState<string | null>(null);
   const [notes, setNotes] = useState("");
   const [events, setEvents] = useState<DraftReviewEvent[] | null>(null);
+
+  // Screen-context awareness: report the draft being managed.
+  useEffect(() => {
+    if (manageId) {
+      setScreenEntity({ type: "communication_draft", id: manageId });
+    } else {
+      clearScreenEntity();
+    }
+  }, [manageId]);
   const [busy, setBusy] = useState(false);
   const [intentMsg, setIntentMsg] = useState<string | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<CommunicationDraft | null>(null);

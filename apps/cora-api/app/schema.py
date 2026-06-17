@@ -320,29 +320,8 @@ CREATE INDEX IF NOT EXISTS knowledge_sources_workspace_idx
 CREATE INDEX IF NOT EXISTS knowledge_sources_hash_idx
     ON knowledge_sources (workspace_id, content_hash);
 
--- Registry of news feeds PULSE draws on. Articles fetched from these feeds are
--- stored as knowledge_sources rows (source_type='news_article') + linked
--- memory_entries, so retrieval/embeddings surface them like any other knowledge.
-CREATE TABLE IF NOT EXISTS news_sources (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    workspace_id UUID,
-    name TEXT NOT NULL,
-    feed_url TEXT NOT NULL,
-    category TEXT,
-    enabled BOOLEAN NOT NULL DEFAULT TRUE,
-    last_fetched_at TIMESTAMPTZ,
-    last_status TEXT,
-    last_error TEXT,
-    last_article_count INTEGER NOT NULL DEFAULT 0,
-    total_article_count INTEGER NOT NULL DEFAULT 0,
-    created_by UUID,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-CREATE INDEX IF NOT EXISTS news_sources_workspace_idx
-    ON news_sources (workspace_id, created_at DESC);
-CREATE UNIQUE INDEX IF NOT EXISTS news_sources_feed_uniq
-    ON news_sources (workspace_id, feed_url);
+-- The old `news_sources` registry (deprecated news path) is no longer created;
+-- existing deployments may still carry the table — safe to DROP manually.
 
 ALTER TABLE memory_entries ADD COLUMN IF NOT EXISTS source_id UUID;
 CREATE INDEX IF NOT EXISTS memory_entries_source_idx
@@ -1558,6 +1537,6 @@ async def init_schema() -> None:
         "tools, memory_entries, agents, agent_versions, mcp_servers, "
         "tool_execution_policies, tool_execution_logs, runtime_traces, "
         "execution_plans, execution_plan_steps, jobs, workspaces, "
-        "agent_delegations, knowledge_sources, news_sources); "
+        "agent_delegations, knowledge_sources); "
         "built-in tools + default workspace seeded"
     )

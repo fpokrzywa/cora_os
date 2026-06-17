@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 from typing import Optional
@@ -9,6 +10,12 @@ import redis.asyncio as aioredis
 from app.config import settings
 
 logger = logging.getLogger(__name__)
+
+# After a host reboot, containers race postgres's crash recovery ("the database
+# system is starting up"). Retry pool creation instead of stranding the process
+# with db_pool=None for its whole lifetime (observed 2026-06-12).
+POOL_INIT_ATTEMPTS = 10
+POOL_INIT_RETRY_SECONDS = 3.0
 
 
 class Clients:
@@ -47,20 +54,29 @@ async def _register_json_codecs(conn: asyncpg.Connection) -> None:
 async def init_clients() -> None:
     dsn_info = _safe_dsn_host(settings.database_url)
     logger.info("Initializing Postgres pool (%s)", dsn_info)
-    try:
-        clients.db_pool = await asyncpg.create_pool(
-            dsn=settings.database_url,
-            min_size=1,
-            max_size=10,
-            command_timeout=10,
-            init=_register_json_codecs,
-        )
-        logger.info("Postgres pool initialized successfully (%s)", dsn_info)
-    except Exception as exc:
-        logger.exception(
-            "Postgres pool initialization failed with exception: %s", exc
-        )
-        clients.db_pool = None
+    for attempt in range(1, POOL_INIT_ATTEMPTS + 1):
+        try:
+            clients.db_pool = await asyncpg.create_pool(
+                dsn=settings.database_url,
+                min_size=1,
+                max_size=10,
+                command_timeout=10,
+                init=_register_json_codecs,
+            )
+            logger.info("Postgres pool initialized successfully (%s)", dsn_info)
+            break
+        except Exception as exc:
+            clients.db_pool = None
+            if attempt < POOL_INIT_ATTEMPTS:
+                logger.warning(
+                    "Postgres pool init failed (attempt %s/%s, retrying in %ss): %s",
+                    attempt, POOL_INIT_ATTEMPTS, POOL_INIT_RETRY_SECONDS, exc,
+                )
+                await asyncio.sleep(POOL_INIT_RETRY_SECONDS)
+            else:
+                logger.exception(
+                    "Postgres pool initialization failed with exception: %s", exc
+                )
 
     try:
         clients.redis = aioredis.from_url(

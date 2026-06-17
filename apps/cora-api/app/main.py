@@ -32,7 +32,6 @@ from app.routers import (
     jobs,
     mcp_admin,
     memory,
-    news,
     oauth,
     plans,
     provider_connectors,
@@ -116,7 +115,6 @@ app.include_router(memory.router, dependencies=_auth_required)
 app.include_router(plans.router, dependencies=_auth_required)
 app.include_router(workspaces.router, dependencies=_auth_required)
 app.include_router(workspaces.sources_router, dependencies=_auth_required)
-app.include_router(news.router, dependencies=_auth_required)
 app.include_router(signal.router, dependencies=_auth_required)
 app.include_router(chronos.router, dependencies=_auth_required)
 app.include_router(integration.router, dependencies=_auth_required)

@@ -41,6 +41,11 @@ MIN_BODY_CHARS = 200
 MAX_FULL_BODY_CHARS = 16000
 MAX_SUMMARY_CHARS = 8000
 
+# Scheduled-refresh backoff: after N consecutive failures a feed's next refresh
+# is pushed out by interval * min(2**(N-1), CAP) so a broken feed stops hammering
+# the scheduler at full cadence. Reset to 0 on the next success.
+REFRESH_BACKOFF_CAP_MULTIPLIER = 8
+
 
 class NewsIngestError(Exception):
     """Raised on feed fetch/parse failure. `code` maps to an HTTP status."""
@@ -620,9 +625,21 @@ async def refresh_feed_source(source_id: uuid.UUID, *, user_id) -> dict:
             **settings,
         )
     except NewsIngestError as exc:
+        # Exponential backoff on repeated failures so a broken feed doesn't keep
+        # retrying every interval. Capped; consecutive_failures resets on success.
+        failures = int(meta.get("consecutive_failures", 0) or 0) + 1
+        if interval and int(interval) > 0:
+            mult = min(2 ** (failures - 1), REFRESH_BACKOFF_CAP_MULTIPLIER)
+            backoff_at = (now + timedelta(minutes=int(interval) * mult)).isoformat()
+        else:
+            backoff_at = None
         await update_feed_metadata(
             source_id,
-            {"last_error": str(exc), "next_refresh_at": next_at},
+            {
+                "last_error": str(exc),
+                "consecutive_failures": failures,
+                "next_refresh_at": backoff_at,
+            },
         )
         await write_trace(
             session_id=None,
@@ -637,6 +654,8 @@ async def refresh_feed_source(source_id: uuid.UUID, *, user_id) -> dict:
                 "source_name": source_name,
                 "error": str(exc),
                 "code": exc.code,
+                "consecutive_failures": failures,
+                "next_refresh_at": backoff_at,
             },
             workspace_id=workspace_id,
             error_message=str(exc),
@@ -657,6 +676,7 @@ async def refresh_feed_source(source_id: uuid.UUID, *, user_id) -> dict:
         {
             "last_success_at": now.isoformat(),
             "last_error": None,
+            "consecutive_failures": 0,
             "last_result": last_result,
             "next_refresh_at": next_at,
         },

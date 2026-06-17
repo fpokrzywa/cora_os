@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
+
+import { clearScreenEntity, setScreenEntity } from "../screenContext";
 import {
   listChronosProposals,
   createChronosProposal,
@@ -85,6 +87,15 @@ export function ChronosProposals({
   const [manageId, setManageId] = useState<string | null>(null);
   const [notes, setNotes] = useState("");
   const [events, setEvents] = useState<ProposalReviewEvent[] | null>(null);
+
+  // Screen-context awareness: report the proposal being managed.
+  useEffect(() => {
+    if (manageId) {
+      setScreenEntity({ type: "schedule_proposal", id: manageId });
+    } else {
+      clearScreenEntity();
+    }
+  }, [manageId]);
   const [busy, setBusy] = useState(false);
   const [intentMsg, setIntentMsg] = useState<string | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<ScheduleProposal | null>(null);

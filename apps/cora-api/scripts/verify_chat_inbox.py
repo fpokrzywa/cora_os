@@ -1,10 +1,14 @@
-"""Durable end-to-end verification of Chat-Native Inbox Assistant v2.3.
+"""Durable end-to-end verification of the Chat-Native Inbox Assistant
+(v2.3 fail-closed gate + v2.7 live read implementation).
 
 Three parts under a throwaway user with a connected gmail (gmail.send scope only):
   A) PRODUCTION STATE — fail-closed: list/search/summarize/read-thread/draft-reply
      all denied (no read scope + inbox_read flag disabled); audited; NO draft made;
      NO provider API call; no token exposed.
-  B) gate-pass + real adapter REFUSES (live read not implemented) — still no API call.
+  B) gate-pass + provider failure — the token broker resolves the (fake) token,
+     the live adapter's HTTP choke point is patched to simulate a provider
+     rejection: graceful error message, audited, read-failed trace, NO draft,
+     no real network call.
   C) gate-pass + mocked adapter returns messages — list renders source metadata; a
      draft-reply creates an INTERNAL SIGNAL draft linked to the source email; traces.
 
@@ -129,19 +133,44 @@ async def main() -> int:
             async with pool.acquire() as conn:
                 await conn.execute("UPDATE external_provider_connectors SET supports_read=TRUE WHERE provider_name='gmail'")
 
-        # --- B) gate-pass, real adapter refuses ---
+        # --- B) gate-pass + simulated provider rejection (no real network) ---
         async def _allow_gate(provider, user_id):
             return {"allowed": True, "connected": True, "token_ok": True, "scope_ok": True,
                     "flag_ok": True, "reason": "test-enabled"}
         ci._gate = _allow_gate
-        h, t = await inbox("Show my latest emails.")
-        responses.append(t)
-        expect(h and t and "not implemented" in t.lower(), "B real adapter refuses")
+
+        async def _reject_http(url, *, token, params=None):
+            raise inbox_adapters.InboxReadError("provider read rejected (HTTP 401)")
+        orig_http = inbox_adapters._http_get_json
+        inbox_adapters._http_get_json = _reject_http
+        try:
+            h, t = await inbox("Show my latest emails.")
+            responses.append(t)
+            expect(h and t and "failed" in t.lower() and "nothing was sent" in t.lower(),
+                   "B provider rejection handled gracefully")
+            async with pool.acquire() as conn:
+                rf = await conn.fetchval(
+                    "SELECT count(*) FROM runtime_traces WHERE user_id=$1 "
+                    "AND trace_type='chat_inbox_provider_read_failed'", uid)
+                drafts_b = await conn.fetchval(
+                    "SELECT count(*) FROM communication_drafts WHERE created_by=$1", uid)
+            expect(rf >= 1, "B read-failed trace written")
+            expect(drafts_b == 0, "B provider failure must NOT create a draft")
+        finally:
+            inbox_adapters._http_get_json = orig_http
 
         # --- C) gate-pass + mocked adapter returns data ---
-        adapter.list_messages = lambda limit=10: list(FAKE_MSGS)
-        adapter.search_messages = lambda query="", limit=10: list(FAKE_MSGS)
-        adapter.read_message = lambda message_id=None: dict(FAKE_MSGS[0])
+        async def _fake_list(*, access_token=None, query=None, limit=10):
+            return list(FAKE_MSGS)
+
+        async def _fake_search(*, access_token=None, query="", limit=10):
+            return list(FAKE_MSGS)
+
+        async def _fake_read(*, access_token=None, message_id=None):
+            return dict(FAKE_MSGS[0])
+        adapter.list_messages = _fake_list
+        adapter.search_messages = _fake_search
+        adapter.read_message = _fake_read
         h, t = await inbox("Show my latest emails.")
         responses.append(t)
         expect(h and t and "Mark <mark@example.com>" in t and "Project delay" in t
@@ -195,9 +224,10 @@ async def main() -> int:
         for f in fails:
             print("  -", f)
         return 1
-    print("RESULT: PASS — inbox reads FAIL CLOSED (no scope/flag); gate-pass→adapter "
-          "refuses (no API); mocked path renders source metadata + creates linked SIGNAL "
-          "reply draft (no send); flags seeded disabled; 5 traces + audit events; "
+    print("RESULT: PASS — inbox reads FAIL CLOSED (no scope/flag); gate-pass + "
+          "provider rejection handled gracefully (broker token, no real network, "
+          "read-failed trace); mocked path renders source metadata + creates linked "
+          "SIGNAL reply draft (no send); flags seeded disabled; traces + audit events; "
           "no token leak; rows cleaned up")
     return 0
 

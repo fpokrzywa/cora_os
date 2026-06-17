@@ -28,7 +28,6 @@ from app.agents.delegations import (
     fail_delegation,
 )
 from app.agents.planner import PlanError, update_step
-from app import news
 from app.clients import clients, close_clients, init_clients
 from app.logging_config import configure_logging
 from app.runtime_traces import write_trace
@@ -339,29 +338,6 @@ async def execute_plan_step(job: dict) -> dict:
     return result_payload
 
 
-async def fetch_news(job: dict) -> dict:
-    """news_fetch handler: pull a registered feed and ingest new articles.
-    Payload: {"source_id": "<uuid>", "max_articles": <int, optional>}."""
-    payload = job.get("payload") or {}
-    raw = payload.get("source_id")
-    if not raw:
-        raise PermanentError("news_fetch job missing payload.source_id")
-    try:
-        source_id = uuid.UUID(str(raw))
-    except ValueError as exc:
-        raise PermanentError(f"invalid source_id: {raw!r}") from exc
-    try:
-        return await news.fetch_source(
-            source_id,
-            user_id=job.get("user_id"),
-            max_articles=int(payload.get("max_articles", news.DEFAULT_MAX_ARTICLES)),
-        )
-    except news.NewsError as exc:
-        if exc.code in ("fetch_failed", "unavailable"):
-            raise TransientError(str(exc)) from exc
-        raise PermanentError(str(exc)) from exc
-
-
 async def refresh_news_feed(job: dict) -> dict:
     """news_feed_refresh handler (unified knowledge path). Payload carries
     source_id; settings come from the feed's metadata. Reuses the same refresh
@@ -388,7 +364,6 @@ async def refresh_news_feed(job: dict) -> dict:
 HANDLERS = {
     "execution_plan_step": execute_plan_step,
     "plan_step": execute_plan_step,  # backwards-compat
-    "news_fetch": fetch_news,  # deprecated old news_sources path
     "news_feed_refresh": refresh_news_feed,
 }
 
@@ -396,13 +371,38 @@ HANDLERS = {
 # ---------- Scheduled news-feed refresh ----------
 
 NEWS_SCHEDULE_INTERVAL_SECONDS = 60.0
+# Scheduler heartbeats share worker_heartbeats with a distinct worker_id so
+# /worker/health can prove the news scheduler is ticking (the main loop's
+# heartbeat would stay fresh even if only the scheduler stalled).
+SCHEDULER_WORKER_ID = f"{WORKER_ID}:news-scheduler"
 
 
-async def enqueue_due_news_feeds() -> None:
-    """Find due news_feed knowledge_sources and enqueue news_feed_refresh jobs,
-    skipping feeds that already have a queued/running refresh job."""
+async def _scheduler_heartbeat(enqueued: int) -> None:
+    """Record a scheduler-tick heartbeat (separate row from the main loop)."""
     if clients.db_pool is None:
         return
+    async with clients.db_pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO worker_heartbeats (worker_id, last_heartbeat_at, last_job_at)
+            VALUES ($1, NOW(), CASE WHEN $2 > 0 THEN NOW() ELSE NULL END)
+            ON CONFLICT (worker_id) DO UPDATE
+            SET last_heartbeat_at = NOW(),
+                last_job_at = CASE WHEN $2 > 0 THEN NOW()
+                                   ELSE worker_heartbeats.last_job_at END
+            """,
+            SCHEDULER_WORKER_ID,
+            enqueued,
+        )
+
+
+async def enqueue_due_news_feeds() -> int:
+    """Find due news_feed knowledge_sources and enqueue news_feed_refresh jobs,
+    skipping feeds that already have a queued/running refresh job. Returns the
+    number of jobs enqueued and records a scheduler-tick heartbeat."""
+    if clients.db_pool is None:
+        return 0
+    enqueued = 0
     async with clients.db_pool.acquire() as conn:
         rows = await conn.fetch(
             """
@@ -463,11 +463,14 @@ async def enqueue_due_news_feeds() -> None:
                 },
                 workspace_id=r["workspace_id"],
             )
+            enqueued += 1
             logger.info(
                 "enqueued news_feed_refresh: source=%s job=%s", sid, job["id"]
             )
         except Exception:
             logger.exception("failed to enqueue news_feed_refresh: source=%s", sid)
+    await _scheduler_heartbeat(enqueued)
+    return enqueued
 
 
 # ---------- Main loop ----------
