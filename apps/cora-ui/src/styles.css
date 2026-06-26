@@ -754,6 +754,44 @@ button {
   min-width: 72px;
 }
 
+.composer__share {
+  height: 44px;
+  white-space: nowrap;
+}
+
+.composer__attachment {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0 28px;
+  padding: 8px 12px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  font-size: 12px;
+  color: var(--text-dim, var(--text));
+}
+
+.composer__thumb {
+  height: 36px;
+  width: auto;
+  max-width: 64px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  object-fit: cover;
+}
+
+.composer__attachment-remove {
+  margin-left: auto;
+  background: none;
+  border: none;
+  color: var(--text);
+  cursor: pointer;
+  font-size: 18px;
+  line-height: 1;
+  padding: 0 4px;
+}
+
 /* ---------- Scrollbars ---------- */
 
 .sidebar__list::-webkit-scrollbar,

@@ -2,11 +2,12 @@ import { useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { ChatMessage } from "../types";
+import { captureScreenFrame } from "../screenCapture";
 
 interface Props {
   messages: ChatMessage[];
   sessionId: string | null;
-  onSend: (text: string) => void;
+  onSend: (text: string, screenImage?: string | null) => void;
   sending: boolean;
   loadingConvo: boolean;
   error: string | null;
@@ -25,6 +26,8 @@ export function ChatPanel({
   workspaceName,
 }: Props) {
   const [input, setInput] = useState("");
+  const [screenImage, setScreenImage] = useState<string | null>(null);
+  const [capturing, setCapturing] = useState(false);
   const listRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -34,9 +37,21 @@ export function ChatPanel({
   }, [messages, sending]);
 
   const submit = () => {
-    if (!input.trim() || sending) return;
-    onSend(input);
+    if ((!input.trim() && !screenImage) || sending) return;
+    onSend(input, screenImage);
     setInput("");
+    setScreenImage(null);
+  };
+
+  const shareScreen = async () => {
+    if (capturing || sending) return;
+    setCapturing(true);
+    try {
+      const frame = await captureScreenFrame();
+      if (frame) setScreenImage(frame);
+    } finally {
+      setCapturing(false);
+    }
   };
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -121,7 +136,30 @@ export function ChatPanel({
 
       {error && <div className="chat__error">{error}</div>}
 
+      {screenImage && (
+        <div className="composer__attachment">
+          <img src={screenImage} alt="Shared screenshot" className="composer__thumb" />
+          <span>Screenshot attached — sent to the local vision model on send.</span>
+          <button
+            className="composer__attachment-remove"
+            onClick={() => setScreenImage(null)}
+            disabled={sending}
+            aria-label="Remove screenshot"
+          >
+            ×
+          </button>
+        </div>
+      )}
+
       <div className="chat__composer">
+        <button
+          className="btn composer__share"
+          onClick={shareScreen}
+          disabled={sending || capturing}
+          title="Share a screenshot with Cora (one frame; you pick what to share)"
+        >
+          {capturing ? "…" : screenImage ? "Re-share" : "Share screen"}
+        </button>
         <textarea
           className="composer__input"
           placeholder="Message Cora…"
@@ -134,7 +172,7 @@ export function ChatPanel({
         <button
           className="btn btn--primary composer__send"
           onClick={submit}
-          disabled={sending || !input.trim()}
+          disabled={sending || (!input.trim() && !screenImage)}
         >
           {sending ? "…" : "Send"}
         </button>

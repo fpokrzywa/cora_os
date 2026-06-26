@@ -212,19 +212,20 @@ export function App() {
   }, [handleLogout, resetAppState]);
 
   const handleSend = useCallback(
-    async (text: string) => {
+    async (text: string, screenImage?: string | null) => {
       const trimmed = text.trim();
-      if (!trimmed || sending) return;
+      if ((!trimmed && !screenImage) || sending) return;
+      const message = trimmed || "What am I looking at on my screen?";
       setError(null);
       setSending(true);
       const optimisticUser: ChatMessage = {
         role: "user",
-        content: trimmed,
+        content: screenImage ? `${message}\n\n_(shared a screenshot)_` : message,
         created_at: new Date().toISOString(),
       };
       setMessages((prev) => [...prev, optimisticUser]);
       try {
-        const res = await sendChat(trimmed, sessionId, currentWorkspaceId);
+        const res = await sendChat(message, sessionId, currentWorkspaceId, screenImage);
         setSessionId(res.session_id);
         setSelectedAgent(res.selected_agent);
         setMessages((prev) => [

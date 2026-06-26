@@ -323,14 +323,15 @@ def assert_selectable(row: dict) -> None:
 async def update_connector(
     provider_name: str, fields: dict
 ) -> Optional[dict]:
-    """Admin update of a connector. SAFETY: live WRITE-execution capability flags
-    can never be turned on here — supports_send / supports_calendar_create /
-    supports_calendar_update are forced FALSE and dry_run_only forced TRUE
-    regardless of input. supports_read (read-only inbox capability, v2.3) is NOT
-    force-reset here — it is a distinct, intentionally-supported read capability set
-    at the seed/migration level and is preserved across admin edits. Read-only
-    capability does NOT imply send: write actions stay disabled and runtime inbox
-    read is still gated by OAuth scope + the inbox_read feature flag."""
+    """Admin update of a connector. SAFETY: email SEND can never be turned on here —
+    supports_send is forced FALSE and dry_run_only forced TRUE regardless of input.
+    supports_read AND the calendar capabilities (supports_calendar_read/create/update/
+    delete) are NOT force-reset — they are real capabilities set at the seed/migration
+    level and preserved across admin edits; runtime execution is gated SEPARATELY by the
+    inbox_read / calendar_read / calendar_write feature flags + the CALENDAR_EXECUTION_ENABLED
+    switch. Zeroing the calendar capabilities here (the old v0.5 behavior) silently broke
+    governed calendar writes on any connector edit. Capability present does NOT imply
+    execution — the flags + switch remain the actual gates."""
     editable = ("enabled", "dry_run_only", "display_name", "description",
                 "metadata", "capabilities")
     sets: list[str] = []
@@ -342,13 +343,15 @@ async def update_connector(
                 value = True  # forced: no live execution in v0.5
             args.append(value)
             sets.append(f"{col} = ${len(args)}")
-    # Hard guard: WRITE capabilities stay FALSE no matter what an admin sends.
-    # (supports_read is intentionally NOT forced — it is preserved as set by seed.)
+    # Hard guard: email SEND stays FALSE no matter what an admin sends (email send is
+    # hard-disabled by the integration governance). Calendar create/update/delete and
+    # supports_read are intentionally NOT forced — they are real capabilities set by the
+    # seed/migration and gated at runtime by the calendar_read/calendar_write/inbox_read
+    # flags + the CALENDAR_EXECUTION_ENABLED switch, so zeroing them here would silently
+    # break governed calendar writes on any connector edit.
     sets.append("supports_send = FALSE")
-    sets.append("supports_calendar_create = FALSE")
-    sets.append("supports_calendar_update = FALSE")
     sets.append("dry_run_only = TRUE")
-    if not args and len(sets) == 4:
+    if not args and len(sets) == 2:
         # nothing editable supplied; still return current row
         return await get_connector_row(provider_name)
     sets.append("updated_at = NOW()")

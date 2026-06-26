@@ -291,3 +291,5 @@ For multi-step tasks, state a brief plan:
 ```
 
 Strong success criteria let you loop independently. Weak criteria ("make it work") require constant clarification.
+
+Output only the modified code no full rewrites no setup guides not explainations unless I ask for them.

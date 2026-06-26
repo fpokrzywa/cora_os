@@ -68,6 +68,8 @@ from app import chat_provider_simulation
 from app import chat_approval_queue
 from app import chat_inbox
 from app import chat_calendar
+from app import provider_defaults
+from app import screen_vision
 
 MEMORY_SEARCH_LIMIT = 20
 MEMORIES_IN_PROMPT = 5
@@ -1067,6 +1069,11 @@ class ChatRequest(BaseModel):
         default=None,
         description="Optional UI screen context (view/section/entity). "
         "Sanitized and re-resolved server-side; see app.screen_context.",
+    )
+    screen_image: Optional[str] = Field(
+        default=None,
+        description="Optional user-shared screenshot (data URL or base64) for "
+        "Tier-2 screen vision. Fail-closed; see app.screen_vision.",
     )
 
 
@@ -2199,6 +2206,61 @@ async def chat(
                 session_id=session_id, agent=PERSONA_NAME, selected_agent=SIGNAL_NAME,
                 routing_matched_keywords=matched_keywords, model_endpoint=endpoint,
                 response=_q_text, placeholder=False, created_at=_completed_at.isoformat(),
+            )
+
+    # Tier-2 Screen Vision (opt-in). The user deliberately shared a screenshot via the
+    # composer's "Share screen" button (browser getDisplayMedia, one frame, no auto-
+    # capture) — the attached image IS the intent, so it short-circuits first. FAILS
+    # CLOSED: nothing reaches a vision model unless SCREEN_VISION_ENABLED + a configured
+    # local model. Image bytes are never stored; only metadata is audited.
+    if request.screen_image:
+        _sv_handled, _sv_text = await screen_vision.handle_screen_vision_turn(
+            message=request.message, image_data=request.screen_image,
+            session_uuid=session_uuid, user_id=current.id,
+            workspace_uuid=workspace_uuid, is_admin=(current.role == "admin"),
+        )
+        if _sv_handled and _sv_text is not None:
+            _completed_at = datetime.now(timezone.utc)
+            try:
+                await _persist_exchange(
+                    session_uuid=session_uuid, scope_type=scope_type, scope_id=scope_id,
+                    user_message=request.message, assistant_response=_sv_text,
+                    model_name=None, placeholder=False, started_at=started_at,
+                    completed_at=_completed_at, agent_name=PERSONA_NAME,
+                    workspace_id=workspace_uuid,
+                )
+            except Exception:
+                logger.exception("persist screen-vision exchange failed session=%s", session_id)
+            return ChatResponse(
+                session_id=session_id, agent=PERSONA_NAME, selected_agent=PERSONA_NAME,
+                routing_matched_keywords=matched_keywords, model_endpoint=endpoint,
+                response=_sv_text, placeholder=False, created_at=_completed_at.isoformat(),
+            )
+
+    # Per-user default provider ("make outlook my default calendar"). Checked before the
+    # inbox/calendar handlers so the phrase isn't swallowed by their detection.
+    _pd_cmd = provider_defaults.detect_default_command(request.message)
+    if _pd_cmd is not None:
+        _pd_handled, _pd_text = await provider_defaults.handle_default_command(
+            _pd_cmd, user_id=current.id, session_uuid=session_uuid,
+            workspace_uuid=workspace_uuid,
+        )
+        if _pd_handled and _pd_text is not None:
+            _completed_at = datetime.now(timezone.utc)
+            try:
+                await _persist_exchange(
+                    session_uuid=session_uuid, scope_type=scope_type, scope_id=scope_id,
+                    user_message=request.message, assistant_response=_pd_text,
+                    model_name=None, placeholder=False, started_at=started_at,
+                    completed_at=_completed_at, agent_name=PERSONA_NAME,
+                    workspace_id=workspace_uuid,
+                )
+            except Exception:
+                logger.exception("persist provider-default exchange failed session=%s", session_id)
+            return ChatResponse(
+                session_id=session_id, agent=PERSONA_NAME, selected_agent=PERSONA_NAME,
+                routing_matched_keywords=matched_keywords, model_endpoint=endpoint,
+                response=_pd_text, placeholder=False, created_at=_completed_at.isoformat(),
             )
 
     # Chat-Native Inbox Assistant v2.3. Read-only inbox Q&A (list/search/summarize/

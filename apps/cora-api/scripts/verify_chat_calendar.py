@@ -52,6 +52,7 @@ async def main() -> int:
     wid = None
     sess = uuid.uuid4()
     saved_flags = []
+    saved_cal_switch = None
 
     def expect(c, m):
         if not c:
@@ -69,6 +70,20 @@ async def main() -> int:
 
     # detection
     expect(cc.detect_calendar_command("What's on my calendar today?")[0] == "list", "detect list")
+    # provider-word tolerance: a named provider must not break detection
+    expect(cc.detect_calendar_command("What's on my outlook calendar today?")[0] == "list",
+           "detect list with a provider word ('outlook calendar')")
+    expect(cc.detect_calendar_command("Show my google calendar this week")[0] == "list",
+           "detect list with 'google calendar'")
+    # day-scoped schedule questions WITHOUT a calendar/meeting anchor (follow-ups)
+    expect(cc.detect_calendar_command("what about this past tuesday what was on it")[0] == "list",
+           "detect 'what was on <day>' without a calendar anchor")
+    expect(cc.detect_calendar_command("anything on monday?")[0] == "list",
+           "detect 'anything on <day>'")
+    expect(cc.detect_calendar_command("what did I have on 2026-06-23")[0] == "list",
+           "detect 'what did I have on <date>'")
+    expect(cc.detect_calendar_command("what was on it") is None,
+           "no day reference → NOT a calendar command (avoid false positives)")
     expect(cc.detect_calendar_command("Schedule a meeting with the team tomorrow")[0] == "create", "detect create")
     expect(cc.detect_calendar_command("Reschedule my 1:1 meeting")[0] == "update", "detect update")
     expect(cc.detect_calendar_command("Cancel my standup meeting")[0] == "delete", "detect delete")
@@ -86,6 +101,10 @@ async def main() -> int:
     expect(y_min < y_max, "window min < max")
     expect(cc.resolve_read_window("anything on my calendar tuesday?")[2] == "Tuesday",
            "named weekday resolves to that day")
+    pt_min, pt_max, pt_label = cc.resolve_read_window("what was on this past tuesday")
+    expect(pt_label == "Tuesday" and datetime.fromisoformat(pt_max) <= now,
+           "'past tuesday' resolves to a strictly PAST Tuesday")
+    expect(datetime.fromisoformat(pt_min) < datetime.fromisoformat(pt_max), "past-tuesday window min<max")
     expect(cc.resolve_read_window("what's on my calendar")[2] == "the next 2 weeks",
            "no day reference → default near-term window")
     deduped = cc._dedupe_series([
@@ -117,6 +136,36 @@ async def main() -> int:
     r_one = await cc._resolve_target(_FakeAdapter([_evs[0]]), "tok", None)
     expect(r_one["status"] == "ok", "resolve no-query + single event → ok")
 
+    # per-calendar CREATE: NL hint extraction + calendar resolution (refuse-on-ambiguous)
+    expect(cc._extract_calendar_hint("schedule a sync on my Work calendar at 3pm") == "Work",
+           "extract hint from 'on my X calendar'")
+    expect(cc._extract_calendar_hint("add a meeting to my calendar tomorrow") is None,
+           "bare 'to my calendar' carries no calendar name → primary")
+    expect(cc._extract_calendar_hint("create an event in the Family calendar") == "Family",
+           "extract hint from 'in the X calendar'")
+    expect(cc._extract_calendar_hint("add a review to the calendar named Project X") == "Project X",
+           "extract hint from 'calendar named X'")
+    expect(cc._extract_calendar_hint("schedule a sync on my outlook calendar") is None,
+           "provider word is NOT a calendar-name hint ('outlook' → primary)")
+    expect(cc._extract_calendar_hint("schedule a sync on my outlook Work calendar") == "Work",
+           "provider word stripped from a real calendar-name hint ('outlook Work' → 'Work')")
+
+    class _FakeCalAdapter:
+        async def list_calendars(self, *, access_token=None):
+            return [{"id": "primary", "name": "Personal", "primary": True},
+                    {"id": "w@g", "name": "Work", "primary": False},
+                    {"id": "w2@g", "name": "Work Projects", "primary": False}]
+    rc_ok = await cc._resolve_calendar(_FakeCalAdapter(), "tok", "Work")
+    expect(rc_ok["status"] == "ok" and rc_ok["calendar"]["id"] == "w@g",
+           "exact 'Work' wins over substring 'Work Projects'")
+    rc_amb = await cc._resolve_calendar(_FakeCalAdapter(), "tok", "wor")
+    expect(rc_amb["status"] == "ambiguous", "substring matching multiple → ambiguous (no guess)")
+    rc_nm = await cc._resolve_calendar(_FakeCalAdapter(), "tok", "Zephyr")
+    expect(rc_nm["status"] == "no_match", "unknown calendar → no_match (no guess)")
+    rc_def = await cc._resolve_calendar(_FakeCalAdapter(), "tok", None)
+    expect(rc_def["status"] == "ok" and rc_def["calendar"]["id"] == "primary",
+           "no hint → primary (no provider call)")
+
     # Snapshot the LIVE flag state (the operator may have enabled calendar_read/
     # write for real use), then force fail-closed for the test. Restored in finally
     # so this run never disrupts the operator's configuration.
@@ -127,6 +176,13 @@ async def main() -> int:
         await conn.execute(
             "UPDATE provider_execution_feature_flags SET enabled=FALSE, dry_run_only=TRUE "
             "WHERE action_type IN ('calendar_read','calendar_write')")
+        # _write_gate now reads the calendar-switch DB override first; clear it so the
+        # settings monkeypatch in part B is authoritative. Restored in finally.
+        saved_cal_switch = await conn.fetchrow(
+            "SELECT enabled, updated_by FROM runtime_execution_switches "
+            "WHERE name='calendar_execution_enabled'")
+        await conn.execute(
+            "DELETE FROM runtime_execution_switches WHERE name='calendar_execution_enabled'")
     for p in ("google_calendar", "microsoft_calendar"):
         for action in ("calendar_read", "calendar_write"):
             flag = await ff.get_flag(p, action)
@@ -252,8 +308,13 @@ async def main() -> int:
         captured = {}
 
         async def _fake_create(*, access_token=None, fields=None, calendar_id="primary"):
+            captured["create_cal"] = calendar_id
             return {"id": "new1", "title": fields.get("title"), "start": "2026-06-30T15:00:00Z",
                     "end": "—", "location": "", "attendees": [], "link": "https://cal/new1"}
+
+        async def _fake_list_calendars(*, access_token=None):
+            return [{"id": "primary", "name": "Personal", "primary": True},
+                    {"id": FAKE_CAL, "name": "Work", "primary": False}]
 
         async def _fake_update(*, access_token=None, event_id=None, fields=None, calendar_id="primary"):
             captured["update_cal"] = calendar_id
@@ -266,6 +327,7 @@ async def main() -> int:
         adapter.create_event = _fake_create
         adapter.update_event = _fake_update
         adapter.delete_event = _fake_delete
+        adapter.list_calendars = _fake_list_calendars
 
         # create: prepare (confirm card, no write) → confirm (fires write)
         h, t = await cal("Schedule a meeting with the team tomorrow")
@@ -281,7 +343,24 @@ async def main() -> int:
         h, t = await cal("confirm")
         responses.append(t)
         expect(h and t and "Created" in t and "✓" in t, "E confirm fires the create")
+        expect(captured.get("create_cal") == "primary", "E default create targets primary")
         expect(not await cc.has_pending(sess), "E pending cleared after confirm")
+
+        # create on a NAMED calendar → resolve calendar_id, show it, thread to the write
+        h, t = await cal("Schedule a meeting with the team on my Work calendar")
+        responses.append(t)
+        expect(h and t and "Ready to create" in t and "Calendar: Work" in t,
+               "E named-calendar create shows the target calendar on the card")
+        h, t = await cal("confirm")
+        responses.append(t)
+        expect(h and t and "Created" in t and captured.get("create_cal") == FAKE_CAL,
+               "E confirm creates on the NAMED calendar (calendar_id threaded to the write)")
+        # unknown calendar → help, nothing staged, no provider write
+        h, t = await cal("Schedule a review on my Zephyr calendar")
+        responses.append(t)
+        expect(h and t and "couldn't find" in t.lower() and "nothing was created" in t.lower(),
+               "E unknown calendar → help message")
+        expect(not await cc.has_pending(sess), "E unknown-calendar create stages nothing")
 
         # update: prepare → confirm
         h, t = await cal("Reschedule my Team sync meeting")
@@ -314,7 +393,51 @@ async def main() -> int:
             allowed_writes = await conn.fetchval(
                 "SELECT count(*) FROM calendar_access_events WHERE user_id=$1 AND allowed=true "
                 "AND action IN ('create','update','delete')", uid)
-        expect(allowed_writes == 3, f"E exactly three real writes via confirm (got {allowed_writes})")
+        expect(allowed_writes == 4, f"E exactly four real writes via confirm (got {allowed_writes})")
+
+        # --- F) multi-provider READ aggregation (provider-less → merge Google+Outlook) ---
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO provider_oauth_connectors (user_id, workspace_id, provider_name, "
+                "provider_type, status, scopes, access_token_encrypted, refresh_token_encrypted, "
+                "token_expires_at, metadata) VALUES ($1,$2,'outlook_calendar','calendar','connected',$3,$4,$5,"
+                "NOW()+interval '1 hour','{}'::jsonb)",
+                uid, wid, ["https://graph.microsoft.com/Calendars.ReadWrite"],
+                encrypt_secret(FAKE_ACCESS), encrypt_secret("r"))
+        ms_adapter = calendar_adapters.resolve_calendar_adapter("outlook_calendar")
+
+        async def _gcal_list(*, access_token=None, time_min=None, time_max=None, limit=10):
+            return [{"id": "g1", "title": "Google Standup", "start": "2026-06-24T09:00:00Z",
+                     "end": "2026-06-24T09:15:00Z", "calendar_id": "primary"}]
+
+        async def _ocal_list(*, access_token=None, time_min=None, time_max=None, limit=10):
+            return [{"id": "o1", "title": "Outlook Review", "start": "2026-06-24T14:00:00Z",
+                     "end": "2026-06-24T15:00:00Z", "calendar_id": "primary"}]
+        adapter.list_events = _gcal_list
+        ms_adapter.list_events = _ocal_list
+
+        # provider named → single provider only (no aggregation)
+        provs1 = await cc._resolve_read_providers("what's on my outlook calendar", uid)
+        expect(provs1 == ["outlook_calendar"], "F named provider → single")
+        provsN = await cc._resolve_read_providers("what's on my calendar this week", uid)
+        expect(set(provsN) == {"google_calendar", "outlook_calendar"},
+               "F no provider named → ALL connected calendars")
+
+        h, t = await cal("what's on my calendar this week")
+        responses.append(t)
+        expect(h and t and "Google Standup" in t and "Outlook Review" in t,
+               "F provider-less read merges events from BOTH calendars")
+        expect(h and t and "[google]" in t and "[outlook]" in t,
+               "F each merged event is tagged with its source calendar")
+        expect(h and t and "google + outlook" in t, "F header names both calendars")
+        # sorted by start: Google Standup (09:00) before Outlook Review (14:00)
+        expect(t.index("Google Standup") < t.index("Outlook Review"),
+               "F merged events sorted by start time")
+        # a named provider still routes to just that calendar
+        h, t = await cal("what's on my outlook calendar this week")
+        responses.append(t)
+        expect(h and t and "Outlook Review" in t and "Google Standup" not in t,
+               "F named 'outlook' reads ONLY outlook")
 
         # traces present
         async with pool.acquire() as conn:
@@ -336,15 +459,23 @@ async def main() -> int:
         cc._write_gate = orig_write_gate
         cc._get_access_token = orig_token
         cc.extract_event_fields = orig_extract
-        for meth in ("list_events", "create_event", "update_event", "delete_event"):
+        for meth in ("list_events", "create_event", "update_event", "delete_event", "list_calendars"):
             if meth in adapter.__dict__:
                 del adapter.__dict__[meth]
+        _ms = calendar_adapters.resolve_calendar_adapter("outlook_calendar")
+        if _ms is not None and "list_events" in _ms.__dict__:
+            del _ms.__dict__["list_events"]
         async with pool.acquire() as conn:
             # Restore the operator's REAL flag state (never clobber their config).
             for fr in saved_flags:
                 await conn.execute(
                     "UPDATE provider_execution_feature_flags SET enabled=$1, dry_run_only=$2 "
                     "WHERE id=$3", fr["enabled"], fr["dry_run_only"], fr["id"])
+            if saved_cal_switch is not None:
+                await conn.execute(
+                    "INSERT INTO runtime_execution_switches (name, enabled, updated_by) "
+                    "VALUES ('calendar_execution_enabled',$1,$2)",
+                    saved_cal_switch["enabled"], saved_cal_switch["updated_by"])
             await conn.execute("DELETE FROM calendar_pending_actions WHERE session_id=$1", sess)
             if uid is not None:
                 await conn.execute("DELETE FROM calendar_access_events WHERE user_id=$1", uid)

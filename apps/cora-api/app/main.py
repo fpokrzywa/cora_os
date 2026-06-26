@@ -27,6 +27,7 @@ from app.routers import (
     integration_providers,
     execution_approval,
     execution_adapters,
+    execution_switches,
     feature_flags,
     execution_governance,
     jobs,
@@ -123,6 +124,7 @@ app.include_router(integration_providers.router, dependencies=_auth_required)
 app.include_router(execution_approval.router, dependencies=_auth_required)
 app.include_router(execution_adapters.router, dependencies=_auth_required)
 app.include_router(feature_flags.router, dependencies=_auth_required)
+app.include_router(execution_switches.router, dependencies=_auth_required)
 app.include_router(execution_governance.router, dependencies=_auth_required)
 app.include_router(credentials.router, dependencies=_auth_required)
 app.include_router(provider_connectors.router, dependencies=_auth_required)

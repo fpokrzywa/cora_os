@@ -59,6 +59,7 @@ import type {
   AdapterSimulationResult,
   AdapterBlockedResult,
   ProviderFeatureFlag,
+  ExecutionSwitch,
   GovernanceDashboard,
   ExternalProviderCredential,
   ExternalProviderCredentialCreateRequest,
@@ -221,6 +222,7 @@ export function sendChat(
   message: string,
   sessionId: string | null,
   workspaceId?: string | null,
+  screenImage?: string | null,
 ) {
   return request<ChatResponse>("/chat", {
     method: "POST",
@@ -229,6 +231,7 @@ export function sendChat(
       session_id: sessionId ?? undefined,
       workspace_id: workspaceId ?? undefined,
       screen_context: getScreenContext(),
+      screen_image: screenImage ?? undefined,
     }),
   });
 }
@@ -1473,6 +1476,24 @@ export function updateProviderFeatureFlag(
   return request<ProviderFeatureFlag>(`/provider-feature-flags/${flagId}`, {
     method: "PATCH",
     body: JSON.stringify(changes),
+  });
+}
+
+// Execution kill-switch admin override
+export function listExecutionSwitches() {
+  return request<{ switches: ExecutionSwitch[] }>(`/admin/execution-switches`);
+}
+
+export function updateExecutionSwitch(name: string, enabled: boolean) {
+  return request<ExecutionSwitch>(`/admin/execution-switches/${name}`, {
+    method: "PATCH",
+    body: JSON.stringify({ enabled }),
+  });
+}
+
+export function clearExecutionSwitch(name: string) {
+  return request<ExecutionSwitch>(`/admin/execution-switches/${name}`, {
+    method: "DELETE",
   });
 }
 

@@ -68,6 +68,18 @@ class Settings(BaseSettings):
     google_oauth_redirect_base: str = ""
     microsoft_oauth_redirect_base: str = ""
 
+    # Tier-2 Screen Vision (opt-in screenshot analysis). DEDICATED master switch for
+    # sending a user-shared screenshot to a LOCAL vision model on the DGX Spark. Like
+    # calendar_execution_enabled it is NOT the global external_execution kill switch:
+    # this path is local-only (DGX on the internal network; no third party), user-
+    # initiated (the browser's screen-share picker grabs one frame), and never auto-
+    # captures. Requires this true AND vision_model_name set AND a DGX endpoint.
+    # Defaults false → nothing is ever sent to a vision model.
+    screen_vision_enabled: bool = False
+    # Ollama vision model pulled on the DGX Spark (e.g. qwen2.5-vl). Empty by default →
+    # screen vision reports not_configured and stays fail-closed.
+    vision_model_name: str = ""
+
     # IANA timezone used when telling the LLM the current date/time. Defaults to
     # UTC (the server clock); set e.g. CORA_TIMEZONE=America/New_York for local
     # time. Requires the tzdata package for non-UTC names (in requirements.txt).

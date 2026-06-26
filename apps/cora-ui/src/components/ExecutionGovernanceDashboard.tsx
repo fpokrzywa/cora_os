@@ -1,9 +1,105 @@
 import { useCallback, useEffect, useState } from "react";
-import { getExecutionGovernanceDashboard } from "../api";
-import type { GovernanceDashboard, GovernanceTraceRow } from "../types";
+import {
+  getExecutionGovernanceDashboard,
+  listExecutionSwitches,
+  updateExecutionSwitch,
+  clearExecutionSwitch,
+} from "../api";
+import type { ExecutionSwitch, GovernanceDashboard, GovernanceTraceRow } from "../types";
 
 function fmt(ts: string | null) {
   return ts ? new Date(ts).toLocaleString() : "—";
+}
+
+function ExecutionSwitches() {
+  const [switches, setSwitches] = useState<ExecutionSwitch[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    setError(null);
+    try {
+      setSwitches((await listExecutionSwitches()).switches);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to load switches");
+    }
+  }, []);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  const run = async (name: string, fn: () => Promise<unknown>) => {
+    setBusy(name);
+    setError(null);
+    try {
+      await fn();
+      await load();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Update failed");
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  return (
+    <>
+      <h3 className="admin__vt-h3">Execution Switches</h3>
+      <div className="admin__hint" style={{ marginBottom: 8 }}>
+        Master kill switches. A toggle here overrides the env default at runtime (no
+        redeploy). Flipping a switch lifts <strong>one</strong> gate only — per-provider
+        feature flags, OAuth scopes, and (for calendar) confirm-before-write still apply.
+      </div>
+      {error && <div className="admin__error">{error}</div>}
+      {!switches ? (
+        <div className="admin__hint">Loading…</div>
+      ) : (
+        <table className="admin__table">
+          <thead>
+            <tr><th>Switch</th><th>Effective</th><th>Env default</th><th>Source</th><th>Control</th></tr>
+          </thead>
+          <tbody>
+            {switches.map((s) => (
+              <tr key={s.name}>
+                <td>
+                  <div><strong>{s.label}</strong></div>
+                  <div className="muted" style={{ fontSize: 12 }}>{s.description}</div>
+                </td>
+                <td>
+                  <span style={{ fontWeight: 600, color: s.effective ? "var(--success, #16a34a)" : "var(--muted, #888)" }}>
+                    {s.effective ? "ON" : "OFF"}
+                  </span>
+                </td>
+                <td className="muted">{s.env_default ? "on" : "off"}</td>
+                <td className="muted" style={{ fontSize: 12 }}>{s.overridden ? "override" : "env"}</td>
+                <td>
+                  {s.manageable ? (
+                    <div style={{ display: "flex", gap: 6 }}>
+                      <button className="btn btn--sm" disabled={busy === s.name}
+                        onClick={() => run(s.name, () => updateExecutionSwitch(s.name, !s.effective))}>
+                        {s.effective ? "Turn off" : "Turn on"}
+                      </button>
+                      {s.overridden && (
+                        <button className="btn btn--ghost btn--sm" disabled={busy === s.name}
+                          title="Remove the override; revert to the env default"
+                          onClick={() => run(s.name, () => clearExecutionSwitch(s.name))}>
+                          ↺ env
+                        </button>
+                      )}
+                    </div>
+                  ) : (
+                    <span className="status-chip status-chip--archived" title={s.description}>
+                      🔒 env-locked
+                    </span>
+                  )}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </>
+  );
 }
 
 function TraceTable({ rows }: { rows: GovernanceTraceRow[] }) {
@@ -75,8 +171,11 @@ export function ExecutionGovernanceDashboard() {
         </button>
       </div>
 
+      <ExecutionSwitches />
+
       <div className="admin__error" style={{ display: "flex", alignItems: "center", gap: 8 }}>
-        🔒 <strong>Provider execution remains disabled. This dashboard is
+        🔒 <strong>Global provider (email/integration) execution remains disabled. The
+        switches above control calendar / screen-vision only; the activity below is
         observability-only.</strong>
       </div>
 

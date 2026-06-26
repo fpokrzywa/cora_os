@@ -84,7 +84,27 @@
       "Bash(sed -n '180,190p' components/SignalDrafts.tsx)",
       "Bash(sed -n '278,286p' components/SignalDrafts.tsx)",
       "Bash(grep -nE '^#{1,3} |^## [0-9]|Next|Roadmap|TODO|Suggested|What.s next|Immediate|Backlog|Recommended' /home/owner/cora-ai-os/HANDOFF_SESSION.md)",
-      "Bash(git add *)"
-    ]
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(git push *)",
+      "Bash(curl -s localhost:8000/health)",
+      "Bash(awk -F= '/^GOOGLE_OAUTH_|^MICROSOFT_OAUTH_/ {v=$2; gsub\\(/^[ \\\\t]+|[ \\\\t]+$/,\"\",v\\); print $1 \": \" \\(length\\(v\\)>0 ? \"SET \\(\"length\\(v\\)\" chars\\)\" : \"EMPTY\"\\)}' .env)",
+      "Bash(git checkout *)",
+      "Bash(gh pr create --base main --head feat/calendar-crud-live-inbox-read --title 'CHRONOS Calendar CRUD \\(v1.0–v1.4\\) + live Gmail inbox read' --body ' *)",
+      "Read(//usr/local/bin/**)",
+      "Bash(env)",
+      "Bash(apt-cache policy *)",
+      "Bash(git remote *)",
+      "Skill(update-config)",
+      "Bash(grep -inoE '[a-z0-9._%+-]+@[a-z0-9.-]+\\\\.[a-z]{2,}')",
+      "Bash(grep -vE 'example\\\\.\\(com|invalid\\)|@example|noreply@anthropic|claude\\\\.com|s\\\\.greatmarketvision|napkintocode|googleapis|microsoft|github|acme\\\\.com|@m$')",
+      "Bash(git reset *)",
+      "Bash(xargs -n1 basename)",
+      "Bash(grep -n \"^### \\\\|^## \\\\|^# \\\\|Screen Context Awareness\\\\|Calendar CRUD\\\\|^---$\" AIOS_CORE_ARCHITECTURE.md)",
+      "Bash(awk '{print $1\" lines / \"$2\" words\"}')",
+      "Bash(awk '/^  cora-api:/{f=1} f&&/environment:/{e=1} e{print NR\": \"$0} f&&/^  [a-z]/&&!/cora-api:/{if\\(seen\\)exit} /cora-api:/{seen=1}' docker-compose.yml)",
+      "Bash(grep -E \"\\(^|/\\)\\\\.env$\")"
+    ],
+    "defaultMode": "auto"
   }
 }

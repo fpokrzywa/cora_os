@@ -941,6 +941,48 @@ CREATE TABLE IF NOT EXISTS calendar_pending_actions (
 -- need calendars/<calendarId>/events/<id>). Idempotent for existing installs.
 ALTER TABLE calendar_pending_actions ADD COLUMN IF NOT EXISTS target_calendar_id TEXT;
 
+-- Tier-2 Screen Vision (opt-in): audit of screenshot-analysis attempts (allowed +
+-- fail-closed denials). PRIVACY: the screenshot bytes are NEVER stored — only the
+-- decision, model, byte count, a short question preview, and latency.
+CREATE TABLE IF NOT EXISTS screen_vision_events (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+    workspace_id UUID,
+    allowed BOOLEAN NOT NULL,
+    reason TEXT,
+    model TEXT,
+    image_bytes INTEGER,
+    question_preview TEXT,
+    latency_ms INTEGER,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS screen_vision_events_user_idx
+    ON screen_vision_events (user_id, created_at DESC);
+
+-- Per-user default provider for provider-less mail/calendar requests (so "what's on
+-- my calendar" with BOTH Google + Outlook connected uses an explicit default instead of
+-- "most-recently-connected wins"). One row per (user, provider_type ∈ email|calendar).
+CREATE TABLE IF NOT EXISTS user_provider_defaults (
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    provider_type TEXT NOT NULL,
+    provider_name TEXT NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (user_id, provider_type)
+);
+
+-- Admin-managed runtime override for the execution kill switches (calendar / screen
+-- vision). The env vars in config.py remain the DEFAULT; a row here, when present,
+-- OVERRIDES the env value at runtime so an operator can toggle from the app without a
+-- redeploy. No row => fall back to env. EXTERNAL_EXECUTION_ENABLED is deliberately NOT
+-- managed here (it stays env-locked — turning it on breaks the email/integration final
+-- interlock, which requires it false). One row per switch name.
+CREATE TABLE IF NOT EXISTS runtime_execution_switches (
+    name TEXT PRIMARY KEY,
+    enabled BOOLEAN NOT NULL,
+    updated_by UUID REFERENCES users(id) ON DELETE SET NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 -- Seed the 4 supported combinations, fail-closed (enabled=false, dry_run_only=true).
 -- action_type uses the canonical send_email / create_calendar_event the adapters
 -- + intents use (spec's "create_event" maps here via the service alias).

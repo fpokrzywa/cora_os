@@ -40,6 +40,8 @@ from app import chronos_tools
 from app import clock
 from app import feature_flags as ff
 from app import oauth_flow
+from app import provider_defaults
+from app import runtime_switches
 from app.config import settings
 from app.crypto import decrypt_secret
 from app.oauth_readiness import _scope_tail
@@ -68,6 +70,11 @@ LLM_TIMEOUT_SECONDS = 30.0
 _REGISTRY_ALIAS = {"outlook_calendar": "microsoft_calendar"}
 _EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
 _ISO_RE = re.compile(r"\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}(?::\d{2})?)?")
+# A named target calendar for CREATE: "on/in/to my|the <name> calendar" (the
+# non-greedy capture stops at the first " calendar", so a bare "to my calendar"
+# matches nothing → primary), or "calendar called|named <name>".
+_CAL_HINT_RE = re.compile(r"\b(?:on|in|to|onto|into)\s+(?:my|the)\s+(.+?)\s+calendar\b", re.I)
+_CAL_NAMED_RE = re.compile(r"\bcalendar\s+(?:called|named|titled)\s+[\"']?([\w '&./-]+?)[\"']?(?:[.,!?]|$)", re.I)
 
 
 def _trunc(v, n=80):
@@ -126,6 +133,18 @@ _WEEKDAYS = {"monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
              "friday": 4, "saturday": 5, "sunday": 6}
 
 
+def _has_day_ref(m: str) -> bool:
+    """True if the message names a specific day/window (used to recognize a day-scoped
+    schedule question that omits an explicit calendar anchor)."""
+    if any(d in m for d in ("today", "tomorrow", "yesterday", "tonight", "this morning",
+                            "this afternoon", "this evening", "this week", "last week",
+                            "next week", "the week")):
+        return True
+    if any(wd in m for wd in _WEEKDAYS):
+        return True
+    return bool(re.search(r"\d{4}-\d{2}-\d{2}", m))
+
+
 def resolve_read_window(message: str) -> tuple[str, str, str]:
     """Resolve a read query into a concrete [time_min, time_max] (RFC3339 UTC) +
     a human label. Day/week references resolve against the current date IN THE
@@ -163,6 +182,15 @@ def resolve_read_window(message: str) -> tuple[str, str, str]:
         s, e = week_of(today); return (*span(s, e), "this week")
     for name, idx in _WEEKDAYS.items():
         if name in m:
+            if "last" in m or "past" in m:
+                # most recent occurrence strictly before today ("this past tuesday")
+                target = today - timedelta(days=((today.weekday() - idx) % 7) or 7)
+                s, e = day_bounds(target)
+                return (*span(s, e), name.capitalize())
+            if "next" in m:
+                target = today + timedelta(days=((idx - today.weekday()) % 7) or 7)
+                s, e = day_bounds(target)
+                return (*span(s, e), name.capitalize())
             monday = today - timedelta(days=today.weekday())
             s, e = day_bounds(monday + timedelta(days=idx))
             return (*span(s, e), name.capitalize())
@@ -196,7 +224,10 @@ def detect_calendar_command(message: str) -> Optional[tuple[str, dict]]:
     """Conservative, explicit-only detection. Requires a calendar/meeting/event
     anchor so generic CHRONOS planning chatter ('plan my week') does NOT route
     here. Returns (kind, payload) with kind in list/create/update/delete."""
-    m = (message or "").lower().strip()
+    # Strip a provider word used as an adjective ("my outlook calendar" → "my calendar")
+    # so a named provider doesn't break phrase matching; provider RESOLUTION still reads
+    # the original message in _resolve_provider.
+    m = provider_defaults.strip_provider_adjectives((message or "").lower().strip())
     if not m:
         return None
     has_anchor = any(n in m for n in ("calendar", "meeting", "event", "appointment", "agenda"))
@@ -233,6 +264,17 @@ def detect_calendar_command(message: str) -> Optional[tuple[str, dict]]:
         "list my events", "list my meetings", "show my calendar", "show my meetings",
         "show my schedule", "what's my schedule", "whats my schedule")
     if any(p in m for p in list_phrases):
+        return ("list", {"window": _detect_window(m)})
+
+    # Day-scoped schedule questions that omit an explicit calendar anchor, e.g.
+    # "what was on this past tuesday", "anything on monday?", "what did I have on the
+    # 14th". Requires a clear schedule-query phrase AND a concrete day reference so
+    # generic chatter doesn't route here.
+    sched_q = ("what was on", "what is on", "what's on", "whats on", "what was scheduled",
+               "what's scheduled", "whats scheduled", "what was happening",
+               "what did i have", "what do i have", "anything on", "anything scheduled",
+               "anything happening", "what was on it", "what was on that")
+    if any(q in m for q in sched_q) and _has_day_ref(m):
         return ("list", {"window": _detect_window(m)})
     return None
 
@@ -333,13 +375,26 @@ async def _resolve_provider(message: str, user_id: uuid.UUID) -> str:
         return "outlook_calendar"
     if "google" in m or "gmail" in m:
         return "google_calendar"
+    # No provider named → the user's connected default, else most-recently connected.
+    return await provider_defaults.resolve(message, user_id, "calendar", "google_calendar")
+
+
+async def _resolve_read_providers(message: str, user_id: uuid.UUID) -> list[str]:
+    """Which calendars a READ targets. A named provider → just that one. Otherwise ALL
+    connected calendars (so a provider-less 'what's on my calendar' aggregates Google +
+    Outlook). Falls back to the default when none are connected (→ a clean gated reply)."""
+    m = (message or "").lower()
+    if "outlook" in m or "microsoft" in m:
+        return ["outlook_calendar"]
+    if "google" in m or "gmail" in m:
+        return ["google_calendar"]
     pool = clients.db_pool
     async with pool.acquire() as conn:
-        row = await conn.fetchval(
+        rows = await conn.fetch(
             "SELECT provider_name FROM provider_oauth_connectors "
             "WHERE user_id=$1 AND provider_type='calendar' AND status='connected' "
-            "ORDER BY created_at DESC LIMIT 1", user_id)
-    return row or "google_calendar"
+            "ORDER BY created_at", user_id)
+    return [r["provider_name"] for r in rows] or ["google_calendar"]
 
 
 async def _connection_state(provider: str, user_id: uuid.UUID) -> dict:
@@ -404,7 +459,9 @@ async def _write_gate(provider: str, user_id: uuid.UUID, action: str) -> dict:
     supports = bool(s["cap"].get(_WRITE_CAP[action]))
     flag = await ff.get_flag(provider, "calendar_write")
     flag_ok = bool(flag and flag["enabled"] and not flag["dry_run_only"])
-    kill_switch_clear = bool(settings.calendar_execution_enabled)
+    # Master gate: the DB override (admin-toggleable from the app) if set, else the
+    # CALENDAR_EXECUTION_ENABLED env default. NOT the global external_execution switch.
+    kill_switch_clear = await runtime_switches.effective("calendar_execution_enabled")
     reasons = []
     if not s["connected"]: reasons.append("provider not connected")
     if not s["token_ok"]: reasons.append("no valid/refreshable token")
@@ -572,6 +629,29 @@ def _render_events(provider, events, label) -> str:
     return "\n".join(lines)
 
 
+def _short(provider) -> str:
+    return {"google_calendar": "google", "outlook_calendar": "outlook",
+            "gmail": "gmail", "outlook_mail": "outlook"}.get(provider, provider or "")
+
+
+def _render_events_multi(providers, events, label, skipped) -> str:
+    """Render events merged across MULTIPLE calendars, each line tagged with its source."""
+    head = " + ".join(_short(p) for p in providers)
+    if not events:
+        base = f"**Calendar ({head})** — no events for {label} (read-only)."
+    else:
+        lines = [f"**Calendar — {len(events)} event(s) for {label}** ({head}, read-only)"]
+        for i, e in enumerate(events, 1):
+            tag = f"[{_short(e.get('provider'))}] " if e.get("provider") else ""
+            loc = f" · {_trunc(e.get('location'), 40)}" if e.get("location") else ""
+            lines.append(f"{i}. {tag}**{_trunc(e.get('title'))}** · {_fmt_event_when(e)}{loc}")
+        base = "\n".join(lines)
+    if skipped:
+        base += "\n\n_Skipped: " + "; ".join(
+            f"{_short(s['provider'])} ({s['reason']})" for s in skipped) + "._"
+    return base
+
+
 def _fmt_when(fields) -> str:
     s, e = fields.get("start_time"), fields.get("end_time")
     if s and e:
@@ -579,12 +659,14 @@ def _fmt_when(fields) -> str:
     return s or "time not specified"
 
 
-def _confirm_card_create(provider, fields) -> str:
+def _confirm_card_create(provider, fields, calendar_name=None) -> str:
     att = fields.get("attendees") or []
     lines = [f"📅 **Ready to create on {provider}** — reply **confirm** to create "
              "(invites will be sent) or **cancel**:",
              f"- **{fields.get('title') or 'New event'}**",
              f"- When: {_fmt_when(fields)}"]
+    if calendar_name:
+        lines.append(f"- Calendar: {calendar_name}")
     if fields.get("location"):
         lines.append(f"- Where: {fields['location']}")
     if att:
@@ -652,17 +734,88 @@ async def handle_calendar_turn(
                                           user_id=user_id, workspace_uuid=workspace_uuid)
 
     kind, payload = command
+    if kind == "list":
+        providers = await _resolve_read_providers(message, user_id)
+        await _trace(session_uuid, user_id, workspace_uuid, trace_type=TRACE_REQUESTED,
+                     result={"providers": providers, "kind": kind})
+        return await _handle_read(providers, message, session_uuid=session_uuid,
+                                  user_id=user_id, workspace_uuid=workspace_uuid)
     provider = await _resolve_provider(message, user_id)
     await _trace(session_uuid, user_id, workspace_uuid, trace_type=TRACE_REQUESTED,
                  result={"provider": provider, "kind": kind})
-    if kind == "list":
-        return await _handle_read(provider, message, session_uuid=session_uuid,
-                                  user_id=user_id, workspace_uuid=workspace_uuid)
     return await _prepare_write(kind, provider, message, payload, session_uuid=session_uuid,
                                 user_id=user_id, workspace_uuid=workspace_uuid)
 
 
-async def _handle_read(provider, message, *, session_uuid, user_id, workspace_uuid):
+async def _read_one_calendar(provider, time_min, time_max, *, session_uuid, user_id,
+                             workspace_uuid):
+    """Gate + broker + read ONE calendar (events tagged with their provider). Audits +
+    traces per provider. Returns (events|None, {provider, reason}) — events None when
+    gated out / no token / read error."""
+    decision = await _read_gate(provider, user_id)
+    if not decision["allowed"]:
+        await _audit(user_id, workspace_uuid, provider, "list", False, decision["reason"])
+        if decision["capability_mismatch"]:
+            await _trace(session_uuid, user_id, workspace_uuid, trace_type=TRACE_CAPABILITY_DENIED,
+                         status="blocked", result={"provider": provider, "reason": "supports_calendar_read=false"})
+        return None, {"provider": provider, "reason": decision["reason"]}
+    adapter = calendar_adapters.resolve_calendar_adapter(provider)
+    if adapter is None:
+        await _audit(user_id, workspace_uuid, provider, "list", False, "no calendar adapter")
+        return None, {"provider": provider, "reason": "no adapter"}
+    token = await _get_access_token(provider, user_id)
+    if not token:
+        await _audit(user_id, workspace_uuid, provider, "list", False, "no usable token (broker)")
+        return None, {"provider": provider, "reason": "no usable token"}
+    try:
+        events = await adapter.list_events(access_token=token, time_min=time_min,
+                                           time_max=time_max, limit=50)
+    except calendar_adapters.CalendarAccessDisabled:
+        await _audit(user_id, workspace_uuid, provider, "list", False, "adapter disabled")
+        return None, {"provider": provider, "reason": "adapter disabled"}
+    except calendar_adapters.CalendarError as exc:
+        await _audit(user_id, workspace_uuid, provider, "list", False, str(exc))
+        await _trace(session_uuid, user_id, workspace_uuid, trace_type=TRACE_PROVIDER_FAILED,
+                     status="error", result={"provider": provider, "kind": "list", "error": str(exc)})
+        return None, {"provider": provider, "reason": f"read failed ({exc})"}
+    for e in events:
+        e["provider"] = provider
+    await _audit(user_id, workspace_uuid, provider, "list", True, "read ok",
+                 event_ref=(events[0].get("id") if events else None))
+    return events, {"provider": provider, "reason": "ok"}
+
+
+async def _handle_read(providers, message, *, session_uuid, user_id, workspace_uuid):
+    """Dispatch a calendar read. One provider (named, or only one connected) → the exact
+    single-provider path. Multiple → read each (gated) and merge across calendars."""
+    if len(providers) <= 1:
+        return await _handle_read_single(
+            providers[0] if providers else "google_calendar", message,
+            session_uuid=session_uuid, user_id=user_id, workspace_uuid=workspace_uuid)
+    time_min, time_max, label = resolve_read_window(message)
+    merged, oks, skipped = [], [], []
+    for p in providers:
+        evs, info = await _read_one_calendar(p, time_min, time_max, session_uuid=session_uuid,
+                                             user_id=user_id, workspace_uuid=workspace_uuid)
+        if evs is not None:
+            merged.extend(evs)
+            oks.append(p)
+        else:
+            skipped.append(info)
+    if not oks:
+        await _trace(session_uuid, user_id, workspace_uuid, trace_type=TRACE_LIST,
+                     status="blocked", result={"providers": providers, "skipped": skipped})
+        notes = "; ".join(f"{_short(s['provider'])}: {s['reason']}" for s in skipped)
+        return True, (f"🔒 I couldn't read any of your calendars right now — {notes}. "
+                      "No calendar data was accessed.")
+    merged.sort(key=lambda e: e.get("start") or "")
+    merged = _dedupe_series(merged)[:12]
+    await _trace(session_uuid, user_id, workspace_uuid, trace_type=TRACE_LIST,
+                 result={"providers": oks, "count": len(merged), "window": label})
+    return True, _render_events_multi(oks, merged, label, skipped)
+
+
+async def _handle_read_single(provider, message, *, session_uuid, user_id, workspace_uuid):
     decision = await _read_gate(provider, user_id)
     if not decision["allowed"]:
         await _audit(user_id, workspace_uuid, provider, "list", False, decision["reason"])
@@ -770,6 +923,60 @@ def _target_help_msg(provider, kind, status, candidates, query) -> str:
             f"Name the event to {verb} — nothing was changed.")
 
 
+# --------------------------------------------------------------------------- #
+# Target-calendar resolution (CREATE) — choose which calendar a new event lands
+# on from a natural-language name; default primary; refuse-on-ambiguous.
+# --------------------------------------------------------------------------- #
+
+def _extract_calendar_hint(message: str) -> Optional[str]:
+    m = message or ""
+    mo = _CAL_HINT_RE.search(m) or _CAL_NAMED_RE.search(m)
+    if not mo:
+        return None
+    name = mo.group(1).strip().strip("\"'")
+    # Drop a provider word ("on my outlook calendar" → provider, not a calendar named
+    # "outlook"; "on my outlook Work calendar" → "Work").
+    name = provider_defaults.strip_provider_words(name)
+    # "my"/"the" alone (e.g. "to my calendar") carries no real calendar name.
+    return name if name and name.lower() not in ("my", "the") else None
+
+
+def _match_calendars(hint: Optional[str], calendars: list) -> list:
+    """Calendars whose name matches the hint — exact (case-insensitive) wins over
+    substring, so 'Work' picks 'Work' even when 'Work Projects' also exists."""
+    h = (hint or "").strip().lower()
+    if not h:
+        return []
+    exact = [c for c in calendars if (c.get("name") or "").strip().lower() == h]
+    if exact:
+        return exact
+    return [c for c in calendars if h in (c.get("name") or "").lower()]
+
+
+async def _resolve_calendar(adapter, token, hint: Optional[str]) -> dict:
+    """Resolve which calendar a CREATE targets. No hint → primary. Otherwise list
+    the user's writable calendars and match — never guessing on 0 or >1 matches.
+    status ∈ ok | no_match | ambiguous."""
+    if not hint:
+        return {"status": "ok", "calendar": {"id": "primary", "name": "primary"}}
+    cals = await adapter.list_calendars(access_token=token)
+    matches = _match_calendars(hint, cals)
+    if not matches:
+        return {"status": "no_match", "candidates": cals[:8]}
+    if len(matches) > 1:
+        return {"status": "ambiguous", "candidates": matches[:8]}
+    return {"status": "ok", "calendar": matches[0]}
+
+
+def _calendar_help_msg(provider, status, candidates, hint) -> str:
+    names = "\n".join(f"- {c.get('name')}" for c in candidates) or "- (none found)"
+    head = (f"I couldn't find a writable {provider} calendar matching “{hint}”."
+            if status == "no_match"
+            else f"More than one {provider} calendar matches “{hint}” — I won't guess which.")
+    return (f"{head} Your calendars:\n{names}\n\n"
+            "Tell me which one (use its exact name) — nothing was created.")
+
+
 async def _prepare_write(kind, provider, message, payload, *, session_uuid, user_id, workspace_uuid):
     """Gate the write. If closed → deny (+ create falls back to an internal proposal).
     If open → STAGE the action and ask the user to confirm; nothing touches the
@@ -797,12 +1004,37 @@ async def _prepare_write(kind, provider, message, payload, *, session_uuid, user
 
     if kind == "create":
         fields = await extract_event_fields(message, "create")
+        # Default to primary (no provider call). Only when the user names a calendar
+        # ("on my Work calendar") do we look it up to resolve a concrete calendar_id.
+        cal_id, cal_name = "primary", None
+        hint = _extract_calendar_hint(message)
+        if hint:
+            token = await _get_access_token(provider, user_id)
+            if not token:
+                await _audit(user_id, workspace_uuid, provider, kind, False, "no usable token (broker)")
+                return True, (f"🔒 Calendar write for {provider} is enabled by policy, but I "
+                              "couldn't obtain a usable access token. Nothing was changed.")
+            try:
+                res = await _resolve_calendar(adapter, token, hint)
+            except calendar_adapters.CalendarError as exc:
+                await _audit(user_id, workspace_uuid, provider, kind, False, str(exc))
+                await _trace(session_uuid, user_id, workspace_uuid, trace_type=TRACE_PROVIDER_FAILED,
+                             status="error", result={"provider": provider, "kind": kind, "error": str(exc)})
+                return True, f"⚠️ I couldn't look up your {provider} calendars ({exc}). Nothing was changed."
+            if res["status"] != "ok":
+                await _audit(user_id, workspace_uuid, provider, kind, False, f"calendar {res['status']}")
+                await _trace(session_uuid, user_id, workspace_uuid, trace_type=TRACE_WRITE_DENIED,
+                             status="blocked", result={"provider": provider, "kind": kind,
+                                                       "reason": f"calendar_{res['status']}"})
+                return True, _calendar_help_msg(provider, res["status"], res.get("candidates", []), hint)
+            cal_id, cal_name = res["calendar"]["id"], res["calendar"].get("name")
         await _set_pending(session_uuid, user_id=user_id, workspace_id=workspace_uuid,
-                           kind="create", provider=provider, fields=fields)
+                           kind="create", provider=provider, fields=fields, target_calendar_id=cal_id)
         await _trace(session_uuid, user_id, workspace_uuid, trace_type=TRACE_CONFIRM_PENDING,
                      result={"provider": provider, "kind": "create",
-                             "has_start": bool(fields.get("start_time"))})
-        return True, _confirm_card_create(provider, fields)
+                             "has_start": bool(fields.get("start_time")), "calendar_id": cal_id})
+        return True, _confirm_card_create(provider, fields,
+                                          cal_name if cal_id != "primary" else None)
 
     # update/delete need a target resolved against the live calendar.
     token = await _get_access_token(provider, user_id)
@@ -882,7 +1114,8 @@ async def _handle_confirmation(confirmation, pending, *, session_uuid, user_id, 
                  result={"provider": provider, "kind": kind})
     try:
         if kind == "create":
-            ev = await adapter.create_event(access_token=token, fields=fields)
+            ev = await adapter.create_event(access_token=token, fields=fields,
+                                            calendar_id=target_cal)
         elif kind == "update":
             ev = await adapter.update_event(access_token=token, event_id=target_id,
                                             fields=fields, calendar_id=target_cal)

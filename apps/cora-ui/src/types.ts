@@ -1356,6 +1356,19 @@ export interface ProviderFeatureFlag {
   updated_at: string;
 }
 
+export interface ExecutionSwitch {
+  name: string;
+  label: string;
+  description: string;
+  manageable: boolean;
+  env_default: boolean;
+  override: boolean | null;
+  overridden: boolean;
+  effective: boolean;
+  updated_at: string | null;
+  updated_by: string | null;
+}
+
 export interface FeatureFlagState {
   present: boolean;
   enabled: boolean;

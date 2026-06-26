@@ -55,6 +55,11 @@ async def main() -> int:
 
     # detection
     expect(ci.detect_inbox_command("Show my latest emails.") == ("list", None), "detect list")
+    # provider-word tolerance: a named provider must not break detection
+    expect(ci.detect_inbox_command("Show my outlook inbox.") == ("list", None),
+           "detect list with a provider word ('outlook inbox')")
+    expect(ci.detect_inbox_command("Search my outlook inbox for emails from Mark.") == ("search", "from:mark"),
+           "provider word stripped, sender 'from:' search preserved")
     expect(ci.detect_inbox_command("Search my inbox for emails from Mark.") == ("search", "from:mark"), "detect search from → sender-scoped from: operator")
     expect(ci.detect_inbox_command("Summarize unread emails.") == ("summarize", None), "detect summarize")
     expect(ci.detect_inbox_command("Summarize this email thread.") == ("read_thread", None), "detect read_thread")
@@ -200,6 +205,54 @@ async def main() -> int:
         expect(src and src.get("message_id") == "m1" and src.get("provider") == "gmail",
                "C reply draft linked to source email")
 
+        # --- D) multi-mailbox READ aggregation (provider-less → merge Gmail+Outlook) ---
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO provider_oauth_connectors (user_id, workspace_id, provider_name, "
+                "provider_type, status, scopes, access_token_encrypted, refresh_token_encrypted, "
+                "token_expires_at, metadata) VALUES ($1,$2,'outlook_mail','email','connected',$3,$4,$5,"
+                "NOW()+interval '1 hour','{}'::jsonb)",
+                uid, wid, ["https://graph.microsoft.com/Mail.Read"],
+                encrypt_secret(FAKE_ACCESS), encrypt_secret("r"))
+        ms_adapter = inbox_adapters.resolve_inbox_adapter("outlook_mail")
+
+        async def _gm_list(*, access_token=None, query=None, limit=10):
+            return [{"id": "gm1", "thread_id": "tg", "from": "Alice <alice@gmail.com>",
+                     "subject": "Gmail hello", "date": "Wed, 24 Jun 2026 09:00:00 +0000",
+                     "snippet": "hi from gmail"}]
+
+        async def _om_list(*, access_token=None, query=None, limit=10):
+            return [{"id": "om1", "thread_id": "to", "from": "Bob <bob@outlook.com>",
+                     "subject": "Outlook hello", "date": "2026-06-24T14:00:00Z",
+                     "snippet": "hi from outlook"}]
+        adapter.list_messages = _gm_list
+        ms_adapter.list_messages = _om_list
+
+        expect(await ci._resolve_read_providers("show my outlook inbox", uid) == ["outlook_mail"],
+               "D named provider → single mailbox")
+        provsN = await ci._resolve_read_providers("show my latest emails", uid)
+        expect(set(provsN) == {"gmail", "outlook_mail"}, "D no provider → ALL connected mailboxes")
+
+        h, t = await inbox("Show my latest emails.")
+        responses.append(t)
+        expect(h and t and "Gmail hello" in t and "Outlook hello" in t,
+               "D provider-less read merges BOTH mailboxes")
+        expect(h and t and "[gmail]" in t and "[outlook]" in t, "D each message tagged with its source")
+        expect(h and t and "gmail + outlook" in t, "D header names both mailboxes")
+        expect(t.index("Outlook hello") < t.index("Gmail hello"),
+               "D merged messages sorted newest-first (Outlook 14:00 before Gmail 09:00)")
+
+        h, t = await inbox("Summarize unread emails.")
+        responses.append(t)
+        expect(h and t and "Inbox summary" in t and "Gmail hello" in t and "Outlook hello" in t,
+               "D summarize aggregates both mailboxes")
+
+        # a named provider still routes to just that mailbox
+        h, t = await inbox("show my outlook emails")
+        responses.append(t)
+        expect(h and t and "Outlook hello" in t and "Gmail hello" not in t,
+               "D named 'outlook' reads ONLY outlook")
+
         # no token leak anywhere
         for r in responses:
             expect(FAKE_ACCESS not in (r or ""), "token leaked into an inbox response")
@@ -218,6 +271,9 @@ async def main() -> int:
         for meth in ("list_messages", "search_messages", "read_message"):
             if meth in adapter.__dict__:
                 del adapter.__dict__[meth]
+        _ms = inbox_adapters.resolve_inbox_adapter("outlook_mail")
+        if _ms is not None and "list_messages" in _ms.__dict__:
+            del _ms.__dict__["list_messages"]
         async with pool.acquire() as conn:
             # Restore the operator's real inbox_read flag state (never clobber it).
             for fr in saved_flags:

@@ -146,6 +146,11 @@ class CalendarAdapter:
                            event_id: str, calendar_id: str = "primary") -> dict:
         raise NotImplementedError
 
+    async def list_calendars(self, *, access_token: Optional[str] = None) -> list:
+        """Writable calendars the user owns: [{id, name, primary}]. Used to resolve
+        a natural-language calendar name on CREATE. Fails closed to primary."""
+        raise NotImplementedError
+
     def describe(self) -> dict:
         return {
             "provider_name": self.provider_name,
@@ -244,6 +249,23 @@ class GoogleCalendarAdapter(CalendarAdapter):
         events.sort(key=lambda e: e.get("start") or "")
         return events[:limit]
 
+    async def list_calendars(self, *, access_token: Optional[str] = None) -> list:
+        token = self._require_token(access_token)
+        # minAccessRole=writer → only calendars the user can create events on, so a
+        # subscribed/read-only calendar can't be picked as a write target.
+        try:
+            data = await _http_get_json(
+                "https://www.googleapis.com/calendar/v3/users/me/calendarList",
+                token=token, params={"fields": "items(id,summary,summaryOverride,primary)",
+                                     "minAccessRole": "writer"})
+        except CalendarError:
+            return [{"id": "primary", "name": "primary", "primary": True}]
+        out = [{"id": c["id"],
+                "name": c.get("summaryOverride") or c.get("summary") or c["id"],
+                "primary": bool(c.get("primary"))}
+               for c in (data.get("items") or []) if c.get("id")]
+        return out or [{"id": "primary", "name": "primary", "primary": True}]
+
     async def get_event(self, *, access_token: Optional[str] = None, event_id: str,
                         calendar_id: str = "primary") -> dict:
         token = self._require_token(access_token)
@@ -329,6 +351,20 @@ class MicrosoftCalendarAdapter(CalendarAdapter):
         listing = await _http_get_json(url, token=token, params=params)
         return [self._normalize(e) for e in (listing.get("value") or [])[:limit]]
 
+    async def list_calendars(self, *, access_token: Optional[str] = None) -> list:
+        token = self._require_token(access_token)
+        try:
+            data = await _http_get_json(
+                f"{_GRAPH_BASE}/calendars", token=token,
+                params={"$select": "id,name,isDefaultCalendar,canEdit", "$top": 50})
+        except CalendarError:
+            return [{"id": "primary", "name": "primary", "primary": True}]
+        out = [{"id": c["id"], "name": c.get("name") or c["id"],
+                "primary": bool(c.get("isDefaultCalendar"))}
+               for c in (data.get("value") or [])
+               if c.get("id") and c.get("canEdit") is not False]
+        return out or [{"id": "primary", "name": "primary", "primary": True}]
+
     async def get_event(self, *, access_token: Optional[str] = None, event_id: str,
                         calendar_id: str = "primary") -> dict:
         token = self._require_token(access_token)
@@ -339,8 +375,11 @@ class MicrosoftCalendarAdapter(CalendarAdapter):
     async def create_event(self, *, access_token: Optional[str] = None, fields: dict,
                            calendar_id: str = "primary") -> dict:
         token = self._require_token(access_token)
+        # Default calendar → /me/events; a named calendar → /me/calendars/{id}/events.
+        base = (_GRAPH_BASE if calendar_id in (None, "primary")
+                else f"{_GRAPH_BASE}/calendars/{calendar_id}")
         return self._normalize(await _http_write(
-            "POST", f"{_GRAPH_BASE}/events", token=token, json_body=self._body(fields)))
+            "POST", f"{base}/events", token=token, json_body=self._body(fields)))
 
     async def update_event(self, *, access_token: Optional[str] = None,
                            event_id: str, fields: dict, calendar_id: str = "primary") -> dict:

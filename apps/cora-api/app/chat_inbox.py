@@ -19,6 +19,7 @@ import logging
 import re
 import uuid
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from typing import Optional
 
 from app.clients import clients
@@ -26,6 +27,7 @@ from app import chat_email_lifecycle as cel
 from app import feature_flags as ff
 from app import inbox_adapters
 from app import oauth_flow
+from app import provider_defaults
 from app import signal_tools
 from app.crypto import decrypt_secret
 from app.oauth_readiness import _scope_tail
@@ -70,7 +72,9 @@ def _extract_query(m: str) -> Optional[str]:
 
 
 def detect_inbox_command(message: str) -> Optional[tuple[str, Optional[str]]]:
-    m = (message or "").lower().strip()
+    # Strip a provider adjective ("my outlook inbox" → "my inbox") so a named provider
+    # doesn't break phrase matching; _resolve_provider still reads the original message.
+    m = provider_defaults.strip_provider_adjectives((message or "").lower().strip())
     if not m:
         return None
     # Draft a reply to an inbox email (must beat the v1.9 "draft an email" create).
@@ -104,13 +108,50 @@ async def _resolve_provider(message: str, user_id: uuid.UUID) -> str:
         return "outlook_mail"
     if "gmail" in m or "google" in m:
         return "gmail"
+    # No provider named → the user's connected default, else most-recently connected.
+    return await provider_defaults.resolve(message, user_id, "email", "gmail")
+
+
+async def _resolve_read_providers(message: str, user_id: uuid.UUID) -> list[str]:
+    """Which mailboxes a list/search/summarize READ targets. Named provider → just that
+    one. Otherwise ALL connected mailboxes (so a provider-less 'show my emails' aggregates
+    Gmail + Outlook). Falls back to gmail when none are connected (→ a clean gated reply)."""
+    m = (message or "").lower()
+    if "outlook" in m or "microsoft" in m:
+        return ["outlook_mail"]
+    if "gmail" in m or "google" in m:
+        return ["gmail"]
     pool = clients.db_pool
     async with pool.acquire() as conn:
-        row = await conn.fetchval(
+        rows = await conn.fetch(
             "SELECT provider_name FROM provider_oauth_connectors "
             "WHERE user_id=$1 AND provider_type='email' AND status='connected' "
-            "ORDER BY created_at DESC LIMIT 1", user_id)
-    return row or "gmail"
+            "ORDER BY created_at", user_id)
+    return [r["provider_name"] for r in rows] or ["gmail"]
+
+
+def _short(provider) -> str:
+    return {"gmail": "gmail", "outlook_mail": "outlook"}.get(provider, provider or "")
+
+
+def _msg_dt(s) -> datetime:
+    """Parse a message date (Gmail RFC-2822 header or Graph ISO) into an aware UTC
+    datetime for cross-provider sorting; unparseable → epoch (sorts last)."""
+    s = (s or "").strip()
+    dt = None
+    if s and s != "—":
+        try:
+            dt = parsedate_to_datetime(s)
+        except (TypeError, ValueError, IndexError):
+            dt = None
+        if dt is None:
+            try:
+                dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+            except ValueError:
+                dt = None
+    if dt is None:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
 async def _gate(provider: str, user_id: uuid.UUID) -> dict:
@@ -253,6 +294,34 @@ def _render_summary(provider, msgs) -> str:
     return "\n".join(lines)
 
 
+def _skip_note(skipped) -> str:
+    if not skipped:
+        return ""
+    return ("\n\n_Skipped: " + "; ".join(
+        f"{_short(s['provider'])} ({s['reason']})" for s in skipped) + "._")
+
+
+def _render_list_multi(providers, msgs, skipped) -> str:
+    head = " + ".join(_short(p) for p in providers)
+    lines = [f"**Inbox — {len(msgs)} message(s)** ({head}, read-only)"]
+    for i, mm in enumerate(msgs, 1):
+        lines.append(f"{i}. [{_short(mm.get('provider'))}] `{str(mm.get('id'))[:10]}` · "
+                     f"from {mm.get('from','—')} · {_trunc(mm.get('subject'))} · {mm.get('date','—')}")
+    lines.append("\n_Safe actions: summarize · draft reply · create follow-up draft._")
+    return "\n".join(lines) + _skip_note(skipped)
+
+
+def _render_summary_multi(providers, msgs, skipped) -> str:
+    head = " + ".join(_short(p) for p in providers)
+    lines = [f"**Inbox summary** ({len(msgs)} message(s) across {head}, read-only)"]
+    for mm in msgs:
+        lines.append(f"- [{_short(mm.get('provider'))}] **{_trunc(mm.get('subject'))}** · "
+                     f"from {mm.get('from','—')} · {mm.get('date','—')}"
+                     + (f"\n  {_trunc(mm.get('snippet'), 140)}" if mm.get('snippet') else ""))
+    lines.append("\n_Safe actions: draft reply · create follow-up draft. Nothing was sent._")
+    return "\n".join(lines) + _skip_note(skipped)
+
+
 # --------------------------------------------------------------------------- #
 # Dispatch
 # --------------------------------------------------------------------------- #
@@ -262,8 +331,88 @@ async def handle_inbox_command(
     user_id: uuid.UUID, workspace_uuid: Optional[uuid.UUID], scope_type: str,
     is_admin: bool,
 ) -> tuple[bool, Optional[str]]:
+    """Dispatch an inbox command. list/search/summarize aggregate across ALL connected
+    mailboxes when no provider is named; read_thread/draft_reply (single latest message)
+    + any named-provider request stay single."""
     kind, query = cmd
-    provider = await _resolve_provider(message, user_id)
+    if kind in ("list", "search", "summarize"):
+        providers = await _resolve_read_providers(message, user_id)
+        if len(providers) > 1:
+            return await _handle_inbox_multi(kind, query, providers, session_uuid=session_uuid,
+                                             user_id=user_id, workspace_uuid=workspace_uuid)
+        provider = providers[0]
+    else:
+        provider = await _resolve_provider(message, user_id)
+    return await _handle_inbox_single(kind, query, provider, session_uuid=session_uuid,
+                                      user_id=user_id, workspace_uuid=workspace_uuid)
+
+
+async def _read_one_inbox(provider, kind, query, *, session_uuid, user_id, workspace_uuid):
+    """Gate + broker + read ONE mailbox for list/search/summarize (msgs tagged with
+    their provider). Audits per provider. Returns (msgs|None, {provider, reason})."""
+    decision = await _gate(provider, user_id)
+    if not decision["allowed"]:
+        await _audit(user_id, workspace_uuid, provider, kind, False, decision["reason"])
+        if decision.get("capability_mismatch"):
+            await _trace(session_uuid, user_id, workspace_uuid, trace_type=TRACE_CAPABILITY_DENIED,
+                         status="blocked", result={"provider": provider, "kind": kind,
+                                                   "reason": "supports_read=false"})
+        return None, {"provider": provider, "reason": decision["reason"]}
+    adapter = inbox_adapters.resolve_inbox_adapter(provider)
+    if adapter is None:
+        await _audit(user_id, workspace_uuid, provider, kind, False, "no inbox adapter")
+        return None, {"provider": provider, "reason": "no adapter"}
+    token = await _get_access_token(provider, user_id)
+    if not token:
+        await _audit(user_id, workspace_uuid, provider, kind, False, "no usable access token (broker)")
+        return None, {"provider": provider, "reason": "no usable token"}
+    try:
+        if kind == "search":
+            msgs = await adapter.search_messages(access_token=token, query=query or "", limit=10)
+        else:
+            msgs = await adapter.list_messages(access_token=token, limit=10)
+    except inbox_adapters.InboxReadDisabled:
+        await _audit(user_id, workspace_uuid, provider, kind, False, "adapter disabled")
+        return None, {"provider": provider, "reason": "adapter disabled"}
+    except inbox_adapters.InboxReadError as exc:
+        await _audit(user_id, workspace_uuid, provider, kind, False, str(exc))
+        await _trace(session_uuid, user_id, workspace_uuid, trace_type=TRACE_READ_FAILED,
+                     status="error", result={"provider": provider, "kind": kind, "error": str(exc)})
+        return None, {"provider": provider, "reason": f"read failed ({exc})"}
+    for mm in msgs:
+        mm["provider"] = provider
+    await _audit(user_id, workspace_uuid, provider, kind, True, "read ok",
+                 message_ref=(msgs[0].get("id") if msgs else None))
+    return msgs, {"provider": provider, "reason": "ok"}
+
+
+async def _handle_inbox_multi(kind, query, providers, *, session_uuid, user_id, workspace_uuid):
+    """Read list/search/summarize across MULTIPLE mailboxes and merge (newest first)."""
+    await _trace(session_uuid, user_id, workspace_uuid, trace_type=TRACE_LISTED, status="ok",
+                 result={"providers": providers, "kind": kind, "query": query})
+    merged, oks, skipped = [], [], []
+    for p in providers:
+        msgs, info = await _read_one_inbox(p, kind, query, session_uuid=session_uuid,
+                                           user_id=user_id, workspace_uuid=workspace_uuid)
+        if msgs is not None:
+            merged.extend(msgs)
+            oks.append(p)
+        else:
+            skipped.append(info)
+    if not oks:
+        notes = "; ".join(f"{_short(s['provider'])}: {s['reason']}" for s in skipped)
+        return True, (f"🔒 I couldn't read any of your mailboxes right now — {notes}. "
+                      "No mailbox data was accessed and nothing was sent.")
+    merged.sort(key=lambda mm: _msg_dt(mm.get("date")), reverse=True)
+    merged = merged[:12]
+    if kind == "summarize":
+        await _trace(session_uuid, user_id, workspace_uuid, trace_type=TRACE_SUMMARY,
+                     result={"providers": oks, "count": len(merged)})
+        return True, _render_summary_multi(oks, merged, skipped)
+    return True, _render_list_multi(oks, merged, skipped)
+
+
+async def _handle_inbox_single(kind, query, provider, *, session_uuid, user_id, workspace_uuid):
     req_trace = {"list": TRACE_LISTED, "search": TRACE_SEARCH, "summarize": TRACE_SUMMARY,
                  "read_thread": TRACE_READ, "draft_reply": TRACE_REPLY}[kind]
     await _trace(session_uuid, user_id, workspace_uuid, trace_type=req_trace, status="ok",
