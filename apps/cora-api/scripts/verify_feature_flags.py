@@ -39,15 +39,20 @@ async def main() -> int:
             fails.append(m)
 
     try:
-        # A) production seeds present + fail-closed defaults
+        # A) production seeds present + fail-closed defaults. Scope the disabled
+        # assertion to the EXECUTION seeds this test guarantees (send_email +
+        # create_calendar_event); operator-enableable READ flags (inbox_read,
+        # calendar_read/write) are intentionally excluded — an operator may turn
+        # them on for real use without breaking this invariant.
+        EXEC_SEEDS = {("gmail", "send_email"), ("outlook_mail", "send_email"),
+                      ("google_calendar", "create_calendar_event"),
+                      ("microsoft_calendar", "create_calendar_event")}
         seeds = await ff.list_flags(environment="production")
         combos = {(f["provider_name"], f["action_type"]) for f in seeds}
-        for want in (("gmail", "send_email"), ("outlook_mail", "send_email"),
-                     ("google_calendar", "create_calendar_event"),
-                     ("microsoft_calendar", "create_calendar_event")):
+        for want in EXEC_SEEDS:
             expect(want in combos, f"seed missing {want}")
         for f in seeds:
-            if (f["provider_name"], f["action_type"]) in combos:
+            if (f["provider_name"], f["action_type"]) in EXEC_SEEDS:
                 expect(f["enabled"] is False, f"seed {f['provider_name']} enabled should be False")
                 expect(f["dry_run_only"] is True, f"seed {f['provider_name']} dry_run_only should be True")
 
@@ -130,8 +135,8 @@ async def main() -> int:
         # req 13: production seeds unchanged
         seeds2 = await ff.list_flags(environment="production")
         expect(all(not f["enabled"] and f["dry_run_only"] for f in seeds2
-                   if (f["provider_name"], f["action_type"]) in combos),
-               "production seeds must remain enabled=false/dry_run_only=true")
+                   if (f["provider_name"], f["action_type"]) in EXEC_SEEDS),
+               "production execution seeds must remain enabled=false/dry_run_only=true")
     finally:
         async with pool.acquire() as conn:
             await conn.execute("DELETE FROM provider_execution_feature_flags WHERE environment=$1", test_env)

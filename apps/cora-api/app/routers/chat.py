@@ -67,6 +67,7 @@ from app import chat_governance
 from app import chat_provider_simulation
 from app import chat_approval_queue
 from app import chat_inbox
+from app import chat_calendar
 
 MEMORY_SEARCH_LIMIT = 20
 MEMORIES_IN_PROMPT = 5
@@ -2227,6 +2228,41 @@ async def chat(
                 session_id=session_id, agent=PERSONA_NAME, selected_agent=SIGNAL_NAME,
                 routing_matched_keywords=matched_keywords, model_endpoint=endpoint,
                 response=_ib_text, placeholder=False, created_at=_completed_at.isoformat(),
+            )
+
+    # Chat-Native Calendar Assistant (CHRONOS Calendar CRUD v1.0). Full read +
+    # create/update/delete calendar ops, confirm-before-write. FAILS CLOSED: reads
+    # need the calendar_read flag; writes additionally need the calendar_write flag
+    # AND the global kill switch. A blocked CREATE falls back to a review-only
+    # internal proposal. A bare "confirm"/"cancel" only routes here when a calendar
+    # action is staged for this session (otherwise it falls through untouched).
+    _cal_cmd = chat_calendar.detect_calendar_command(request.message)
+    _cal_confirm = chat_calendar.detect_confirmation(request.message)
+    _cal_active = _cal_cmd is not None or (
+        _cal_confirm is not None and await chat_calendar.has_pending(session_uuid)
+    )
+    if _cal_active:
+        _cal_handled, _cal_text = await chat_calendar.handle_calendar_turn(
+            message=request.message, command=_cal_cmd, confirmation=_cal_confirm,
+            session_uuid=session_uuid, user_id=current.id, workspace_uuid=workspace_uuid,
+            scope_type=scope_type, is_admin=(current.role == "admin"),
+        )
+        if _cal_handled and _cal_text is not None:
+            _completed_at = datetime.now(timezone.utc)
+            try:
+                await _persist_exchange(
+                    session_uuid=session_uuid, scope_type=scope_type, scope_id=scope_id,
+                    user_message=request.message, assistant_response=_cal_text,
+                    model_name=None, placeholder=False, started_at=started_at,
+                    completed_at=_completed_at, agent_name=CHRONOS_NAME,
+                    workspace_id=workspace_uuid,
+                )
+            except Exception:
+                logger.exception("persist calendar exchange failed session=%s", session_id)
+            return ChatResponse(
+                session_id=session_id, agent=PERSONA_NAME, selected_agent=CHRONOS_NAME,
+                routing_matched_keywords=matched_keywords, model_endpoint=endpoint,
+                response=_cal_text, placeholder=False, created_at=_completed_at.isoformat(),
             )
 
     # Chat-Native Provider Simulation & Payload Inspection v2.1. Richer payload

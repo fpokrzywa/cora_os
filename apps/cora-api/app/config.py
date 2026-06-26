@@ -35,6 +35,18 @@ class Settings(BaseSettings):
     # keeps the whole system dry-run / readiness-only.
     external_execution_enabled: bool = False
 
+    # Calendar Execution Switch (CHRONOS Calendar CRUD). DEDICATED master gate for
+    # real calendar writes (create/update/delete), independent of the global
+    # external_execution kill switch above. This separation is deliberate: the
+    # email/integration-intent governance (execution_approval / final_interlock)
+    # ENFORCES external_execution_enabled=false as a "still in the no-execution
+    # phase" invariant (its approval checklist refuses while it is true), so
+    # calendar writes — the first real external-execution path — must NOT reuse
+    # that flag or they would break email/integration governance. Calendar writes
+    # require this true AND the per-provider calendar_write feature flag AND a
+    # connected provider with the write scope/capability. Defaults false.
+    calendar_execution_enabled: bool = False
+
     # Real OAuth Flow (v1.1). Provider OAuth client config. Empty by default →
     # the provider reports not_configured and cannot start an OAuth flow. These
     # connect a provider ACCOUNT only; they never enable execution (still gated
@@ -47,6 +59,14 @@ class Settings(BaseSettings):
     microsoft_oauth_client_id: str = ""
     microsoft_oauth_client_secret: str = ""
     microsoft_oauth_redirect_uri: str = ""
+    # Per-provider OAuth callback derivation. Each provider's redirect must land
+    # on its OWN /oauth/<provider>/callback route (the callback resolves the
+    # provider from the URL path + a state check), so one pinned redirect_uri
+    # can't serve gmail AND google_calendar. If a *_redirect_base is set the code
+    # builds "{base}/oauth/<provider>/callback"; otherwise it rewrites the
+    # provider segment of the existing *_redirect_uri per provider (back-compat).
+    google_oauth_redirect_base: str = ""
+    microsoft_oauth_redirect_base: str = ""
 
     # IANA timezone used when telling the LLM the current date/time. Defaults to
     # UTC (the server clock); set e.g. CORA_TIMEZONE=America/New_York for local

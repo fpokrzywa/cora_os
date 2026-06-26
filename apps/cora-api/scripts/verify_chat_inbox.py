@@ -55,17 +55,25 @@ async def main() -> int:
 
     # detection
     expect(ci.detect_inbox_command("Show my latest emails.") == ("list", None), "detect list")
-    expect(ci.detect_inbox_command("Search my inbox for emails from Mark.") == ("search", "mark"), "detect search from")
+    expect(ci.detect_inbox_command("Search my inbox for emails from Mark.") == ("search", "from:mark"), "detect search from → sender-scoped from: operator")
     expect(ci.detect_inbox_command("Summarize unread emails.") == ("summarize", None), "detect summarize")
     expect(ci.detect_inbox_command("Summarize this email thread.") == ("read_thread", None), "detect read_thread")
     expect(ci.detect_inbox_command("Draft a reply to this email, but do not send it.") == ("draft_reply", None), "detect draft_reply")
     expect(ci.detect_inbox_command("Find emails about the project delay.") == ("search", "the project delay"), "detect find about")
     expect(ci.detect_inbox_command("Draft an email to Mark.") is None, "v1.9 create must not be inbox")
 
-    # flags seeded fail-closed
+    # Snapshot the operator's REAL inbox_read flag state (they may have enabled it
+    # for live use), then force fail-closed for the test; restored in finally so
+    # this run never disrupts their configuration. Part A's fail-closed still holds
+    # via the throwaway user's missing read scope regardless.
+    async with pool.acquire() as conn:
+        saved_flags = [dict(r) for r in await conn.fetch(
+            "SELECT id, enabled FROM provider_execution_feature_flags WHERE action_type='inbox_read'")]
+        await conn.execute(
+            "UPDATE provider_execution_feature_flags SET enabled=FALSE WHERE action_type='inbox_read'")
     for p in ("gmail", "outlook_mail"):
         flag = await ff.get_flag(p, "inbox_read")
-        expect(flag is not None and flag["enabled"] is False, f"{p}/inbox_read seeded disabled")
+        expect(flag is not None, f"{p}/inbox_read flag exists")
 
     # capability alignment: gmail/outlook supports_read=TRUE, write caps FALSE
     async with pool.acquire() as conn:
@@ -211,6 +219,11 @@ async def main() -> int:
             if meth in adapter.__dict__:
                 del adapter.__dict__[meth]
         async with pool.acquire() as conn:
+            # Restore the operator's real inbox_read flag state (never clobber it).
+            for fr in saved_flags:
+                await conn.execute(
+                    "UPDATE provider_execution_feature_flags SET enabled=$1 WHERE id=$2",
+                    fr["enabled"], fr["id"])
             await conn.execute("DELETE FROM chat_email_context WHERE session_id=$1", sess)
             if uid is not None:
                 await conn.execute("DELETE FROM inbox_access_events WHERE user_id=$1", uid)

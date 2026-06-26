@@ -7,6 +7,7 @@ so a connected account is ready for a later execution phase — connecting grant
 NO ability to send/create here; execution stays blocked by the v0.8 kill switch.
 """
 
+import re
 from dataclasses import dataclass, field
 
 from app.config import settings
@@ -51,7 +52,12 @@ PROVIDERS: dict[str, OAuthProvider] = {
         vendor="google",
         authorize_url=_GOOGLE_AUTH,
         token_url=_GOOGLE_TOKEN,
-        scopes=["https://www.googleapis.com/auth/calendar.events"],
+        # calendar.events = read/write events on all calendars (used for writes);
+        # calendar.readonly = enumerate the calendar list + read events across ALL
+        # calendars (so "what's on my calendar" sees secondary/work calendars, not
+        # just primary). Requesting a scope enables nothing alone — still gated.
+        scopes=["https://www.googleapis.com/auth/calendar.events",
+                "https://www.googleapis.com/auth/calendar.readonly"],
         requires_refresh_token=True,
         extra_authorize_params={"access_type": "offline", "prompt": "consent"},
     ),
@@ -90,19 +96,39 @@ def get_provider(name):
     return PROVIDERS.get(_ALIASES.get(key, key))
 
 
+def redirect_uri_for(provider: OAuthProvider) -> str:
+    """The OAuth callback URL for THIS provider. Each provider must land on its own
+    /oauth/<provider>/callback route, so a single pinned redirect_uri can't serve
+    two providers of the same vendor (gmail + google_calendar). Resolution order:
+    (1) "{vendor}_oauth_redirect_base" → "{base}/oauth/<provider>/callback";
+    (2) else rewrite the provider segment of "{vendor}_oauth_redirect_uri"
+        (back-compat: the existing gmail value auto-adapts to google_calendar);
+    (3) else "" (unconfigured)."""
+    base = (getattr(settings, f"{provider.vendor}_oauth_redirect_base", "") or "").strip()
+    if base:
+        return f"{base.rstrip('/')}/oauth/{provider.name}/callback"
+    configured = (getattr(settings, f"{provider.vendor}_oauth_redirect_uri", "") or "").strip()
+    if not configured:
+        return ""
+    m = re.match(r"^(.*)/oauth/[^/]+/callback/?$", configured)
+    if m:
+        return f"{m.group(1)}/oauth/{provider.name}/callback"
+    return configured  # non-standard literal — use as-is
+
+
 def provider_config(provider: OAuthProvider) -> dict:
     """Resolve the vendor's OAuth client config from settings (never logged)."""
     if provider.vendor == "google":
         return {
             "client_id": settings.google_oauth_client_id,
             "client_secret": settings.google_oauth_client_secret,
-            "redirect_uri": settings.google_oauth_redirect_uri,
+            "redirect_uri": redirect_uri_for(provider),
         }
     if provider.vendor == "microsoft":
         return {
             "client_id": settings.microsoft_oauth_client_id,
             "client_secret": settings.microsoft_oauth_client_secret,
-            "redirect_uri": settings.microsoft_oauth_redirect_uri,
+            "redirect_uri": redirect_uri_for(provider),
         }
     return {"client_id": "", "client_secret": "", "redirect_uri": ""}
 

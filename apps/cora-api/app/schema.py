@@ -692,6 +692,13 @@ CREATE TABLE IF NOT EXISTS external_provider_connectors (
 );
 CREATE INDEX IF NOT EXISTS external_provider_connectors_type_idx
     ON external_provider_connectors (provider_type);
+-- CHRONOS Calendar CRUD v1.0: calendar read + delete capability columns (the
+-- v0.5 table shipped with create/update only). Idempotent for existing installs.
+-- WRITE capability stays gated by the calendar_write flag + the global kill switch.
+ALTER TABLE external_provider_connectors
+    ADD COLUMN IF NOT EXISTS supports_calendar_read BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE external_provider_connectors
+    ADD COLUMN IF NOT EXISTS supports_calendar_delete BOOLEAN NOT NULL DEFAULT FALSE;
 
 -- OAuth Credential Vault Design v0.6: per-workspace/per-user credential records
 -- for FUTURE OAuth providers (Gmail/Outlook/Google Calendar/Microsoft Calendar).
@@ -897,6 +904,43 @@ CREATE TABLE IF NOT EXISTS inbox_access_events (
 CREATE INDEX IF NOT EXISTS inbox_access_events_user_idx
     ON inbox_access_events (user_id, created_at DESC);
 
+-- CHRONOS Calendar CRUD v1.0. Audit of calendar access attempts (reads + writes,
+-- allowed + fail-closed denials). NO event bodies or tokens stored — only the
+-- action, decision, and an event reference.
+CREATE TABLE IF NOT EXISTS calendar_access_events (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+    workspace_id UUID,
+    provider TEXT NOT NULL,
+    action TEXT NOT NULL,
+    allowed BOOLEAN NOT NULL,
+    reason TEXT,
+    event_ref TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS calendar_access_events_user_idx
+    ON calendar_access_events (user_id, created_at DESC);
+
+-- CHRONOS Calendar CRUD v1.0 confirm-before-write: a per-session staged calendar
+-- write awaiting the user's explicit "confirm". One row per session (replaced on a
+-- new request, deleted on confirm/cancel). NO tokens — only the parsed event fields
+-- + the resolved target event id/summary for update/delete.
+CREATE TABLE IF NOT EXISTS calendar_pending_actions (
+    session_id UUID PRIMARY KEY,
+    user_id UUID,
+    workspace_id UUID,
+    kind TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    fields JSONB NOT NULL DEFAULT '{}'::jsonb,
+    target_event_id TEXT,
+    target_calendar_id TEXT,
+    target_summary TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+-- Cross-calendar writes: the resolved target's calendar id (Google update/delete
+-- need calendars/<calendarId>/events/<id>). Idempotent for existing installs.
+ALTER TABLE calendar_pending_actions ADD COLUMN IF NOT EXISTS target_calendar_id TEXT;
+
 -- Seed the 4 supported combinations, fail-closed (enabled=false, dry_run_only=true).
 -- action_type uses the canonical send_email / create_calendar_event the adapters
 -- + intents use (spec's "create_event" maps here via the service alias).
@@ -909,7 +953,14 @@ VALUES
     ('microsoft_calendar', 'calendar', 'create_calendar_event', 'production'),
     -- v2.3 read-only inbox access flags (fail-closed: disabled by default).
     ('gmail', 'email', 'inbox_read', 'production'),
-    ('outlook_mail', 'email', 'inbox_read', 'production')
+    ('outlook_mail', 'email', 'inbox_read', 'production'),
+    -- CHRONOS Calendar CRUD v1.0: read + write calendar flags (fail-closed). The
+    -- calendar_write flag is necessary-but-not-sufficient — the global kill switch
+    -- is still the master gate for any real create/update/delete.
+    ('google_calendar', 'calendar', 'calendar_read', 'production'),
+    ('google_calendar', 'calendar', 'calendar_write', 'production'),
+    ('microsoft_calendar', 'calendar', 'calendar_read', 'production'),
+    ('microsoft_calendar', 'calendar', 'calendar_write', 'production')
 ON CONFLICT (provider_name, action_type, environment) DO NOTHING;
 """
 
@@ -1530,6 +1581,18 @@ async def init_schema() -> None:
             "    dry_run_only = TRUE, updated_at = NOW() "
             "WHERE provider_name IN ('gmail', 'outlook_mail') "
             "  AND supports_read IS DISTINCT FROM TRUE"
+        )
+        # CHRONOS Calendar CRUD v1.0 capability alignment: the calendar connectors
+        # gain read + full CRUD capability on existing rows. The capability being
+        # available does NOT enable execution — the calendar_read/calendar_write
+        # feature flags + the global kill switch remain the actual gates.
+        await conn.execute(
+            "UPDATE external_provider_connectors "
+            "SET supports_calendar_read = TRUE, supports_calendar_create = TRUE, "
+            "    supports_calendar_update = TRUE, supports_calendar_delete = TRUE, "
+            "    updated_at = NOW() "
+            "WHERE provider_name IN ('google_calendar', 'microsoft_calendar') "
+            "  AND supports_calendar_read IS DISTINCT FROM TRUE"
         )
         await conn.execute(SEED_DEFAULT_WORKSPACE_SQL)
     logger.info(

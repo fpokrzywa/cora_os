@@ -56,7 +56,14 @@ def _trunc(v, n=80):
 # --------------------------------------------------------------------------- #
 
 def _extract_query(m: str) -> Optional[str]:
-    for kw in (" about ", " from ", " for ", " containing ", " mentioning "):
+    # "from X" → a SENDER-scoped search via the providers' `from:` operator
+    # (Gmail `q` and Graph `$search` both understand `from:`), so "emails from
+    # Strawberry" matches the sender, not every message containing the word.
+    # Other keywords stay full-text.
+    if " from " in m:
+        val = m.split(" from ", 1)[1].strip().rstrip("?.! ")[:120]
+        return f"from:{val}" if val else None
+    for kw in (" about ", " for ", " containing ", " mentioning "):
         if kw in m:
             return m.split(kw, 1)[1].strip().rstrip("?.! ")[:120] or None
     return None
