@@ -159,77 +159,96 @@ export function Memories() {
 
       <section className="admin__section">
         <div className="admin__section-head">
-          <h2>Memory by scope</h2>
-          <div className="admin__inline">
-            <div className="admin__scope-tabs">
-              {SCOPE_FILTERS.map((s) => (
-                <button
-                  key={s}
-                  className={`tab${memScope === s ? " tab--active" : ""}`}
-                  onClick={() => setMemScope(s)}
-                >
-                  {s}
-                </button>
-              ))}
-            </div>
+          <h2>Visibility test</h2>
+        </div>
+        <p className="admin__subtitle">
+          Preview the memory list + chat-prompt injection for a specific user
+          without switching identity.
+        </p>
+
+        <form className="admin__form" onSubmit={runVisibilityTest}>
+          <div className="admin__form-row">
+            <label className="admin__field-wide">
+              <span>User</span>
+              <select
+                value={vtUserId}
+                onChange={(e) => setVtUserId(e.target.value)}
+                required
+                disabled={vtLoading}
+              >
+                <option value="">— select —</option>
+                {users.map((u) => (
+                  <option key={u.id} value={u.id}>
+                    {u.email} ({u.role})
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="admin__field-wide">
+              <span>Chat query (optional)</span>
+              <input
+                type="text"
+                placeholder="e.g. how does ATLAS route requests"
+                value={vtQuery}
+                onChange={(e) => setVtQuery(e.target.value)}
+                disabled={vtLoading}
+              />
+            </label>
             <button
-              className="btn btn--ghost btn--sm"
-              onClick={refreshMemory}
-              disabled={loadingMem}
+              type="submit"
+              className="btn btn--primary"
+              disabled={vtLoading || !vtUserId.trim()}
             >
-              ↻
+              {vtLoading ? "…" : "Run test"}
             </button>
           </div>
+        </form>
+
+        {vtError && <div className="admin__error">{vtError}</div>}
+
+        {vtResult && (
+          <div className="admin__vt-result">
+            <div className="admin__vt-meta">
+              <strong>{vtResult.user_email}</strong>
+              <span className="muted">{vtResult.scope_filter}</span>
+            </div>
+
+            <h3>What this user would see in /memory</h3>
+            <p className="admin__hint">
+              {vtResult.list_visible_count} entr
+              {vtResult.list_visible_count === 1 ? "y" : "ies"} (top{" "}
+              {vtResult.list_visible.length} shown)
+            </p>
+            <MemoryPreviewList items={vtResult.list_visible} />
+
+            <h3>
+              What would be injected into the chat prompt
+              {vtResult.query ? ` for "${vtResult.query}"` : ""}
+            </h3>
+            {!vtResult.query ? (
+              <p className="admin__hint">
+                Provide a chat query above to preview prompt injection.
+              </p>
+            ) : (
+              <>
+                <p className="admin__hint">
+                  Keyword search matched {vtResult.search_match_count}; top{" "}
+                  {vtResult.search_top_in_prompt.length} would be embedded under
+                  "Relevant Cora Memory".
+                </p>
+                <MemoryPreviewList items={vtResult.search_top_in_prompt} />
+              </>
+            )}
+          </div>
+        )}
+      </section>
+
+      <section className="admin__section">
+        <div className="admin__section-head">
+          <h2>Create memory entry</h2>
         </div>
 
-        {memError && <div className="admin__error">{memError}</div>}
-
-        <table className="admin__table">
-          <thead>
-            <tr>
-              <th>Title</th>
-              <th>Type</th>
-              <th>Scope</th>
-              <th>Owner</th>
-              <th>Tags</th>
-              <th>Imp.</th>
-              <th>Created</th>
-            </tr>
-          </thead>
-          <tbody>
-            {memEntries.map((m) => (
-              <tr key={m.id}>
-                <td>{m.title}</td>
-                <td className="mono">{m.type}</td>
-                <td>
-                  <span className={`scope-chip scope-chip--${m.scope_type}`}>
-                    {m.scope_type}
-                  </span>
-                </td>
-                <td className="mono muted">
-                  {m.scope_id
-                    ? usersById.get(m.scope_id)?.email ?? m.scope_id.slice(0, 8)
-                    : "—"}
-                </td>
-                <td className="muted">{m.tags.join(", ") || "—"}</td>
-                <td>{m.importance}</td>
-                <td className="muted">
-                  {new Date(m.created_at).toLocaleDateString()}
-                </td>
-              </tr>
-            ))}
-            {!loadingMem && memEntries.length === 0 && (
-              <tr>
-                <td colSpan={7} className="muted">
-                  No memory entries.
-                </td>
-              </tr>
-            )}
-          </tbody>
-        </table>
-
         <form className="admin__form" onSubmit={submitNewMemory}>
-          <h3>Create memory entry</h3>
           <div className="admin__form-row">
             <label>
               <span>Scope</span>
@@ -330,88 +349,74 @@ export function Memories() {
 
       <section className="admin__section">
         <div className="admin__section-head">
-          <h2>Visibility test</h2>
-        </div>
-        <p className="admin__subtitle">
-          Preview the memory list + chat-prompt injection for a specific user
-          without switching identity.
-        </p>
-
-        <form className="admin__form" onSubmit={runVisibilityTest}>
-          <div className="admin__form-row">
-            <label className="admin__field-wide">
-              <span>User</span>
-              <select
-                value={vtUserId}
-                onChange={(e) => setVtUserId(e.target.value)}
-                required
-                disabled={vtLoading}
-              >
-                <option value="">— select —</option>
-                {users.map((u) => (
-                  <option key={u.id} value={u.id}>
-                    {u.email} ({u.role})
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label className="admin__field-wide">
-              <span>Chat query (optional)</span>
-              <input
-                type="text"
-                placeholder="e.g. how does ATLAS route requests"
-                value={vtQuery}
-                onChange={(e) => setVtQuery(e.target.value)}
-                disabled={vtLoading}
-              />
-            </label>
+          <h2>Memory by scope</h2>
+          <div className="admin__inline">
+            <div className="admin__scope-tabs">
+              {SCOPE_FILTERS.map((s) => (
+                <button
+                  key={s}
+                  className={`tab${memScope === s ? " tab--active" : ""}`}
+                  onClick={() => setMemScope(s)}
+                >
+                  {s}
+                </button>
+              ))}
+            </div>
             <button
-              type="submit"
-              className="btn btn--primary"
-              disabled={vtLoading || !vtUserId.trim()}
+              className="btn btn--ghost btn--sm"
+              onClick={refreshMemory}
+              disabled={loadingMem}
             >
-              {vtLoading ? "…" : "Run test"}
+              ↻
             </button>
           </div>
-        </form>
+        </div>
 
-        {vtError && <div className="admin__error">{vtError}</div>}
+        {memError && <div className="admin__error">{memError}</div>}
 
-        {vtResult && (
-          <div className="admin__vt-result">
-            <div className="admin__vt-meta">
-              <strong>{vtResult.user_email}</strong>
-              <span className="muted">{vtResult.scope_filter}</span>
-            </div>
-
-            <h3>What this user would see in /memory</h3>
-            <p className="admin__hint">
-              {vtResult.list_visible_count} entr
-              {vtResult.list_visible_count === 1 ? "y" : "ies"} (top{" "}
-              {vtResult.list_visible.length} shown)
-            </p>
-            <MemoryPreviewList items={vtResult.list_visible} />
-
-            <h3>
-              What would be injected into the chat prompt
-              {vtResult.query ? ` for "${vtResult.query}"` : ""}
-            </h3>
-            {!vtResult.query ? (
-              <p className="admin__hint">
-                Provide a chat query above to preview prompt injection.
-              </p>
-            ) : (
-              <>
-                <p className="admin__hint">
-                  Keyword search matched {vtResult.search_match_count}; top{" "}
-                  {vtResult.search_top_in_prompt.length} would be embedded under
-                  "Relevant Cora Memory".
-                </p>
-                <MemoryPreviewList items={vtResult.search_top_in_prompt} />
-              </>
+        <table className="admin__table">
+          <thead>
+            <tr>
+              <th>Title</th>
+              <th>Type</th>
+              <th>Scope</th>
+              <th>Owner</th>
+              <th>Tags</th>
+              <th>Imp.</th>
+              <th>Created</th>
+            </tr>
+          </thead>
+          <tbody>
+            {memEntries.map((m) => (
+              <tr key={m.id}>
+                <td>{m.title}</td>
+                <td className="mono">{m.type}</td>
+                <td>
+                  <span className={`scope-chip scope-chip--${m.scope_type}`}>
+                    {m.scope_type}
+                  </span>
+                </td>
+                <td className="mono muted">
+                  {m.scope_id
+                    ? usersById.get(m.scope_id)?.email ?? m.scope_id.slice(0, 8)
+                    : "—"}
+                </td>
+                <td className="muted">{m.tags.join(", ") || "—"}</td>
+                <td>{m.importance}</td>
+                <td className="muted">
+                  {new Date(m.created_at).toLocaleDateString()}
+                </td>
+              </tr>
+            ))}
+            {!loadingMem && memEntries.length === 0 && (
+              <tr>
+                <td colSpan={7} className="muted">
+                  No memory entries.
+                </td>
+              </tr>
             )}
-          </div>
-        )}
+          </tbody>
+        </table>
       </section>
     </main>
   );
