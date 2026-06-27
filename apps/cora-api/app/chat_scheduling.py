@@ -307,6 +307,9 @@ async def _book_first(interval, duration, payload, message, label, read, *, sess
     start, _free_end = interval
     end = start + timedelta(minutes=duration)
     provider = await cc._resolve_provider(message, user_id)
+    # A booked slot is a create-write: honor the user's default WRITE calendar when
+    # they didn't name one in the request (else primary), same as a chat create.
+    dflt = None if cc._extract_calendar_hint(message) else await cc.get_default_calendar(user_id, provider)
     fields = {
         "title": payload.get("title") or "Meeting",
         "description": (message or "").strip()[:1000],
@@ -320,7 +323,9 @@ async def _book_first(interval, duration, payload, message, label, read, *, sess
                  {"provider": provider, "start": fields["start_time"], "duration_min": duration,
                   "attendees": len(payload.get("attendees") or [])})
     handled, text = await cc.stage_create(provider, fields, session_uuid=session_uuid,
-                                          user_id=user_id, workspace_uuid=workspace_uuid)
+                                          user_id=user_id, workspace_uuid=workspace_uuid,
+                                          calendar_id=(dflt["id"] if dflt else "primary"),
+                                          calendar_name=(dflt["name"] if dflt else None))
     prefix = (f"📅 Earliest free {duration}-min slot {label}: **{_fmt_slot(start)} – "
               f"{end.strftime('%-I:%M %p')}**.\n\n")
     # When the calendar wasn't named and more than one is connected, make the default

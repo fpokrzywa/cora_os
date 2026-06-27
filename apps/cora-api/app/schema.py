@@ -970,6 +970,20 @@ CREATE TABLE IF NOT EXISTS user_provider_defaults (
     PRIMARY KEY (user_id, provider_type)
 );
 
+-- Per-user default WRITE calendar — the specific calendar (WITHIN a provider) a
+-- hint-less CREATE lands on, instead of the provider's `primary`. Complements
+-- user_provider_defaults (which picks the provider): "make Work my default calendar"
+-- stores the resolved calendar id+name here; an unnamed create then targets it. One
+-- row per (user, provider_name); no row => primary. Set/cleared via chat (CHRONOS).
+CREATE TABLE IF NOT EXISTS user_calendar_defaults (
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    provider_name TEXT NOT NULL,
+    calendar_id TEXT NOT NULL,
+    calendar_name TEXT NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (user_id, provider_name)
+);
+
 -- Admin-managed runtime override for the execution kill switches (calendar / screen
 -- vision). The env vars in config.py remain the DEFAULT; a row here, when present,
 -- OVERRIDES the env value at runtime so an operator can toggle from the app without a

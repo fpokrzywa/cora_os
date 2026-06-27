@@ -587,6 +587,78 @@ async def main() -> int:
                "I confirm deletes exactly read item #1 (gA)")
         await cc._clear_pending(sess)
 
+        # --- J) per-user DEFAULT WRITE calendar (hint-less create → the chosen one) ---
+        # detection (pure): set (name before / after) vs clear vs not-a-default-command
+        expect(cc.detect_calendar_default_command("make Work my default calendar")
+               == {"action": "set", "name": "Work"}, "J detect set default (name before)")
+        expect(cc.detect_calendar_default_command("set my default calendar to Work")
+               == {"action": "set", "name": "Work"}, "J detect set default (name after 'to')")
+        expect(cc.detect_calendar_default_command("use my Work calendar as my default")
+               == {"action": "set", "name": "Work"}, "J detect set (trailing 'calendar' stripped)")
+        expect(cc.detect_calendar_default_command("clear my default calendar") == {"action": "clear"},
+               "J detect clear default")
+        expect(cc.detect_calendar_default_command("make google my default calendar") is None,
+               "J provider-only default carries no calendar name → None (handled upstream)")
+        expect(cc.detect_calendar_default_command("what's on my calendar") is None,
+               "J a plain read is not a default-calendar command")
+        expect(cc.detect_calendar_default_command("schedule a sync tomorrow") is None,
+               "J a plain create is not a default-calendar command")
+
+        # google adapter still has _fake_list_calendars (primary=Personal, FAKE_CAL=Work);
+        # write gate + token mocked open. BOTH providers are connected by now, so name
+        # google explicitly to keep provider resolution deterministic.
+        defcap = {}
+
+        async def _def_create(*, access_token=None, fields=None, calendar_id="primary"):
+            defcap["cal"] = calendar_id
+            return {"id": "dz", "title": fields.get("title"), "start": "—", "end": "—",
+                    "location": "", "attendees": [], "link": ""}
+        adapter.create_event = _def_create
+        adapter.list_calendars = _fake_list_calendars
+
+        hset, tset = await cc.handle_calendar_default_command(
+            {"action": "set", "name": "Work"}, message="make my google Work calendar the default",
+            session_uuid=sess, user_id=uid, workspace_uuid=wid)
+        responses.append(tset)
+        expect(hset and "Work" in (tset or "") and "default" in (tset or "").lower(),
+               "J set-default confirmation names the calendar")
+        dset = await cc.get_default_calendar(uid, "google_calendar")
+        expect(dset and dset["id"] == FAKE_CAL and dset["name"] == "Work",
+               "J default calendar persisted (id + name)")
+
+        # a hint-less create on google now lands on the default (Work), not primary
+        h, t = await cal("Schedule a meeting with the team on google")
+        responses.append(t)
+        expect(h and t and "Ready to create" in t and "Calendar: Work" in t,
+               "J hint-less create shows the default calendar on the card")
+        h, t = await cal("confirm")
+        responses.append(t)
+        expect(h and t and "Created" in t and defcap.get("cal") == FAKE_CAL,
+               "J confirmed create lands on the default calendar (not primary)")
+        # an explicitly named calendar still overrides the default
+        h, t = await cal("Schedule a sync on my Personal calendar on google")
+        responses.append(t)
+        h, t = await cal("confirm")
+        responses.append(t)
+        expect(h and t and "Created" in t and defcap.get("cal") == "primary",
+               "J a named calendar overrides the default (Personal → primary id)")
+
+        # clear → revert to primary
+        hclr, tclr = await cc.handle_calendar_default_command(
+            {"action": "clear"}, message="clear my default google calendar",
+            session_uuid=sess, user_id=uid, workspace_uuid=wid)
+        responses.append(tclr)
+        expect(hclr and "cleared" in (tclr or "").lower(), "J clear-default confirmation")
+        expect(await cc.get_default_calendar(uid, "google_calendar") is None,
+               "J default removed after clear")
+        defcap.clear()
+        h, t = await cal("Schedule a meeting with the team on google")
+        responses.append(t)
+        h, t = await cal("confirm")
+        responses.append(t)
+        expect(h and t and "Created" in t and defcap.get("cal") == "primary",
+               "J after clear, a hint-less create reverts to primary")
+
         # traces present
         async with pool.acquire() as conn:
             traces = {r["trace_type"] for r in await conn.fetch(
@@ -596,7 +668,8 @@ async def main() -> int:
                    "chat_calendar_event_created", "chat_calendar_event_updated",
                    "chat_calendar_event_deleted", "chat_calendar_write_denied",
                    "chat_calendar_proposal_fallback", "chat_calendar_confirm_pending",
-                   "chat_calendar_confirmed", "chat_calendar_cancelled"):
+                   "chat_calendar_confirmed", "chat_calendar_cancelled",
+                   "chat_calendar_default_set", "chat_calendar_default_cleared"):
             expect(tr in traces, f"missing trace {tr}")
 
         # no token leak anywhere
@@ -626,6 +699,7 @@ async def main() -> int:
                     saved_cal_switch["enabled"], saved_cal_switch["updated_by"])
             await conn.execute("DELETE FROM calendar_pending_actions WHERE session_id=$1", sess)
             if uid is not None:
+                await conn.execute("DELETE FROM user_calendar_defaults WHERE user_id=$1", uid)
                 await conn.execute("DELETE FROM calendar_access_events WHERE user_id=$1", uid)
                 await conn.execute("DELETE FROM runtime_traces WHERE user_id=$1", uid)
                 await conn.execute("DELETE FROM schedule_proposals WHERE created_by=$1", uid)

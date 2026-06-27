@@ -2265,6 +2265,35 @@ async def chat(
                 response=_pd_text, placeholder=False, created_at=_completed_at.isoformat(),
             )
 
+    # Per-user default WRITE calendar ("make Work my default calendar"). A hint-less
+    # create then targets that calendar instead of primary. Checked AFTER the provider
+    # default (so "make google my default calendar" stays a provider default — no
+    # calendar name) and BEFORE the calendar handler (so the phrase isn't taken as a
+    # create). Resolving the calendar is governed by the same read path as a create.
+    _cd_cmd = chat_calendar.detect_calendar_default_command(request.message)
+    if _cd_cmd is not None:
+        _cd_handled, _cd_text = await chat_calendar.handle_calendar_default_command(
+            _cd_cmd, message=request.message, session_uuid=session_uuid,
+            user_id=current.id, workspace_uuid=workspace_uuid,
+        )
+        if _cd_handled and _cd_text is not None:
+            _completed_at = datetime.now(timezone.utc)
+            try:
+                await _persist_exchange(
+                    session_uuid=session_uuid, scope_type=scope_type, scope_id=scope_id,
+                    user_message=request.message, assistant_response=_cd_text,
+                    model_name=None, placeholder=False, started_at=started_at,
+                    completed_at=_completed_at, agent_name=CHRONOS_NAME,
+                    workspace_id=workspace_uuid,
+                )
+            except Exception:
+                logger.exception("persist calendar-default exchange failed session=%s", session_id)
+            return ChatResponse(
+                session_id=session_id, agent=PERSONA_NAME, selected_agent=CHRONOS_NAME,
+                routing_matched_keywords=matched_keywords, model_endpoint=endpoint,
+                response=_cd_text, placeholder=False, created_at=_completed_at.isoformat(),
+            )
+
     # Daily Briefing (composite: CHRONOS schedule + SIGNAL inbox + PULSE news). A
     # read-only digest of the user's day — reuses the governed cross-provider calendar
     # and inbox reads (each section fails closed independently) plus the news_briefing

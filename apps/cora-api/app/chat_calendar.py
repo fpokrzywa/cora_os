@@ -1222,6 +1222,119 @@ def _calendar_help_msg(provider, status, candidates, hint) -> str:
             "Tell me which one (use its exact name) — nothing was created.")
 
 
+# --------------------------------------------------------------------------- #
+# Per-user default WRITE calendar (the specific calendar WITHIN a provider a
+# hint-less CREATE targets). Complements the per-user default *provider*
+# (provider_defaults): "make Work my default calendar" stores the resolved
+# calendar; an unnamed create then lands there instead of `primary`.
+# --------------------------------------------------------------------------- #
+
+# Set: "<verb> [my] <name> (as) [my|the] default [calendar]" (name BEFORE) or
+# "default calendar (to|=|:) <name>" (name AFTER). Clear reverts to primary.
+_CDEF_SET_VERB_RE = re.compile(r"\b(set|use|make|prefer|change)\b", re.I)
+_CDEF_CLEAR_RE = re.compile(
+    r"\b(clear|remove|unset|reset|forget|delete|drop)\b.*\bdefault\s+calendar\b", re.I)
+_CDEF_BEFORE_RE = re.compile(
+    r"\b(?:set|use|make|prefer|change)\s+(?:my\s+)?(.+?)\s+(?:as\s+)?(?:my|the)\s+"
+    r"default(?:\s+calendar)?\b", re.I)
+_CDEF_AFTER_RE = re.compile(
+    r"\bdefault\s+calendar\b\s*(?:to(?:\s+be)?|=|:|is)\s+(.+?)(?:[.,!?]|$)", re.I)
+
+
+def detect_calendar_default_command(message: str) -> Optional[dict]:
+    """Detect setting/clearing the per-user default WRITE calendar. Returns
+    {"action":"set","name":<str>} | {"action":"clear"} | None. Requires a
+    'default'+'calendar' phrase; a provider-only default ("make google my default
+    calendar") carries no calendar NAME (handled upstream by provider_defaults) →
+    None here. Conservative: a plain read/create with no "default" never matches."""
+    low = (message or "").lower()
+    if "default" not in low or "calendar" not in low:
+        return None
+    if _CDEF_CLEAR_RE.search(low):
+        return {"action": "clear"}
+    if not _CDEF_SET_VERB_RE.search(low):
+        return None
+    mo = _CDEF_AFTER_RE.search(message) or _CDEF_BEFORE_RE.search(message)
+    if not mo:
+        return None
+    name = re.sub(r"\s+calendar$", "", mo.group(1).strip(), flags=re.I).strip().strip("\"'")
+    name = re.sub(r"^(?:my|the)\s+", "", name, flags=re.I).strip()
+    name = provider_defaults.strip_provider_words(name).strip()
+    if not name or name.lower() in ("my", "the"):
+        return None
+    if name.lower() == "primary":  # "make primary my default" → revert to primary
+        return {"action": "clear"}
+    return {"action": "set", "name": name}
+
+
+async def _set_default_calendar(user_id, provider, calendar_id, calendar_name) -> None:
+    pool = clients.db_pool
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO user_calendar_defaults (user_id, provider_name, calendar_id, "
+            "calendar_name, updated_at) VALUES ($1,$2,$3,$4,NOW()) "
+            "ON CONFLICT (user_id, provider_name) DO UPDATE "
+            "SET calendar_id=$3, calendar_name=$4, updated_at=NOW()",
+            user_id, provider, calendar_id, calendar_name)
+
+
+async def get_default_calendar(user_id, provider) -> Optional[dict]:
+    """The user's chosen default calendar for `provider`, as {"id","name"}, else None."""
+    pool = clients.db_pool
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT calendar_id, calendar_name FROM user_calendar_defaults "
+            "WHERE user_id=$1 AND provider_name=$2", user_id, provider)
+    return {"id": row["calendar_id"], "name": row["calendar_name"]} if row else None
+
+
+async def _clear_default_calendar(user_id, provider) -> None:
+    pool = clients.db_pool
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "DELETE FROM user_calendar_defaults WHERE user_id=$1 AND provider_name=$2",
+            user_id, provider)
+
+
+async def handle_calendar_default_command(
+    cmd: dict, *, message: str, session_uuid: uuid.UUID, user_id: uuid.UUID,
+    workspace_uuid: Optional[uuid.UUID],
+) -> tuple[bool, str]:
+    """Set or clear the per-user default WRITE calendar. The provider is the one named
+    in the message, else the user's default/most-recent calendar provider. Setting
+    resolves the calendar NAME against the provider's writable calendars (exact-wins,
+    refuse-on-ambiguous, same as a named-calendar create) before storing it."""
+    provider = await _resolve_provider(message, user_id)
+    if cmd["action"] == "clear":
+        await _clear_default_calendar(user_id, provider)
+        await _trace(session_uuid, user_id, workspace_uuid,
+                     trace_type="chat_calendar_default_cleared", result={"provider": provider})
+        return True, (f"✓ Cleared your default **{_short(provider)}** calendar — new events "
+                      "go to your primary calendar unless you name one.")
+    name = cmd["name"]
+    adapter = calendar_adapters.resolve_calendar_adapter(provider)
+    if adapter is None:
+        return True, f"No calendar adapter is available for {provider}."
+    token = await _get_access_token(provider, user_id)
+    if not token:
+        return True, (f"🔒 I couldn't read your {_short(provider)} calendars to set a default "
+                      "(no usable access token). Nothing was changed.")
+    try:
+        res = await _resolve_calendar(adapter, token, name)
+    except calendar_adapters.CalendarError as exc:
+        return True, f"⚠️ I couldn't look up your {_short(provider)} calendars ({exc}). Nothing was changed."
+    if res["status"] != "ok":
+        return True, _calendar_help_msg(_short(provider), res["status"], res.get("candidates", []), name)
+    cal = res["calendar"]
+    cal_name = cal.get("name") or name
+    await _set_default_calendar(user_id, provider, cal["id"], cal_name)
+    await _trace(session_uuid, user_id, workspace_uuid, trace_type="chat_calendar_default_set",
+                 result={"provider": provider, "calendar_id": cal["id"]})
+    return True, (f"✓ Set **{cal_name}** as your default {_short(provider)} calendar. New events "
+                  "go there unless you name a different one (e.g. **“on my Personal calendar”**). "
+                  "Say **“clear my default calendar”** to revert to primary.")
+
+
 async def _resolve_target_across(providers, query, *, session_uuid, user_id, workspace_uuid):
     """Find an update/delete target across MULTIPLE calendars: read each (gated +
     brokered, events tagged with their provider), match the query, and decide. So
@@ -1327,10 +1440,16 @@ async def _prepare_write(kind, provider, message, payload, *, session_uuid, user
 
     if kind == "create":
         fields = await extract_event_fields(message, "create")
-        # Default to primary (no provider call). Only when the user names a calendar
-        # ("on my Work calendar") do we look it up to resolve a concrete calendar_id.
+        # Default to primary. Only when the user names a calendar ("on my Work
+        # calendar") do we look it up to resolve a concrete calendar_id; otherwise
+        # fall back to the user's saved default WRITE calendar (no provider call —
+        # id+name were resolved when it was set), else primary.
         cal_id, cal_name = "primary", None
         hint = _extract_calendar_hint(message)
+        if not hint:
+            dflt = await get_default_calendar(user_id, provider)
+            if dflt:
+                cal_id, cal_name = dflt["id"], dflt["name"]
         if hint:
             token = await _get_access_token(provider, user_id)
             if not token:
