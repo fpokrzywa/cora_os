@@ -18,6 +18,35 @@ export interface ChatResponse {
   created_at: string;
 }
 
+// ---- Agent runtime (Cora Configuration) ----
+export interface AgentRuntimeConfig {
+  runtime_enabled: boolean;
+  delegation_enabled: boolean;
+  write_enabled: boolean;
+  max_steps: number;
+  max_parallel: number;
+  chat_model: string;
+  endpoint_configured: boolean;
+}
+
+export interface AgentRunStep {
+  kind: "tool_call" | "tool_result" | "final" | "error";
+  name?: string;
+  arguments?: Record<string, unknown>;
+  result?: string;
+  answer?: string;
+  error?: string;
+}
+
+export interface AgentRunResponse {
+  run_id: string | null;
+  answer: string;
+  model: string;
+  tool_calls: number;
+  stopped: "final" | "budget" | "error";
+  steps: AgentRunStep[];
+}
+
 export interface ConversationSummary {
   session_id: string;
   created_at: string;

@@ -12,6 +12,8 @@ import type {
   RoutingTestResult,
   ResponseTestRequest,
   ResponseTestResult,
+  AgentRunResponse,
+  AgentRuntimeConfig,
   ChatResponse,
   ConversationDetail,
   ConversationSummary,
@@ -238,6 +240,19 @@ export function sendChat(
 
 export function listConversations() {
   return request<ConversationSummary[]>("/conversations");
+}
+
+// ---------- Agent runtime (Cora Configuration) ----------
+
+export function getAgentConfig() {
+  return request<AgentRuntimeConfig>("/chat/agent/config");
+}
+
+export function sendAgentChat(message: string, sessionId?: string | null) {
+  return request<AgentRunResponse>("/chat/agent", {
+    method: "POST",
+    body: JSON.stringify({ message, session_id: sessionId ?? undefined }),
+  });
 }
 
 export function getConversation(sessionId: string) {

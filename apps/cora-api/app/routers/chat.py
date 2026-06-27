@@ -1221,6 +1221,37 @@ async def chat_agent_get_run(
     return run
 
 
+class AgentConfigResponse(BaseModel):
+    runtime_enabled: bool
+    delegation_enabled: bool
+    write_enabled: bool
+    max_steps: int
+    max_parallel: int
+    chat_model: str
+    endpoint_configured: bool
+
+
+@router.get(
+    "/chat/agent/config",
+    response_model=AgentConfigResponse,
+    summary="Agent runtime config + flag status (read-only)",
+)
+async def chat_agent_config(
+    current: Annotated[CurrentUser, Depends(get_current_user)],
+) -> AgentConfigResponse:
+    """Read-only view of the agent runtime's effective config. Intentionally NOT
+    gated on agent_runtime_enabled — it reports status even when the loop is off."""
+    return AgentConfigResponse(
+        runtime_enabled=settings.agent_runtime_enabled,
+        delegation_enabled=settings.agent_delegation_enabled,
+        write_enabled=settings.agent_write_enabled,
+        max_steps=settings.agent_runtime_max_steps,
+        max_parallel=settings.agent_delegation_max_parallel,
+        chat_model=settings.dgx_chat_model_name or settings.dgx_model_name or "",
+        endpoint_configured=bool(settings.dgx_model_endpoint),
+    )
+
+
 async def _persist_exchange(
     session_uuid: uuid.UUID,
     scope_type: str,

@@ -2611,3 +2611,124 @@ textarea.cora-input {
   text-transform: uppercase;
   color: var(--text-muted);
 }
+
+/* ---- Cora Configuration · Agent Runtime ---- */
+.agent-cfg__status {
+  margin-bottom: 24px;
+}
+.agent-cfg__pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.agent-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.agent-pill__dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-dim);
+}
+.agent-pill--on {
+  color: var(--text);
+  border-color: rgba(52, 211, 153, 0.4);
+}
+.agent-pill--on .agent-pill__dot {
+  background: #34d399;
+  box-shadow: 0 0 6px rgba(52, 211, 153, 0.6);
+}
+.agent-pill--off .agent-pill__dot {
+  background: var(--text-dim);
+}
+.agent-cfg__meta {
+  font-size: 13px;
+  color: var(--text-muted);
+}
+.agent-cfg__meta code,
+.agent-cfg__note code {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-size: 12px;
+}
+.agent-cfg__note {
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.agent-cfg__h2 {
+  font-size: 15px;
+  margin: 0 0 10px;
+}
+.agent-cfg__composer {
+  display: flex;
+  gap: 8px;
+  align-items: flex-end;
+}
+.agent-cfg__composer .composer__input {
+  flex: 1;
+}
+.agent-cfg__result {
+  margin-top: 16px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+  padding: 14px;
+}
+.agent-cfg__result-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-bottom: 10px;
+}
+.agent-steps {
+  list-style: none;
+  margin: 0 0 14px;
+  padding: 0;
+  border-left: 2px solid var(--border-strong);
+}
+.agent-step {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px;
+  padding: 4px 0 4px 12px;
+  font-size: 12.5px;
+  color: var(--text-muted);
+}
+.agent-step__arrow {
+  color: var(--accent);
+  font-weight: 700;
+}
+.agent-step__name {
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.agent-step__args {
+  color: var(--text-dim);
+  font-size: 11px;
+  word-break: break-all;
+}
+.agent-step__text {
+  color: var(--text-muted);
+}
+.agent-step--error {
+  color: var(--danger);
+}
+.agent-cfg__answer {
+  margin-top: 4px;
+}

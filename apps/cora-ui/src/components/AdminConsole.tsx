@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 
 import { setScreenView } from "../screenContext";
 import { Admin } from "./Admin";
+import { Memories } from "./Memories";
 import { AgentAdmin } from "./AgentAdmin";
 import { McpAdmin } from "./McpAdmin";
 import { ToolAdmin } from "./ToolAdmin";
@@ -24,16 +25,19 @@ import { ExecutionGovernanceDashboard } from "./ExecutionGovernanceDashboard";
 import { ProviderConnectors } from "./ProviderConnectors";
 import { IntegrationProviders } from "./IntegrationProviders";
 import { CredentialVault } from "./CredentialVault";
+import { CoraConfiguration } from "./CoraConfiguration";
 
 // Primary tabs collapse the old per-module sidebar items into one console.
 export type AdminTab =
   | "overview"
   | "users"
+  | "memories"
   | "agents"
   | "tools"
   | "knowledge"
   | "execution"
-  | "workspaces";
+  | "workspaces"
+  | "cora-config";
 
 interface Props {
   onImpersonate: (userId: string) => void;
@@ -69,6 +73,13 @@ const TABS: TabDef[] = [
     icon: "⚙",
     blurb: "Manage users, roles, and impersonation.",
     subs: [{ key: "users", label: "Users" }],
+  },
+  {
+    key: "memories",
+    label: "Memories",
+    icon: "❖",
+    blurb: "Inspect memory by scope, create entries, and preview visibility.",
+    subs: [{ key: "memories", label: "Memories" }],
   },
   {
     key: "agents",
@@ -132,6 +143,13 @@ const TABS: TabDef[] = [
     blurb: "Create and manage workspaces.",
     subs: [{ key: "workspaces", label: "Workspaces" }],
   },
+  {
+    key: "cora-config",
+    label: "Cora Configuration",
+    icon: "✦",
+    blurb: "Agent runtime status, and a panel to use the model-driven agent.",
+    subs: [],
+  },
 ];
 
 function firstSub(tab: AdminTab): string {
@@ -172,6 +190,8 @@ export function AdminConsole({
     switch (tab) {
       case "users":
         return <Admin onImpersonate={onImpersonate} />;
+      case "memories":
+        return <Memories />;
       case "agents":
         if (sub === "signal-drafts")
           return <SignalDrafts workspaceId={workspaceId} isAdmin={isAdmin} />;
@@ -234,6 +254,8 @@ export function AdminConsole({
         return <Plans />;
       case "workspaces":
         return <Workspaces onWorkspacesChanged={onWorkspacesChanged} />;
+      case "cora-config":
+        return <CoraConfiguration />;
       case "overview":
       default:
         return (
