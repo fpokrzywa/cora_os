@@ -19,6 +19,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+from app import agent_runtime
 from app import news_ingest
 from app.jobs import create_job
 from app.agents.delegations import (
@@ -361,10 +362,36 @@ async def refresh_news_feed(job: dict) -> dict:
         raise PermanentError(str(exc)) from exc
 
 
+async def run_agent_job(job: dict) -> dict:
+    """Phase 3: execute a worker-driven agent run bound to a pre-created
+    agent_runtime_runs row. The HTTP request that enqueued this already returned
+    the run_id; the client polls GET /chat/agent/runs/{id}. run_agent persists +
+    finalizes the row itself, so we only surface a job-level summary."""
+    payload = job.get("payload") or {}
+    run_id = payload.get("run_id")
+    message = payload.get("message")
+    if not run_id or not message:
+        raise PermanentError("agent_run job missing run_id/message")
+    result = await agent_runtime.run_agent(
+        message,
+        user_id=job.get("user_id"),
+        session_id=job.get("session_id"),
+        workspace_id=payload.get("workspace_id"),
+        is_orchestrator=bool(payload.get("is_orchestrator", True)),
+        run_id=uuid.UUID(str(run_id)),
+    )
+    return {
+        "run_id": str(run_id),
+        "stopped": result.stopped,
+        "tool_calls": result.tool_calls,
+    }
+
+
 HANDLERS = {
     "execution_plan_step": execute_plan_step,
     "plan_step": execute_plan_step,  # backwards-compat
     "news_feed_refresh": refresh_news_feed,
+    "agent_run": run_agent_job,
 }
 
 

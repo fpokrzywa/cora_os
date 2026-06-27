@@ -72,6 +72,8 @@ from app import chat_briefing
 from app import chat_scheduling
 from app import provider_defaults
 from app import screen_vision
+from app import agent_runtime
+from app.jobs import JobError, create_job
 
 MEMORY_SEARCH_LIMIT = 20
 MEMORIES_IN_PROMPT = 5
@@ -1088,6 +1090,135 @@ class ChatResponse(BaseModel):
     response: str
     placeholder: bool
     created_at: str
+
+
+class AgentRunRequest(BaseModel):
+    message: str = Field(..., min_length=1, description="User message for the agent kernel")
+    session_id: Optional[str] = Field(default=None, description="Optional session id")
+
+
+class AgentRunResponse(BaseModel):
+    run_id: Optional[str]
+    answer: str
+    model: str
+    tool_calls: int
+    stopped: str  # final | budget | error
+    steps: list[dict]
+
+
+@router.post(
+    "/chat/agent",
+    response_model=AgentRunResponse,
+    summary="Phase 1 agent kernel (read-only tool-calling loop)",
+)
+async def chat_agent(
+    request: AgentRunRequest,
+    current: Annotated[CurrentUser, Depends(get_current_user)],
+) -> AgentRunResponse:
+    """Experimental: route a message through the model-driven reason→act→observe
+    loop (read-only tools only). Fail-closed — returns 404 unless
+    settings.agent_runtime_enabled is true."""
+    if not settings.agent_runtime_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="agent runtime is disabled",
+        )
+    result = await agent_runtime.run_agent(
+        request.message,
+        user_id=current.id,
+        session_id=request.session_id,
+        is_orchestrator=True,
+    )
+    return AgentRunResponse(
+        run_id=result.run_id,
+        answer=result.answer,
+        model=result.model,
+        tool_calls=result.tool_calls,
+        stopped=result.stopped,
+        steps=[{"kind": s.kind, **s.detail} for s in result.steps],
+    )
+
+
+class AgentAsyncResponse(BaseModel):
+    run_id: str
+    status: str
+
+
+@router.post(
+    "/chat/agent/async",
+    response_model=AgentAsyncResponse,
+    summary="Submit a worker-driven agent run (non-blocking); poll the run id",
+)
+async def chat_agent_async(
+    request: AgentRunRequest,
+    current: Annotated[CurrentUser, Depends(get_current_user)],
+) -> AgentAsyncResponse:
+    """Phase 3: enqueue the orchestrator run on cora-worker and return its id
+    immediately. The request never blocks on the model/tools/spokes; poll
+    GET /chat/agent/runs/{run_id} until status is terminal."""
+    if not settings.agent_runtime_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="agent runtime is disabled",
+        )
+    session_uuid = (
+        _parse_uuid_or_none(request.session_id) if request.session_id else None
+    )
+    run_id = await agent_runtime.create_pending_run(
+        goal=request.message,
+        user_id=current.id,
+        session_id=session_uuid,
+    )
+    if run_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="run storage unavailable; async runs require persistence",
+        )
+    try:
+        await create_job(
+            user_id=current.id,
+            session_id=session_uuid,
+            job_type="agent_run",
+            payload={
+                "run_id": str(run_id),
+                "message": request.message,
+                "is_orchestrator": True,
+            },
+        )
+    except JobError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"could not enqueue run: {exc}",
+        ) from exc
+    return AgentAsyncResponse(run_id=str(run_id), status="pending")
+
+
+@router.get(
+    "/chat/agent/runs/{run_id}",
+    summary="Fetch a persisted agent run (owner-scoped)",
+)
+async def chat_agent_get_run(
+    run_id: str,
+    current: Annotated[CurrentUser, Depends(get_current_user)],
+) -> dict:
+    if not settings.agent_runtime_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="agent runtime is disabled",
+        )
+    try:
+        rid = uuid.UUID(run_id)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="run_id must be a UUID",
+        ) from exc
+    run = await agent_runtime.get_run(rid, user_id=current.id)
+    if run is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="run not found"
+        )
+    return run
 
 
 async def _persist_exchange(

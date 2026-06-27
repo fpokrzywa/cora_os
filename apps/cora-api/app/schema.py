@@ -1018,6 +1018,45 @@ VALUES
     ('microsoft_calendar', 'calendar', 'calendar_read', 'production'),
     ('microsoft_calendar', 'calendar', 'calendar_write', 'production')
 ON CONFLICT (provider_name, action_type, environment) DO NOTHING;
+
+-- Phase 1 agent kernel: durable, resumable run state. One row per run_agent()
+-- invocation; the message thread, budget, and result are persisted as the loop
+-- advances, so a run survives a restart and is the seam Phase 2 hub-and-spoke
+-- delegation resumes through (a spoke run is just another row, with agent_name
+-- set to the spoke). status leaves room for the Phase 2 pause states
+-- (waiting_user / waiting_tool); Phase 1 only ever sets running / done / failed.
+CREATE TABLE IF NOT EXISTS agent_runtime_runs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id UUID,
+    user_id UUID,
+    workspace_id UUID,
+    agent_name TEXT,
+    status TEXT NOT NULL DEFAULT 'running',
+    goal TEXT NOT NULL,
+    model_name TEXT,
+    messages JSONB NOT NULL DEFAULT '[]'::jsonb,
+    steps JSONB NOT NULL DEFAULT '[]'::jsonb,
+    answer TEXT,
+    tool_calls INT NOT NULL DEFAULT 0,
+    step_count INT NOT NULL DEFAULT 0,
+    max_steps INT NOT NULL DEFAULT 6,
+    stopped TEXT,
+    error_message TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS agent_runtime_runs_session_idx
+    ON agent_runtime_runs (session_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS agent_runtime_runs_user_idx
+    ON agent_runtime_runs (user_id, created_at DESC);
+
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'agent_runtime_runs_status_chk') THEN
+        ALTER TABLE agent_runtime_runs ADD CONSTRAINT agent_runtime_runs_status_chk
+            CHECK (status IN ('pending','running','waiting_user','waiting_tool','done','failed','cancelled'));
+    END IF;
+END $$;
 """
 
 # Each entry is one INSERT — asyncpg.Connection.execute() cannot run a

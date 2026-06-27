@@ -10,6 +10,34 @@ class Settings(BaseSettings):
     dgx_model_endpoint: str = ""
     dgx_model_name: str = ""
 
+    # Phase 1 agent kernel (tool-calling loop). dgx_chat_model_name is the
+    # tools-capable chat model served on the DGX (Ollama /api/chat); falls back
+    # to dgx_model_name when unset. Fail-closed: the runtime serves only when
+    # agent_runtime_enabled is true, and only the curated READ-ONLY catalog is
+    # reachable. max_steps bounds the reason→act→observe loop.
+    dgx_chat_model_name: str = ""
+    agent_runtime_enabled: bool = False
+    agent_runtime_max_steps: int = 6
+
+    # Phase 2 hub-and-spoke delegation. When true (AND agent_runtime_enabled),
+    # the orchestrator run gains a delegate_to tool that hands a self-contained
+    # subtask to a registry specialist (FORGE/PULSE/SIGNAL/CHRONOS), which runs
+    # as its own scoped spoke run and returns its answer. Fail-closed: off ->
+    # the orchestrator is a plain single agent (Phase 1 behavior).
+    agent_delegation_enabled: bool = False
+
+    # Phase 4: max spokes that run concurrently within one orchestrator turn
+    # (asyncio fan-out; spoke model calls are I/O-bound on the DGX so they
+    # overlap). Bounds DGX load and concurrent delegations.
+    agent_delegation_max_parallel: int = 3
+
+    # Phase 5: let the agent STAGE review-only artifacts (email drafts, schedule
+    # proposals) via the internal_action tools. These create draft/proposal
+    # records only — they NEVER send email or write a calendar; the actual
+    # send/execute stays a separate human-confirmed step gated by the kill
+    # switches. Fail-closed: off -> the agent loop is read-only (Phase 1-4).
+    agent_write_enabled: bool = False
+
     n8n_webhook_health_url: str = "http://n8n:5678/webhook/cora-health"
 
     # Self-hosted SearXNG metasearch — backs PULSE's web_search tool. Internal
