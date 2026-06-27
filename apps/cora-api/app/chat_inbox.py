@@ -412,6 +412,25 @@ async def _handle_inbox_multi(kind, query, providers, *, session_uuid, user_id, 
     return True, _render_list_multi(oks, merged, skipped)
 
 
+async def gather_inbox_highlights(*, user_id, workspace_uuid, session_uuid, limit=5):
+    """Composite-friendly read for the Daily Briefing: recent messages merged across
+    ALL connected mailboxes (newest first), gated + brokered + audited per provider
+    exactly like a chat inbox read (each provider fails closed independently). Returns
+    {"messages", "providers_ok", "skipped"}."""
+    providers = await _resolve_read_providers("", user_id)
+    merged, oks, skipped = [], [], []
+    for p in providers:
+        msgs, info = await _read_one_inbox(p, "list", None, session_uuid=session_uuid,
+                                           user_id=user_id, workspace_uuid=workspace_uuid)
+        if msgs is not None:
+            merged.extend(msgs)
+            oks.append(p)
+        else:
+            skipped.append(info)
+    merged.sort(key=lambda mm: _msg_dt(mm.get("date")), reverse=True)
+    return {"messages": merged[:limit], "providers_ok": oks, "skipped": skipped}
+
+
 async def _handle_inbox_single(kind, query, provider, *, session_uuid, user_id, workspace_uuid):
     req_trace = {"list": TRACE_LISTED, "search": TRACE_SEARCH, "summarize": TRACE_SUMMARY,
                  "read_thread": TRACE_READ, "draft_reply": TRACE_REPLY}[kind]

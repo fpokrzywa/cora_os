@@ -61,12 +61,15 @@ async def main() -> int:
     async def cal(msg):
         cmd = cc.detect_calendar_command(msg)
         conf = cc.detect_confirmation(msg)
-        active = cmd is not None or (conf is not None and await cc.has_pending(sess))
+        sel = cc.detect_selection(msg)
+        la = cc.detect_list_action(msg)
+        active = cmd is not None or ((conf is not None or sel is not None or la is not None)
+                                     and await cc.has_pending(sess))
         if not active:
             return None, None
         return await cc.handle_calendar_turn(
-            message=msg, command=cmd, confirmation=conf, session_uuid=sess,
-            user_id=uid, workspace_uuid=wid, scope_type="user", is_admin=True)
+            message=msg, command=cmd, confirmation=conf, selection=sel, list_action=la,
+            session_uuid=sess, user_id=uid, workspace_uuid=wid, scope_type="user", is_admin=True)
 
     # detection
     expect(cc.detect_calendar_command("What's on my calendar today?")[0] == "list", "detect list")
@@ -87,11 +90,38 @@ async def main() -> int:
     expect(cc.detect_calendar_command("Schedule a meeting with the team tomorrow")[0] == "create", "detect create")
     expect(cc.detect_calendar_command("Reschedule my 1:1 meeting")[0] == "update", "detect update")
     expect(cc.detect_calendar_command("Cancel my standup meeting")[0] == "delete", "detect delete")
+    # follow-up cancel phrasings that previously fell through to the LLM (which hallucinated
+    # a cancellation) must route to the governed delete instead
+    for phrase in ("sorry lets cancel that meeting", "cancel that meeting", "delete that event",
+                   "remove this meeting", "call off the meeting", "get rid of that appointment"):
+        expect((cc.detect_calendar_command(phrase) or (None,))[0] == "delete",
+               f"detect delete (follow-up phrasing): {phrase!r}")
+    expect(cc.detect_calendar_command("cancel that meeting with Admin")[1]["query"] == "meeting with admin",
+           "delete query extracted after 'that' ('with Admin' kept)")
+    expect(cc.detect_calendar_command("cancel it") is None, "bare 'cancel it' (no anchor) → NOT a delete cmd")
     expect(cc.detect_calendar_command("Plan my week") is None, "planning chatter must NOT be a calendar cmd")
     expect(cc.detect_calendar_command("Draft an email to Mark") is None, "email must NOT be a calendar cmd")
     expect(cc.detect_confirmation("confirm") == "confirm" and cc.detect_confirmation("yes") == "confirm", "detect confirm")
     expect(cc.detect_confirmation("cancel") == "cancel" and cc.detect_confirmation("no") == "cancel", "detect cancel")
     expect(cc.detect_confirmation("now show me the agenda") is None, "'now…' must NOT read as 'no'")
+    # numbered candidate selection
+    expect(cc.detect_selection("2") == 2 and cc.detect_selection("cancel 2") == 2
+           and cc.detect_selection("number 3") == 3 and cc.detect_selection("#1") == 1,
+           "detect numeric selection")
+    expect(cc.detect_selection("the second one") == 2 and cc.detect_selection("2nd") == 2,
+           "detect ordinal selection")
+    expect(cc.detect_selection("2 pm tomorrow") is None and cc.detect_selection("schedule something") is None,
+           "selection must NOT fire on non-pick text")
+    # verb+number list action ("cancel 4")
+    expect(cc.detect_list_action("cancel 4") == ("delete", 4)
+           and cc.detect_list_action("Can you cancel 4 please") == ("delete", 4),
+           "detect list-action cancel N (incl. politeness wrapper)")
+    expect(cc.detect_list_action("reschedule 2 to 3pm") == ("update", 2)
+           and cc.detect_list_action("move 3") == ("update", 3),
+           "detect list-action reschedule/move N")
+    expect(cc.detect_list_action("cancel my standup meeting") is None
+           and cc.detect_list_action("cancel that meeting") is None,
+           "a query-based cancel is NOT a list action")
 
     # read-window resolution: past-aware day/week windows (the old code hid the past)
     now = datetime.now(timezone.utc)
@@ -438,6 +468,124 @@ async def main() -> int:
         responses.append(t)
         expect(h and t and "Outlook Review" in t and "Google Standup" not in t,
                "F named 'outlook' reads ONLY outlook")
+
+        # --- G) confirm-time calendar REDIRECT ("confirm but on <provider>") ---
+        created_on = {}
+
+        async def _g_create(*, access_token=None, fields=None, calendar_id="primary"):
+            created_on["provider"] = "google_calendar"
+            return {"id": "gx", "title": fields.get("title"), "start": "—", "end": "—",
+                    "location": "", "attendees": [], "link": ""}
+
+        async def _o_create(*, access_token=None, fields=None, calendar_id="primary"):
+            created_on["provider"] = "outlook_calendar"
+            return {"id": "ox", "title": fields.get("title"), "start": "—", "end": "—",
+                    "location": "", "attendees": [], "link": ""}
+        adapter.create_event = _g_create
+        ms_adapter.create_event = _o_create
+
+        # Stage a provider-less create (lands on the default), then redirect at confirm.
+        h, t = await cal("Schedule a meeting with Dana tomorrow")
+        responses.append(t)
+        expect(h and t and "Ready to create on " in t, "G provider-less create staged on a default")
+        staged = "outlook_calendar" if "Ready to create on outlook_calendar" in t else "google_calendar"
+        other = "google_calendar" if staged == "outlook_calendar" else "outlook_calendar"
+        other_word = "google" if other == "google_calendar" else "outlook"
+        created_on.clear()
+        h, t = await cal(f"confirm but on {other_word}")
+        responses.append(t)
+        expect(h and t and f"Created a {other} event" in t,
+               "G 'confirm but on <provider>' redirects the create to the named calendar")
+        expect(created_on.get("provider") == other,
+               "G the redirected provider's adapter performed the write (not the staged one)")
+        expect(not await cc.has_pending(sess), "G pending cleared after redirected confirm")
+
+        # --- H) CROSS-PROVIDER numbered selection (find/cancel on whichever calendar) ---
+        # Two calendars connected (google+outlook from F); a provider-less delete must
+        # search BOTH and act on the picked event's OWN calendar.
+        async def _g_two(*, access_token=None, time_min=None, time_max=None, limit=50):
+            b = "2026-07-08T"
+            return [
+                {"id": "gA", "provider": "google_calendar", "title": "Alpha Sync", "start": b + "09:00:00Z", "end": b + "09:30:00Z", "calendar_id": "primary"},
+                {"id": "gB", "provider": "google_calendar", "title": "Beta Review", "start": b + "13:00:00Z", "end": b + "14:00:00Z", "calendar_id": "primary"},
+            ]
+
+        async def _o_one(*, access_token=None, time_min=None, time_max=None, limit=50):
+            b = "2026-07-08T"
+            return [{"id": "oC", "provider": "outlook_calendar", "title": "Outlook Standup",
+                     "start": b + "11:00:00Z", "end": b + "11:30:00Z", "calendar_id": "primary"}]
+        adapter.list_events = _g_two
+        ms_adapter.list_events = _o_one
+        # provider-less cancel → searches BOTH calendars; numbered + provider-tagged
+        h, t = await cal("sorry can we cancel that meeting")
+        responses.append(t)
+        expect(h and t and "**1.**" in t and "**2.**" in t and "**3.**" in t,
+               "H cross-provider numbered list spans both calendars")
+        expect(h and t and "[google]" in t and "[outlook]" in t,
+               "H candidates tagged with their owning calendar")
+        psel = await cc._get_pending(sess)
+        expect(psel and psel["kind"] == "select_target", "H candidate set stashed (no write pending yet)")
+        # sorted by start: #1 Alpha 09:00 [google], #2 Outlook Standup 11:00 [outlook], #3 Beta 13:00 [google]
+        h, t = await cal("2")
+        responses.append(t)
+        expect(h and t and "Ready to cancel on outlook_calendar" in t and "Outlook Standup" in t,
+               "H pick crosses to the right calendar (the outlook event)")
+        pdel = await cc._get_pending(sess)
+        expect(pdel and pdel["kind"] == "delete" and pdel["provider"] == "outlook_calendar"
+               and pdel["target_event_id"] == "oC",
+               "H staged delete on the event's OWN provider (outlook)")
+        odel = {}
+
+        async def _o_del(*, access_token=None, event_id=None, calendar_id="primary"):
+            odel["id"] = event_id
+            return {"id": event_id, "deleted": True}
+        ms_adapter.delete_event = _o_del
+        h, t = await cal("confirm")
+        responses.append(t)
+        expect(h and t and "Cancelled" in t and odel.get("id") == "oC",
+               "H confirm deletes the picked cross-calendar event on outlook")
+        expect(not await cc.has_pending(sess), "H pending cleared after the delete")
+        # out-of-range pick is rejected without staging a write
+        h, t = await cal("cancel that meeting")  # re-stage the candidate list
+        responses.append(t)
+        psel2 = await cc._get_pending(sess)
+        expect(psel2 and psel2["kind"] == "select_target", "H re-staged candidate list")
+        h, t = await cal("9")
+        responses.append(t)
+        expect(h and t and "not one of the" in t.lower(), "H out-of-range pick rejected")
+        await cc._clear_pending(sess)
+
+        # --- I) numbered READ list is actionable ("cancel N" maps to read item N) ---
+        # (google=_g_two [Alpha 09:00, Beta 13:00], outlook=_o_one [Outlook Standup 11:00]
+        #  still mocked; provider-less read merges + sorts → 1 Alpha, 2 Outlook Standup, 3 Beta)
+        h, t = await cal("what's on my calendar this week")
+        responses.append(t)
+        expect(h and t and "**1.**" in t and "**2.**" in t and "**3.**" in t, "I read list is numbered")
+        expect(h and t and "cancel 2" in t.lower(), "I read list shows the act hint")
+        pl = await cc._get_pending(sess)
+        expect(pl and pl["kind"] == "select_target" and pl["fields"].get("action") is None,
+               "I read stashes an actionable list (no action yet)")
+        # bare number after a read → ask which action (never guess a write)
+        h, t = await cal("1")
+        responses.append(t)
+        expect(h and t and "cancel" in t.lower() and "reschedule" in t.lower(),
+               "I bare number after a read asks cancel-or-reschedule")
+        # "cancel 1" → read item #1 (Alpha Sync, google) staged for delete
+        h, t = await cal("cancel 1")
+        responses.append(t)
+        expect(h and t and "Ready to cancel on google_calendar" in t and "Alpha Sync" in t,
+               "I 'cancel 1' targets read item #1 on its own calendar")
+        gdel = {}
+
+        async def _g_del(*, access_token=None, event_id=None, calendar_id="primary"):
+            gdel["id"] = event_id
+            return {"id": event_id, "deleted": True}
+        adapter.delete_event = _g_del
+        h, t = await cal("confirm")
+        responses.append(t)
+        expect(h and t and "Cancelled" in t and gdel.get("id") == "gA",
+               "I confirm deletes exactly read item #1 (gA)")
+        await cc._clear_pending(sess)
 
         # traces present
         async with pool.acquire() as conn:

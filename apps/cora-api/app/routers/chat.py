@@ -68,6 +68,8 @@ from app import chat_provider_simulation
 from app import chat_approval_queue
 from app import chat_inbox
 from app import chat_calendar
+from app import chat_briefing
+from app import chat_scheduling
 from app import provider_defaults
 from app import screen_vision
 
@@ -2263,6 +2265,64 @@ async def chat(
                 response=_pd_text, placeholder=False, created_at=_completed_at.isoformat(),
             )
 
+    # Daily Briefing (composite: CHRONOS schedule + SIGNAL inbox + PULSE news). A
+    # read-only digest of the user's day — reuses the governed cross-provider calendar
+    # and inbox reads (each section fails closed independently) plus the news_briefing
+    # DB read. No writes, no sends. Checked before the single-domain inbox/calendar
+    # handlers so "brief me on my day" isn't partially swallowed by them.
+    if chat_briefing.detect_briefing_command(request.message):
+        _br_handled, _br_text = await chat_briefing.handle_briefing_command(
+            message=request.message, session_uuid=session_uuid, user_id=current.id,
+            workspace_uuid=workspace_uuid,
+        )
+        if _br_handled and _br_text is not None:
+            _completed_at = datetime.now(timezone.utc)
+            try:
+                await _persist_exchange(
+                    session_uuid=session_uuid, scope_type=scope_type, scope_id=scope_id,
+                    user_message=request.message, assistant_response=_br_text,
+                    model_name=None, placeholder=False, started_at=started_at,
+                    completed_at=_completed_at, agent_name=PERSONA_NAME,
+                    workspace_id=workspace_uuid,
+                )
+            except Exception:
+                logger.exception("persist daily-briefing exchange failed session=%s", session_id)
+            return ChatResponse(
+                session_id=session_id, agent=PERSONA_NAME, selected_agent=PERSONA_NAME,
+                routing_matched_keywords=matched_keywords, model_endpoint=endpoint,
+                response=_br_text, placeholder=False, created_at=_completed_at.isoformat(),
+            )
+
+    # CHRONOS Smart Scheduling (free/busy + find-a-time). "When am I free this week?" /
+    # "find 30 min tomorrow afternoon" → READ-ONLY open-slot search across all calendars;
+    # "schedule 30 min with sam@x next tue" → finds the slot then STAGES it through the
+    # calendar confirm-before-write path (a later "confirm" books it). Checked before the
+    # calendar handler so a duration-based find isn't taken as a normal create; a bare
+    # "confirm" after a staged booking is resolved by the calendar block (has_pending).
+    _sched_cmd = chat_scheduling.detect_scheduling_command(request.message)
+    if _sched_cmd is not None:
+        _sc_handled, _sc_text = await chat_scheduling.handle_scheduling_command(
+            message=request.message, payload=_sched_cmd[1], session_uuid=session_uuid,
+            user_id=current.id, workspace_uuid=workspace_uuid,
+        )
+        if _sc_handled and _sc_text is not None:
+            _completed_at = datetime.now(timezone.utc)
+            try:
+                await _persist_exchange(
+                    session_uuid=session_uuid, scope_type=scope_type, scope_id=scope_id,
+                    user_message=request.message, assistant_response=_sc_text,
+                    model_name=None, placeholder=False, started_at=started_at,
+                    completed_at=_completed_at, agent_name=CHRONOS_NAME,
+                    workspace_id=workspace_uuid,
+                )
+            except Exception:
+                logger.exception("persist scheduling exchange failed session=%s", session_id)
+            return ChatResponse(
+                session_id=session_id, agent=PERSONA_NAME, selected_agent=CHRONOS_NAME,
+                routing_matched_keywords=matched_keywords, model_endpoint=endpoint,
+                response=_sc_text, placeholder=False, created_at=_completed_at.isoformat(),
+            )
+
     # Chat-Native Inbox Assistant v2.3. Read-only inbox Q&A (list/search/summarize/
     # thread/draft-reply). Governed + FAILS CLOSED — no provider API call and no
     # token access in this phase. Checked before the email-lifecycle so "draft a
@@ -2300,14 +2360,18 @@ async def chat(
     # action is staged for this session (otherwise it falls through untouched).
     _cal_cmd = chat_calendar.detect_calendar_command(request.message)
     _cal_confirm = chat_calendar.detect_confirmation(request.message)
+    _cal_select = chat_calendar.detect_selection(request.message)
+    _cal_list_action = chat_calendar.detect_list_action(request.message)
     _cal_active = _cal_cmd is not None or (
-        _cal_confirm is not None and await chat_calendar.has_pending(session_uuid)
+        (_cal_confirm is not None or _cal_select is not None or _cal_list_action is not None)
+        and await chat_calendar.has_pending(session_uuid)
     )
     if _cal_active:
         _cal_handled, _cal_text = await chat_calendar.handle_calendar_turn(
             message=request.message, command=_cal_cmd, confirmation=_cal_confirm,
-            session_uuid=session_uuid, user_id=current.id, workspace_uuid=workspace_uuid,
-            scope_type=scope_type, is_admin=(current.role == "admin"),
+            selection=_cal_select, list_action=_cal_list_action, session_uuid=session_uuid,
+            user_id=current.id, workspace_uuid=workspace_uuid, scope_type=scope_type,
+            is_admin=(current.role == "admin"),
         )
         if _cal_handled and _cal_text is not None:
             _completed_at = datetime.now(timezone.utc)

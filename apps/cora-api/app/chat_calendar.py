@@ -112,8 +112,53 @@ def detect_confirmation(message: str) -> Optional[str]:
     return None
 
 
+_ORDINALS = {"first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5,
+             "sixth": 6, "seventh": 7, "eighth": 8, "ninth": 9, "tenth": 10}
+
+
+def detect_selection(message: str) -> Optional[int]:
+    """Detect a 1-based pick from a numbered candidate list ("2", "cancel 2",
+    "number 2", "the 2nd one", "second"). Only meaningful when a candidate selection
+    is pending (the caller gates on that). Anchored to the whole message so "2 pm
+    tomorrow" is NOT read as a pick."""
+    m = (message or "").strip().lower().rstrip("!.? ")
+    if not m:
+        return None
+    mt = re.match(r"^(?:option|number|item|no\.?|#|pick|choose|select|cancel|delete|"
+                  r"remove|do|the)?\s*#?\s*(\d{1,2})(?:\s+(?:one|please|that one|thanks))?$", m)
+    if mt:
+        return int(mt.group(1))
+    mt2 = re.match(r"^(?:the\s+)?(\d{1,2})(?:st|nd|rd|th)(?:\s+one)?$", m)
+    if mt2:
+        return int(mt2.group(1))
+    for w, n in _ORDINALS.items():
+        if re.match(rf"^(?:the\s+)?{w}(?:\s+one)?$", m):
+            return n
+    return None
+
+
+_LIST_ACTION_RE = re.compile(
+    r"^(?:can you|could you|would you|please|pls|hey|ok|okay)?\s*,?\s*"
+    r"(cancel|delete|remove|reschedule|move|change|update|edit)\s+"
+    r"(?:the\s+)?(?:event\s+|meeting\s+|number\s+|item\s+|#\s*)?(\d{1,2})(?:st|nd|rd|th)?\b")
+_LIST_ACTION_VERB = {"cancel": "delete", "delete": "delete", "remove": "delete",
+                     "reschedule": "update", "move": "update", "change": "update",
+                     "update": "update", "edit": "update"}
+
+
+def detect_list_action(message: str) -> Optional[tuple[str, int]]:
+    """Detect "cancel 4" / "reschedule 2 to 3pm" / "delete event 3" — a verb + a
+    1-based index into the last numbered list Cora showed. Returns (action, index)
+    with action in delete|update. Only meaningful when a numbered list is pending
+    (the caller gates on that)."""
+    mt = _LIST_ACTION_RE.match((message or "").strip().lower())
+    if not mt:
+        return None
+    return (_LIST_ACTION_VERB[mt.group(1)], int(mt.group(2)))
+
+
 def _extract_event_query(m: str) -> Optional[str]:
-    for kw in (" my ", " the ", " about ", " for ", " titled ", " called "):
+    for kw in (" my ", " the ", " that ", " this ", " about ", " for ", " titled ", " called "):
         if kw in m:
             tail = m.split(kw, 1)[1].strip().rstrip("?.! ")
             tail = re.split(r"\b(to|on|at|from|tomorrow|today|next)\b", tail, 1)[0].strip()
@@ -232,9 +277,12 @@ def detect_calendar_command(message: str) -> Optional[tuple[str, dict]]:
         return None
     has_anchor = any(n in m for n in ("calendar", "meeting", "event", "appointment", "agenda"))
 
-    if any(p in m for p in ("cancel my", "cancel the", "delete the event", "delete my event",
-                            "delete the meeting", "remove the event", "remove the meeting",
-                            "remove my meeting", "clear my calendar")) and has_anchor:
+    if any(p in m for p in ("cancel my", "cancel the", "cancel that", "cancel this",
+                            "cancel our", "delete the event", "delete my event", "delete that",
+                            "delete this", "delete the meeting", "delete my meeting",
+                            "remove the event", "remove the meeting", "remove my meeting",
+                            "remove that", "remove this", "drop the meeting", "drop that meeting",
+                            "call off", "get rid of", "clear my calendar")) and has_anchor:
         return ("delete", {"query": _extract_event_query(m)})
 
     if ("reschedule" in m or "move my meeting" in m or "move the meeting" in m
@@ -369,12 +417,21 @@ async def extract_event_fields(message: str, kind: str) -> dict:
 # Provider resolution + governance gates (fail-closed)
 # --------------------------------------------------------------------------- #
 
-async def _resolve_provider(message: str, user_id: uuid.UUID) -> str:
+def _named_provider(message: str) -> Optional[str]:
+    """The calendar provider EXPLICITLY named in the message, else None (no silent
+    default). Used both to resolve writes and to honor a redirect at confirm time."""
     m = (message or "").lower()
     if "outlook" in m or "microsoft" in m:
         return "outlook_calendar"
     if "google" in m or "gmail" in m:
         return "google_calendar"
+    return None
+
+
+async def _resolve_provider(message: str, user_id: uuid.UUID) -> str:
+    named = _named_provider(message)
+    if named:
+        return named
     # No provider named → the user's connected default, else most-recently connected.
     return await provider_defaults.resolve(message, user_id, "calendar", "google_calendar")
 
@@ -619,14 +676,19 @@ def _fmt_event_when(e) -> str:
     return f"{day}, {st}"
 
 
+def _act_hint() -> str:
+    return ("\n_Reply e.g. **“cancel 2”** or **“reschedule 2 to 3pm”** to act on a "
+            "numbered event (I'll confirm before changing anything)._")
+
+
 def _render_events(provider, events, label) -> str:
     if not events:
         return f"**{provider}** — no events for {label} (read-only)."
     lines = [f"**{provider} — {len(events)} event(s) for {label}** (read-only)"]
     for i, e in enumerate(events, 1):
         loc = f" · {_trunc(e.get('location'), 40)}" if e.get("location") else ""
-        lines.append(f"{i}. **{_trunc(e.get('title'))}** · {_fmt_event_when(e)}{loc}")
-    return "\n".join(lines)
+        lines.append(f"**{i}.** {_trunc(e.get('title'))} · {_fmt_event_when(e)}{loc}")
+    return "\n".join(lines) + _act_hint()
 
 
 def _short(provider) -> str:
@@ -644,8 +706,8 @@ def _render_events_multi(providers, events, label, skipped) -> str:
         for i, e in enumerate(events, 1):
             tag = f"[{_short(e.get('provider'))}] " if e.get("provider") else ""
             loc = f" · {_trunc(e.get('location'), 40)}" if e.get("location") else ""
-            lines.append(f"{i}. {tag}**{_trunc(e.get('title'))}** · {_fmt_event_when(e)}{loc}")
-        base = "\n".join(lines)
+            lines.append(f"**{i}.** {tag}{_trunc(e.get('title'))} · {_fmt_event_when(e)}{loc}")
+        base = "\n".join(lines) + _act_hint()
     if skipped:
         base += "\n\n_Skipped: " + "; ".join(
             f"{_short(s['provider'])} ({s['reason']})" for s in skipped) + "._"
@@ -719,17 +781,56 @@ def _write_blocked_msg(provider, action, decision) -> str:
 async def handle_calendar_turn(
     *, message: str, command: Optional[tuple[str, dict]], confirmation: Optional[str],
     session_uuid: uuid.UUID, user_id: uuid.UUID, workspace_uuid: Optional[uuid.UUID],
-    scope_type: str, is_admin: bool,
+    scope_type: str, is_admin: bool, selection: Optional[int] = None,
+    list_action: Optional[tuple[str, int]] = None,
 ) -> tuple[bool, Optional[str]]:
-    """Single entry point. A fresh `command` always wins; a bare `confirmation`
-    resolves a staged pending action. Returns (False, None) to fall through when the
-    message isn't actually ours (e.g. a 'yes' with nothing pending)."""
+    """Single entry point. A "cancel 4"/"reschedule 2" against the last numbered list
+    wins when such a list is pending; otherwise a fresh `command` wins, then a bare
+    `selection` and a `confirmation`. Returns (False, None) to fall through."""
+    # A numbered pick ("cancel 4", "reschedule 2 to 3pm") against the last list takes
+    # precedence over re-parsing it as a brand-new command — but ONLY when a numbered
+    # list is actually pending (otherwise "reschedule 2 to 3pm" is a normal update).
+    if list_action is not None:
+        _pend = await _get_pending(session_uuid)
+        if _pend is not None and _pend["kind"] == "select_target":
+            act, idx = list_action
+            ofields = (await extract_event_fields(message, "update")) if act == "update" else None
+            return await _handle_selection(idx, _pend, message, override_action=act,
+                                           override_fields=ofields, session_uuid=session_uuid,
+                                           user_id=user_id, workspace_uuid=workspace_uuid)
+
     if command is None:
-        if confirmation is None:
+        if confirmation is None and selection is None and list_action is None:
             return False, None
         pending = await _get_pending(session_uuid)
         if pending is None:
             return False, None
+        # The last numbered list (a read, or a "which of these?" candidate set) is
+        # resolved by "cancel 4" (verb+number) or a bare "4", which stages the real
+        # write for confirmation. A "cancel" abandons it.
+        if pending["kind"] == "select_target":
+            if selection is not None:
+                return await _handle_selection(selection, pending, message, session_uuid=session_uuid,
+                                               user_id=user_id, workspace_uuid=workspace_uuid)
+            if confirmation == "cancel":
+                await _clear_pending(session_uuid)
+                return True, "✓ Okay — nothing changed."
+            return True, "Reply with the number of the event (e.g. **cancel 4**), or name it."
+        if confirmation is None:
+            return False, None
+        # Honor a calendar redirect supplied alongside the confirmation, e.g.
+        # "confirm but on google". Only for CREATE: an update/delete acts on an event
+        # that already lives on a specific calendar, so a provider word there is ignored
+        # (we must never retarget an existing event onto the wrong calendar). The slot
+        # was found free across ALL calendars, so re-pointing a create to the named
+        # provider's primary is safe.
+        override = _named_provider(message)
+        if confirmation == "confirm" and override and pending["kind"] == "create" \
+                and override != pending["provider"]:
+            pending["provider"] = override
+            pending["target_calendar_id"] = "primary"
+            await _trace(session_uuid, user_id, workspace_uuid, trace_type=TRACE_REQUESTED,
+                         result={"kind": "create", "provider": override, "redirect": True})
         return await _handle_confirmation(confirmation, pending, session_uuid=session_uuid,
                                           user_id=user_id, workspace_uuid=workspace_uuid)
 
@@ -740,6 +841,17 @@ async def handle_calendar_turn(
                      result={"providers": providers, "kind": kind})
         return await _handle_read(providers, message, session_uuid=session_uuid,
                                   user_id=user_id, workspace_uuid=workspace_uuid)
+    # update/delete with NO named provider + more than one connected calendar → resolve
+    # the target across ALL of them (so "cancel that meeting" finds it on whichever
+    # calendar holds it). create stays single (a new event lands on one calendar).
+    if kind in ("update", "delete") and _named_provider(message) is None:
+        providers = await _resolve_read_providers("", user_id)
+        if len(providers) > 1:
+            await _trace(session_uuid, user_id, workspace_uuid, trace_type=TRACE_REQUESTED,
+                         result={"providers": providers, "kind": kind})
+            return await _prepare_write_multi(kind, providers, message, payload,
+                                              session_uuid=session_uuid, user_id=user_id,
+                                              workspace_uuid=workspace_uuid)
     provider = await _resolve_provider(message, user_id)
     await _trace(session_uuid, user_id, workspace_uuid, trace_type=TRACE_REQUESTED,
                  result={"provider": provider, "kind": kind})
@@ -812,6 +924,7 @@ async def _handle_read(providers, message, *, session_uuid, user_id, workspace_u
     merged = _dedupe_series(merged)[:12]
     await _trace(session_uuid, user_id, workspace_uuid, trace_type=TRACE_LIST,
                  result={"providers": oks, "count": len(merged), "window": label})
+    await _stash_list_context(session_uuid, user_id=user_id, workspace_id=workspace_uuid, events=merged)
     return True, _render_events_multi(oks, merged, label, skipped)
 
 
@@ -852,7 +965,40 @@ async def _handle_read_single(provider, message, *, session_uuid, user_id, works
                  event_ref=(events[0].get("id") if events else None))
     await _trace(session_uuid, user_id, workspace_uuid, trace_type=TRACE_LIST,
                  result={"provider": provider, "count": len(events), "window": label})
+    for e in events:
+        e.setdefault("provider", provider)
+    await _stash_list_context(session_uuid, user_id=user_id, workspace_id=workspace_uuid, events=events)
     return True, _render_events(provider, events, label)
+
+
+async def gather_events_window(*, user_id, workspace_uuid, session_uuid, time_min, time_max):
+    """Read ALL connected calendars for an explicit [time_min, time_max] (RFC3339 UTC)
+    window, gated + brokered + audited per provider exactly like a chat calendar read
+    (each provider fails closed independently), merged + de-duped. Shared by the Daily
+    Briefing (today) and smart scheduling (free/busy). Returns
+    {"events", "providers_ok", "skipped"}."""
+    providers = await _resolve_read_providers("", user_id)
+    merged, oks, skipped = [], [], []
+    for p in providers:
+        evs, info = await _read_one_calendar(p, time_min, time_max, session_uuid=session_uuid,
+                                             user_id=user_id, workspace_uuid=workspace_uuid)
+        if evs is not None:
+            merged.extend(evs)
+            oks.append(p)
+        else:
+            skipped.append(info)
+    merged.sort(key=lambda e: e.get("start") or "")
+    return {"events": _dedupe_series(merged), "providers_ok": oks, "skipped": skipped}
+
+
+async def gather_day_events(*, user_id, workspace_uuid, session_uuid):
+    """Composite-friendly read for the Daily Briefing: today's events merged across
+    ALL connected calendars. Returns gather_events_window(...) + a 'today' label."""
+    time_min, time_max, label = resolve_read_window("today")
+    res = await gather_events_window(user_id=user_id, workspace_uuid=workspace_uuid,
+                                     session_uuid=session_uuid, time_min=time_min, time_max=time_max)
+    res["label"] = label
+    return res
 
 
 # Filler stripped from a target query so "cancel my X meeting" doesn't fail to
@@ -923,6 +1069,105 @@ def _target_help_msg(provider, kind, status, candidates, query) -> str:
             f"Name the event to {verb} — nothing was changed.")
 
 
+def _slim_candidate(e: dict) -> dict:
+    """Just the fields the confirm card needs — kept small enough to stash in the
+    pending row's JSONB and re-render later. Carries `provider` so a cross-calendar
+    pick deletes/updates on the event's own calendar."""
+    return {"id": e.get("id"), "title": e.get("title"), "calendar_id": e.get("calendar_id"),
+            "start": e.get("start"), "end": e.get("end"), "all_day": e.get("all_day"),
+            "provider": e.get("provider")}
+
+
+def _numbered_target_msg(provider, kind, candidates, query, status) -> str:
+    verb = {"update": "reschedule", "delete": "cancel"}.get(kind, kind)
+    if status == "no_match" and query:
+        head = (f"I couldn't find an upcoming event matching “{query}”. Did you mean "
+                "one of these")
+    else:
+        head = f"More than one upcoming event could match — I won't {verb} the wrong one. Did you mean"
+    lines = [head + ":", ""]
+    for i, e in enumerate(candidates, 1):
+        tag = f"[{_short(e.get('provider'))}] " if e.get("provider") else ""
+        lines.append(f"**{i}.** {tag}{_trunc(e.get('title'))} · {_fmt_event_when(e)}{_cal_hint(e)}")
+    lines.append(f"\n_Reply with a number (1–{len(candidates)}) to pick, or name the event. "
+                 "Nothing was changed._")
+    return "\n".join(lines)
+
+
+async def _stage_selection(session, *, user_id, workspace_id, provider, action, candidates,
+                           update_fields=None) -> None:
+    """Stash a numbered candidate set so a follow-up "2" resolves to a specific event."""
+    fields = {"action": action, "candidates": [_slim_candidate(c) for c in candidates]}
+    if update_fields is not None:
+        fields["update_fields"] = update_fields
+    await _set_pending(session, user_id=user_id, workspace_id=workspace_id,
+                       kind="select_target", provider=provider, fields=fields)
+
+
+async def _stash_list_context(session, *, user_id, workspace_id, events) -> None:
+    """After a read, remember the numbered events so a follow-up "cancel 4" /
+    "reschedule 2 to 3pm" acts on item #4/#2. Stores no action yet (the follow-up
+    verb decides). Never clobbers a write that's already awaiting confirmation."""
+    if not events:
+        return
+    existing = await _get_pending(session)
+    if existing and existing["kind"] in ("create", "update", "delete"):
+        return
+    await _set_pending(session, user_id=user_id, workspace_id=workspace_id,
+                       kind="select_target", provider=events[0].get("provider") or "multi",
+                       fields={"action": None, "candidates": [_slim_candidate(e) for e in events]})
+
+
+async def _handle_selection(selection, pending, message, *, override_action=None,
+                            override_fields=None, session_uuid, user_id, workspace_uuid):
+    """Resolve a numbered pick against a stashed list, then stage the real write
+    (delete/update) for confirmation — never writes directly. `override_action` comes
+    from a verb+number ("cancel 4"); otherwise the list's own action is used (a read
+    list has none → ask which)."""
+    data = pending.get("fields") or {}
+    candidates = data.get("candidates") or []
+    if selection < 1 or selection > len(candidates):
+        return True, (f"That's not one of the {len(candidates)} options — reply with a "
+                      f"number 1–{len(candidates)}, or name the event.")
+    chosen = candidates[selection - 1]
+    # The pick may live on a different calendar than the row's default (cross-provider
+    # lists) — act on the event's OWN provider.
+    provider = chosen.get("provider") or pending["provider"]
+    action = override_action or data.get("action")
+    if action is None:
+        # A numbered read list with no action yet — ask which (never guess a write).
+        return True, (f"Did you want to **cancel** or **reschedule** “{_trunc(chosen.get('title'))}” "
+                      f"(#{selection})? Say e.g. **cancel {selection}** or "
+                      f"**reschedule {selection} to <time>**.")
+    decision = await _write_gate(provider, user_id, action)
+    if not decision["allowed"]:
+        await _audit(user_id, workspace_uuid, provider, action, False, decision["reason"])
+        await _trace(session_uuid, user_id, workspace_uuid, trace_type=TRACE_WRITE_DENIED,
+                     status="blocked", result={"provider": provider, "kind": action,
+                                               "reason": decision["reason"], "from_selection": True})
+        return True, _write_blocked_msg(provider, action, decision)
+    if action == "update":
+        fields = override_fields or data.get("update_fields") or {}
+        await _set_pending(session_uuid, user_id=user_id, workspace_id=workspace_uuid,
+                           kind="update", provider=provider, fields=fields,
+                           target_event_id=chosen.get("id"),
+                           target_calendar_id=chosen.get("calendar_id"),
+                           target_summary=chosen.get("title"))
+        await _trace(session_uuid, user_id, workspace_uuid, trace_type=TRACE_CONFIRM_PENDING,
+                     result={"provider": provider, "kind": "update", "from_selection": True,
+                             "target": chosen.get("id")})
+        return True, _confirm_card_update(provider, chosen, fields)
+    await _set_pending(session_uuid, user_id=user_id, workspace_id=workspace_uuid,
+                       kind="delete", provider=provider, fields={},
+                       target_event_id=chosen.get("id"),
+                       target_calendar_id=chosen.get("calendar_id"),
+                       target_summary=chosen.get("title"))
+    await _trace(session_uuid, user_id, workspace_uuid, trace_type=TRACE_CONFIRM_PENDING,
+                 result={"provider": provider, "kind": "delete", "from_selection": True,
+                         "target": chosen.get("id")})
+    return True, _confirm_card_delete(provider, chosen)
+
+
 # --------------------------------------------------------------------------- #
 # Target-calendar resolution (CREATE) — choose which calendar a new event lands
 # on from a natural-language name; default primary; refuse-on-ambiguous.
@@ -975,6 +1220,84 @@ def _calendar_help_msg(provider, status, candidates, hint) -> str:
             else f"More than one {provider} calendar matches “{hint}” — I won't guess which.")
     return (f"{head} Your calendars:\n{names}\n\n"
             "Tell me which one (use its exact name) — nothing was created.")
+
+
+async def _resolve_target_across(providers, query, *, session_uuid, user_id, workspace_uuid):
+    """Find an update/delete target across MULTIPLE calendars: read each (gated +
+    brokered, events tagged with their provider), match the query, and decide. So
+    "cancel that meeting" finds the event on whichever calendar holds it. status ∈
+    none | no_match (+candidates) | ambiguous (+candidates) | ok (+event w/ provider)."""
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    tmin, tmax = now.isoformat(), (now + timedelta(days=30)).isoformat()
+    all_events = []
+    for p in providers:
+        evs, _info = await _read_one_calendar(p, tmin, tmax, session_uuid=session_uuid,
+                                              user_id=user_id, workspace_uuid=workspace_uuid)
+        if evs:
+            all_events.extend(_dedupe_series(evs))
+    if not all_events:
+        return {"status": "none"}
+    all_events.sort(key=lambda e: e.get("start") or "")
+    if _query_tokens(query):
+        matches = _match_events(query, all_events)
+        if not matches:
+            return {"status": "no_match", "candidates": all_events[:8]}
+        if len(matches) > 1:
+            return {"status": "ambiguous", "candidates": matches[:8]}
+        return {"status": "ok", "event": matches[0]}
+    if len(all_events) == 1:
+        return {"status": "ok", "event": all_events[0]}
+    return {"status": "ambiguous", "candidates": all_events[:8]}
+
+
+async def _stage_one_write(kind, provider, message, target, *, session_uuid, user_id, workspace_uuid):
+    """Write-gate a resolved update/delete target on its own provider, then stage the
+    confirm-before-write action. Shared by the cross-provider path and selection."""
+    decision = await _write_gate(provider, user_id, kind)
+    if not decision["allowed"]:
+        await _audit(user_id, workspace_uuid, provider, kind, False, decision["reason"])
+        await _trace(session_uuid, user_id, workspace_uuid, trace_type=TRACE_WRITE_DENIED,
+                     status="blocked", result={"provider": provider, "kind": kind,
+                                               "reason": decision["reason"]})
+        return True, _write_blocked_msg(provider, kind, decision)
+    if kind == "update":
+        fields = await extract_event_fields(message, "update")
+        await _set_pending(session_uuid, user_id=user_id, workspace_id=workspace_uuid, kind="update",
+                           provider=provider, fields=fields, target_event_id=target.get("id"),
+                           target_calendar_id=target.get("calendar_id"), target_summary=target.get("title"))
+        await _trace(session_uuid, user_id, workspace_uuid, trace_type=TRACE_CONFIRM_PENDING,
+                     result={"provider": provider, "kind": "update", "target": target.get("id")})
+        return True, _confirm_card_update(provider, target, fields)
+    await _set_pending(session_uuid, user_id=user_id, workspace_id=workspace_uuid, kind="delete",
+                       provider=provider, fields={}, target_event_id=target.get("id"),
+                       target_calendar_id=target.get("calendar_id"), target_summary=target.get("title"))
+    await _trace(session_uuid, user_id, workspace_uuid, trace_type=TRACE_CONFIRM_PENDING,
+                 result={"provider": provider, "kind": "delete", "target": target.get("id")})
+    return True, _confirm_card_delete(provider, target)
+
+
+async def _prepare_write_multi(kind, providers, message, payload, *, session_uuid, user_id, workspace_uuid):
+    """Update/delete with no named provider + multiple connected calendars: resolve the
+    target across all of them. One match → stage it on its own calendar; several (or a
+    no-match with suggestions) → a NUMBERED, provider-tagged list to pick from."""
+    query = (payload or {}).get("query")
+    res = await _resolve_target_across(providers, query, session_uuid=session_uuid,
+                                       user_id=user_id, workspace_uuid=workspace_uuid)
+    if res["status"] == "ok":
+        target = res["event"]
+        return await _stage_one_write(kind, target.get("provider") or providers[0], message, target,
+                                      session_uuid=session_uuid, user_id=user_id, workspace_uuid=workspace_uuid)
+    candidates = res.get("candidates", [])
+    await _audit(user_id, workspace_uuid, "multi", kind, False, f"target {res['status']}")
+    await _trace(session_uuid, user_id, workspace_uuid, trace_type=TRACE_WRITE_DENIED,
+                 status="blocked", result={"providers": providers, "kind": kind,
+                                           "reason": f"target_{res['status']}", "candidates": len(candidates)})
+    if candidates and res["status"] in ("ambiguous", "no_match"):
+        upd = await extract_event_fields(message, "update") if kind == "update" else None
+        await _stage_selection(session_uuid, user_id=user_id, workspace_id=workspace_uuid,
+                               provider=providers[0], action=kind, candidates=candidates, update_fields=upd)
+        return True, _numbered_target_msg(None, kind, candidates, query, res["status"])
+    return True, _target_help_msg("your calendars", kind, res["status"], candidates, query)
 
 
 async def _prepare_write(kind, provider, message, payload, *, session_uuid, user_id, workspace_uuid):
@@ -1051,13 +1374,22 @@ async def _prepare_write(kind, provider, message, payload, *, session_uuid, user
                      status="error", result={"provider": provider, "kind": kind, "error": str(exc)})
         return True, f"⚠️ The {provider} calendar lookup failed ({exc}). Nothing was changed."
     if res["status"] != "ok":
-        # No confident single target — do NOT guess a write target. Ask instead.
+        # No confident single target — do NOT guess a write target. When there are
+        # candidates, present them NUMBERED and stash them so the user can reply "2";
+        # otherwise just explain. Either way, nothing is written yet.
+        candidates = res.get("candidates", [])
         await _audit(user_id, workspace_uuid, provider, kind, False, f"target {res['status']}")
         await _trace(session_uuid, user_id, workspace_uuid, trace_type=TRACE_WRITE_DENIED,
                      status="blocked", result={"provider": provider, "kind": kind,
-                                               "reason": f"target_{res['status']}"})
-        return True, _target_help_msg(provider, kind, res["status"],
-                                      res.get("candidates", []), query)
+                                               "reason": f"target_{res['status']}",
+                                               "candidates": len(candidates)})
+        if candidates and res["status"] in ("ambiguous", "no_match"):
+            upd = await extract_event_fields(message, "update") if kind == "update" else None
+            await _stage_selection(session_uuid, user_id=user_id, workspace_id=workspace_uuid,
+                                   provider=provider, action=kind, candidates=candidates,
+                                   update_fields=upd)
+            return True, _numbered_target_msg(provider, kind, candidates, query, res["status"])
+        return True, _target_help_msg(provider, kind, res["status"], candidates, query)
     target = res["event"]
 
     if kind == "update":
@@ -1077,6 +1409,29 @@ async def _prepare_write(kind, provider, message, payload, *, session_uuid, user
     await _trace(session_uuid, user_id, workspace_uuid, trace_type=TRACE_CONFIRM_PENDING,
                  result={"provider": provider, "kind": "delete", "target": target["id"]})
     return True, _confirm_card_delete(provider, target)
+
+
+async def stage_create(provider, fields, *, session_uuid, user_id, workspace_uuid,
+                       calendar_id="primary", calendar_name=None):
+    """Stage a confirm-before-write CREATE from EXPLICIT fields (no NL re-extraction),
+    reusing the exact same write gate + pending store + confirm card as a chat 'create'.
+    Smart scheduling uses this to book a found free slot; a later 'confirm' fires the
+    real write through `_handle_confirmation`, unchanged. Returns (handled, text). FAILS
+    CLOSED: if the write gate is shut, nothing is staged and the governed write-blocked
+    message is returned."""
+    decision = await _write_gate(provider, user_id, "create")
+    if not decision["allowed"]:
+        await _audit(user_id, workspace_uuid, provider, "create", False, decision["reason"])
+        await _trace(session_uuid, user_id, workspace_uuid, trace_type=TRACE_WRITE_DENIED,
+                     status="blocked", result={"provider": provider, "kind": "create",
+                                               "reason": decision["reason"], "source": "scheduling"})
+        return True, _write_blocked_msg(provider, "create", decision)
+    await _set_pending(session_uuid, user_id=user_id, workspace_id=workspace_uuid,
+                       kind="create", provider=provider, fields=fields, target_calendar_id=calendar_id)
+    await _trace(session_uuid, user_id, workspace_uuid, trace_type=TRACE_CONFIRM_PENDING,
+                 result={"provider": provider, "kind": "create", "source": "scheduling",
+                         "has_start": bool(fields.get("start_time")), "calendar_id": calendar_id})
+    return True, _confirm_card_create(provider, fields, calendar_name if calendar_id != "primary" else None)
 
 
 async def _handle_confirmation(confirmation, pending, *, session_uuid, user_id, workspace_uuid):
