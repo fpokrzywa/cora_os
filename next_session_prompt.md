@@ -4,8 +4,8 @@ Continuing the **Cora AI OS** build. Last session shipped a **model-driven agent
 **Cora Configuration** UI. This doc is the entry point; deeper detail lives in code docstrings, the
 commits below, and the auto-memory `agent_runtime_build` (do not re-summarize or rebuild shipped work).
 
-> ⚠️ Doc gap: `HANDOFF_SESSION.md` / `AIOS_CORE_ARCHITECTURE.md` do **not** yet cover the agent runtime.
-> If you touch those areas, fold the agent runtime into them (don't just append).
+> `HANDOFF_SESSION.md` (What's Completed, §10, §14) and `AIOS_CORE_ARCHITECTURE.md` §9 now cover the
+> agent runtime (updated 2026-06-27). Keep them current as it evolves — update, don't just append.
 
 ## Git / deploy state (verify first)
 - **Everything is on `main`** — `main` == `feat/agentic-runtime` == `origin` @ **`889ec0e`**. Working tree clean.
