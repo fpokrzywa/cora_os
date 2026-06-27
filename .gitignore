@@ -17,6 +17,9 @@ env/
 build/
 dist/
 
+# ---- Claude Code local state (per-machine; not shared) ----
+.claude/settings.local.json
+
 # ---- Node / frontend (cora-ui) ----
 node_modules/
 apps/cora-ui/dist/
