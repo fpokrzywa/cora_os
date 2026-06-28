@@ -2679,6 +2679,17 @@ textarea.cora-input {
 .agent-cfg__composer .composer__input {
   flex: 1;
 }
+.agent-cfg__run-btns {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  white-space: nowrap;
+}
+.agent-cfg__live {
+  font-size: 11px;
+  color: #fbbf24;
+  font-style: italic;
+}
 .agent-cfg__result {
   margin-top: 16px;
   border: 1px solid var(--border);

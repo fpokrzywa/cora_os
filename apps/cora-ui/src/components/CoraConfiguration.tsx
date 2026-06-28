@@ -6,6 +6,7 @@ import {
   getAgentRun,
   listAgentRuns,
   sendAgentChat,
+  sendAgentChatAsync,
 } from "../api";
 import type {
   AgentDelegationNode,
@@ -66,6 +67,12 @@ function runOk(status: string | null | undefined): boolean {
   return status !== "failed" && status !== "error" && status !== "cancelled";
 }
 
+// Terminal run states — polling stops here (pending/running/waiting_* keep going).
+const TERMINAL_STATUSES = new Set(["done", "failed", "cancelled"]);
+function isTerminal(status: string | null | undefined): boolean {
+  return TERMINAL_STATUSES.has(status ?? "");
+}
+
 // Independent evaluator verdict (Phase 6) — advisory, review-only.
 function EvaluationCard({ evaluation }: { evaluation: AgentEvaluation }) {
   return (
@@ -107,6 +114,7 @@ function AgentPanel({ config }: { config: AgentRuntimeConfig | null }) {
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
   const [result, setResult] = useState<AgentRunResponse | null>(null);
+  const [asyncRunId, setAsyncRunId] = useState<string | null>(null);
   const [runErr, setRunErr] = useState<string | null>(null);
 
   const run = async () => {
@@ -115,8 +123,29 @@ function AgentPanel({ config }: { config: AgentRuntimeConfig | null }) {
     setSending(true);
     setRunErr(null);
     setResult(null);
+    setAsyncRunId(null);
     try {
       setResult(await sendAgentChat(msg));
+    } catch (e) {
+      setRunErr(e instanceof Error ? e.message : "Request failed");
+    } finally {
+      setSending(false);
+    }
+  };
+
+  // Background run: enqueue on the worker, return immediately, then poll the
+  // run id for live progress. Best for long / delegating runs that would block
+  // the synchronous request.
+  const runAsync = async () => {
+    const msg = input.trim();
+    if (!msg || sending) return;
+    setSending(true);
+    setRunErr(null);
+    setResult(null);
+    setAsyncRunId(null);
+    try {
+      const { run_id } = await sendAgentChatAsync(msg);
+      setAsyncRunId(run_id);
     } catch (e) {
       setRunErr(e instanceof Error ? e.message : "Request failed");
     } finally {
@@ -165,15 +194,35 @@ function AgentPanel({ config }: { config: AgentRuntimeConfig | null }) {
             rows={2}
             disabled={sending}
           />
-          <button
-            className="btn btn--primary"
-            onClick={run}
-            disabled={sending || !input.trim()}
-          >
-            {sending ? "Running…" : "Run"}
-          </button>
+          <div className="agent-cfg__run-btns">
+            <button
+              className="btn btn--primary"
+              onClick={run}
+              disabled={sending || !input.trim()}
+            >
+              {sending ? "Running…" : "Run"}
+            </button>
+            <button
+              className="btn btn--ghost"
+              onClick={runAsync}
+              disabled={sending || !input.trim()}
+              title="Enqueue on the worker and poll for progress — best for long runs"
+            >
+              Run in background
+            </button>
+          </div>
         </div>
         {runErr && <div className="chat__error">{runErr}</div>}
+
+        {asyncRunId && (
+          <>
+            <p className="agent-cfg__note">
+              Background run <code>{asyncRunId.slice(0, 8)}</code> — polling for
+              progress; it also appears in the <strong>Runs</strong> tab.
+            </p>
+            <RunDetail runId={asyncRunId} poll />
+          </>
+        )}
 
         {result && (
           <div className="agent-cfg__result">
@@ -246,20 +295,41 @@ function DelegationNode({ deleg }: { deleg: AgentDelegationNode }) {
   );
 }
 
-function RunDetail({ runId }: { runId: string }) {
+function RunDetail({ runId, poll = false }: { runId: string; poll?: boolean }) {
   const [detail, setDetail] = useState<AgentRunDetail | null>(null);
   const [err, setErr] = useState<string | null>(null);
 
   useEffect(() => {
+    let active = true;
+    let timer: ReturnType<typeof setTimeout> | undefined;
     setDetail(null);
     setErr(null);
-    getAgentRun(runId)
-      .then(setDetail)
-      .catch((e) => setErr(e instanceof Error ? e.message : "Failed to load run"));
-  }, [runId]);
+    const tick = () => {
+      getAgentRun(runId)
+        .then((d) => {
+          if (!active) return;
+          setDetail(d);
+          // Keep polling while the run is still in flight (async mode only).
+          if (poll && !isTerminal(d.status)) {
+            timer = setTimeout(tick, 2000);
+          }
+        })
+        .catch((e) => {
+          if (!active) return;
+          setErr(e instanceof Error ? e.message : "Failed to load run");
+        });
+    };
+    tick();
+    return () => {
+      active = false;
+      if (timer) clearTimeout(timer);
+    };
+  }, [runId, poll]);
 
   if (err) return <div className="chat__error">{err}</div>;
   if (!detail) return <div className="agent-cfg__note">Loading run…</div>;
+
+  const live = poll && !isTerminal(detail.status);
 
   return (
     <div className="agent-cfg__result">
@@ -269,6 +339,7 @@ function RunDetail({ runId }: { runId: string }) {
           {detail.status}
           {detail.stopped ? ` · ${detail.stopped}` : ""}
         </span>
+        {live && <span className="agent-cfg__live">updating…</span>}
         <span>
           {detail.tool_calls} tool call{detail.tool_calls === 1 ? "" : "s"} ·{" "}
           {detail.step_count}/{detail.max_steps} steps

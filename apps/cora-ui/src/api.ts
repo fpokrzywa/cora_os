@@ -13,6 +13,7 @@ import type {
   ResponseTestRequest,
   ResponseTestResult,
   AgentRunResponse,
+  AgentAsyncResponse,
   AgentRunSummary,
   AgentRunDetail,
   AgentRuntimeConfig,
@@ -252,6 +253,13 @@ export function getAgentConfig() {
 
 export function sendAgentChat(message: string, sessionId?: string | null) {
   return request<AgentRunResponse>("/chat/agent", {
+    method: "POST",
+    body: JSON.stringify({ message, session_id: sessionId ?? undefined }),
+  });
+}
+
+export function sendAgentChatAsync(message: string, sessionId?: string | null) {
+  return request<AgentAsyncResponse>("/chat/agent/async", {
     method: "POST",
     body: JSON.stringify({ message, session_id: sessionId ?? undefined }),
   });

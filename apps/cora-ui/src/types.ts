@@ -38,6 +38,11 @@ export interface AgentEvaluation {
   model?: string;
 }
 
+export interface AgentAsyncResponse {
+  run_id: string;
+  status: string;
+}
+
 export interface AgentRunStep {
   kind: "tool_call" | "tool_result" | "final" | "error";
   name?: string;
