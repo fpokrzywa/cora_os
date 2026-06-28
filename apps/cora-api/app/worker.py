@@ -40,6 +40,15 @@ logger = logging.getLogger(__name__)
 POLL_INTERVAL_SECONDS = float(
     os.environ.get("WORKER_POLL_INTERVAL_SECONDS", "5")
 )
+# How many jobs may run concurrently. >1 stops a long agent_run from blocking
+# news refreshes / other runs (the Phase-3 single-job-at-a-time side effect).
+# Connections are acquired per-query and released immediately, so this stays
+# well under the worker's Postgres pool (max_size=10) even with parallel spokes.
+WORKER_MAX_CONCURRENCY = max(1, int(os.environ.get("WORKER_MAX_CONCURRENCY", "3")))
+# On shutdown, give in-flight jobs this long to finish before closing the pool.
+WORKER_SHUTDOWN_DRAIN_SECONDS = float(
+    os.environ.get("WORKER_SHUTDOWN_DRAIN_SECONDS", "30")
+)
 WORKER_ID = f"{socket.gethostname()}:{os.getpid()}"
 # The worker serves no HTTP, so container liveness is tracked via a file the
 # loop refreshes each iteration; app.healthcheck reads its mtime.
@@ -503,15 +512,17 @@ async def enqueue_due_news_feeds() -> int:
 # ---------- Main loop ----------
 
 
-async def process_one() -> bool:
+async def run_claimed(job: dict) -> None:
+    """Execute one already-claimed job to completion: dispatch the handler,
+    persist the result/failure, write traces, and heartbeat. NEVER raises — a
+    crashed task must not take down the pool loop."""
     try:
-        job = await claim_job()
+        await _run_claimed_inner(job)
     except Exception:
-        logger.exception("claim_job failed")
-        return False
-    if job is None:
-        return False
+        logger.exception("run_claimed crashed: job_id=%s", job.get("id"))
 
+
+async def _run_claimed_inner(job: dict) -> None:
     job_id = job["id"]
     logger.info(
         "worker claimed job: id=%s type=%s attempt=%s/%s",
@@ -550,7 +561,7 @@ async def process_one() -> bool:
             tool_result={"job_id": str(job_id)},
         )
         await heartbeat(job_id=job_id)
-        return True
+        return
 
     started = datetime.now(timezone.utc)
     try:
@@ -580,7 +591,7 @@ async def process_one() -> bool:
             },
         )
         await heartbeat(job_id=job_id)
-        return True
+        return
     except PermanentError as exc:
         logger.warning(
             "worker handler permanent error: job_id=%s err=%s", job_id, exc
@@ -597,7 +608,7 @@ async def process_one() -> bool:
             tool_result={"job_id": str(job_id)},
         )
         await heartbeat(job_id=job_id)
-        return True
+        return
     except Exception as exc:
         should_retry = job["attempts"] < job["max_attempts"]
         logger.exception("worker handler crashed: job_id=%s", job_id)
@@ -617,7 +628,7 @@ async def process_one() -> bool:
             },
         )
         await heartbeat(job_id=job_id)
-        return True
+        return
 
     duration_ms = int(
         (datetime.now(timezone.utc) - started).total_seconds() * 1000
@@ -638,15 +649,59 @@ async def process_one() -> bool:
         "worker completed job: id=%s duration_ms=%s", job_id, duration_ms
     )
     await heartbeat(job_id=job_id)
-    return True
+
+
+def _reap(inflight: set) -> None:
+    """Drop finished tasks from the in-flight set (run_claimed already swallowed
+    any error; surface a stray one defensively)."""
+    for task in [t for t in inflight if t.done()]:
+        inflight.discard(task)
+        if not task.cancelled():
+            exc = task.exception()
+            if exc is not None:
+                logger.error("worker task ended with exception", exc_info=exc)
+
+
+async def _fill_slots(inflight: set, *, max_concurrency: int, claim, run) -> int:
+    """Claim and spawn jobs until the pool is full or no work remains. Returns
+    how many were started this pass. claim/run are injected for testability."""
+    started = 0
+    while not SHUTDOWN.is_set() and len(inflight) < max_concurrency:
+        try:
+            job = await claim()
+        except Exception:
+            logger.exception("claim_job failed")
+            break
+        if job is None:
+            break
+        inflight.add(asyncio.ensure_future(run(job)))
+        started += 1
+    return started
+
+
+async def _idle_wait(inflight: set) -> None:
+    """Block until a running job finishes, shutdown is signalled, or the poll
+    interval elapses — whichever comes first. Waiting on the in-flight tasks
+    (without consuming them) lets a freed slot be refilled immediately rather
+    than only on the next poll tick."""
+    shutdown_wait = asyncio.ensure_future(SHUTDOWN.wait())
+    try:
+        await asyncio.wait(
+            set(inflight) | {shutdown_wait},
+            timeout=POLL_INTERVAL_SECONDS,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+    finally:
+        shutdown_wait.cancel()
 
 
 async def main() -> None:
     configure_logging()
     logger.info(
-        "cora-worker starting: worker_id=%s poll_interval=%ss",
+        "cora-worker starting: worker_id=%s poll_interval=%ss max_concurrency=%s",
         WORKER_ID,
         POLL_INTERVAL_SECONDS,
+        WORKER_MAX_CONCURRENCY,
     )
     touch_heartbeat_file()
     await init_clients()
@@ -662,14 +717,23 @@ async def main() -> None:
             # e.g. on Windows; fall back to plain signal handlers
             signal.signal(sig, lambda *_: SHUTDOWN.set())
 
+    # Bounded concurrent pool: claim up to WORKER_MAX_CONCURRENCY jobs and run
+    # them as tasks, so a long agent_run no longer blocks news refreshes / other
+    # runs, and the scheduler tick + heartbeat keep ticking alongside it.
+    inflight: set = set()
     last_schedule = 0.0
     try:
         while not SHUTDOWN.is_set():
+            _reap(inflight)
             try:
-                processed = await process_one()
+                await _fill_slots(
+                    inflight,
+                    max_concurrency=WORKER_MAX_CONCURRENCY,
+                    claim=claim_job,
+                    run=run_claimed,
+                )
             except Exception:
-                logger.exception("worker loop error")
-                processed = False
+                logger.exception("worker fill-slots error")
             try:
                 await heartbeat()
             except Exception:
@@ -681,15 +745,19 @@ async def main() -> None:
                     await enqueue_due_news_feeds()
                 except Exception:
                     logger.exception("news feed scheduler tick failed")
-            if not processed:
-                try:
-                    await asyncio.wait_for(
-                        SHUTDOWN.wait(), timeout=POLL_INTERVAL_SECONDS
-                    )
-                except asyncio.TimeoutError:
-                    pass
+            await _idle_wait(inflight)
     finally:
-        logger.info("cora-worker shutting down: worker_id=%s", WORKER_ID)
+        _reap(inflight)
+        logger.info(
+            "cora-worker shutting down: worker_id=%s (draining %d in-flight)",
+            WORKER_ID,
+            len(inflight),
+        )
+        if inflight:
+            try:
+                await asyncio.wait(inflight, timeout=WORKER_SHUTDOWN_DRAIN_SECONDS)
+            except Exception:
+                logger.exception("in-flight drain failed")
         await close_clients()
 
 
