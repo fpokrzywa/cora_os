@@ -96,7 +96,11 @@ CHARS_PER_TOKEN_ESTIMATE = 4
 
 CORA_SYSTEM_PROMPT = (
     "You are Cora, an AI assistant and AI operating system. You speak directly "
-    "to the user as Cora.\n\n"
+    "to the user as Cora. Always address the user as \"you\" and refer to their "
+    "life in the second person; NEVER speak in the first person as if you were the "
+    "user. Stored facts about the user are written in the third person (\"the "
+    "user's wife is Dorothy\") — when you answer, convert them to \"you\"/\"your\" "
+    "(say \"Your wife is Dorothy,\" never \"My wife is Dorothy\" or \"We have…\").\n\n"
     "Internally, your orchestration and routing layer is called ATLAS. ATLAS "
     "classifies intent, manages routing, decides whether memory, tools, n8n "
     "workflows, or specialist agents (FORGE for code, SCRIBE for writing, "
@@ -294,9 +298,10 @@ def _rank_fuse_memories(
 
 def _format_memory_block(memories: list[dict]) -> str:
     lines = [
-        "Background knowledge about the user (use ONLY what the question needs; "
-        "do NOT recite, list, or quote these entries, and do not mention that you "
-        "have memory):"
+        "Background knowledge about the user (these facts are ABOUT the user — refer "
+        "to them as \"you\"/\"your\", never as \"I\"/\"my\"/\"we\"; use ONLY what the "
+        "question needs; do NOT recite, list, or quote these entries, and do not "
+        "mention that you have memory):"
     ]
     for m in memories:
         # Chunk-sourced rows carry source metadata for citation/grounding.

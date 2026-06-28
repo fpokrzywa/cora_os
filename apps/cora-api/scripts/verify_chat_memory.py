@@ -135,6 +135,10 @@ def main() -> int:
     expect("recite stored facts" in CORA_SYSTEM_PROMPT
            and "one-sentence" in CORA_SYSTEM_PROMPT,
            "system prompt directs concise, one-sentence factual answers")
+    expect("never as" in blk.lower() and "you" in blk.lower(),
+           "memory block pins second-person voice (you/your, not I/my/we)")
+    expect("address the user as" in CORA_SYSTEM_PROMPT,
+           "system prompt pins second-person address (never speak as the user)")
 
     print()
     if fails:
