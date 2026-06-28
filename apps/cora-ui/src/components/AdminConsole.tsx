@@ -147,8 +147,11 @@ const TABS: TabDef[] = [
     key: "cora-config",
     label: "Cora Configuration",
     icon: "✦",
-    blurb: "Agent runtime status, and a panel to use the model-driven agent.",
-    subs: [],
+    blurb: "Agent runtime status, a panel to use the agent, and a runs viewer.",
+    subs: [
+      { key: "agent", label: "Agent" },
+      { key: "runs", label: "Runs" },
+    ],
   },
 ];
 
@@ -255,7 +258,7 @@ export function AdminConsole({
       case "workspaces":
         return <Workspaces onWorkspacesChanged={onWorkspacesChanged} />;
       case "cora-config":
-        return <CoraConfiguration />;
+        return <CoraConfiguration sub={sub} />;
       case "overview":
       default:
         return (

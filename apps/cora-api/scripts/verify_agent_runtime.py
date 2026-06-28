@@ -18,6 +18,9 @@ Parts:
      builds the minimal-context payload; _delegate_tool_schema enumerates spokes.
   F) Hub-and-spoke guards — _handle_delegation blocks depth>=1 and unknown agents
      BEFORE running anything (so no model call).
+  G) Runs view — list_runs is owner-scoped; get_run_delegations rebuilds the
+     orchestrator→spoke tree from the _parent_run_id stamp and embeds the spoke
+     run's own step trace.
 
     docker cp apps/cora-api/scripts/verify_agent_runtime.py cora-api:/tmp/var.py
     docker exec -e PYTHONPATH=/app cora-api python /tmp/var.py   # 0=PASS 1=FAIL
@@ -55,6 +58,8 @@ async def main() -> int:
     expect(uid is not None, "a user exists to attribute test rows to")
     sess = uuid.uuid4()
     run_id = None
+    spoke_run_id = None
+    deleg_id = None
 
     try:
         # ---- A) Catalog scoping ----
@@ -159,6 +164,49 @@ async def main() -> int:
         expect(unknown.startswith("error") and "unknown agent" in unknown,
                "an unknown delegation target is refused")
 
+        # ---- G) Runs view (list + orchestrator→spoke tree) ----
+        print("G) runs view")
+        listed = await ar.list_runs(user_id=uid, limit=50)
+        expect(any(r["id"] == run_id for r in listed),
+               "list_runs returns the owner's run")
+        other_list = await ar.list_runs(user_id=uuid.uuid4(), limit=50)
+        expect(all(r["id"] != run_id for r in other_list),
+               "list_runs is owner-scoped (owned run hidden from another user)")
+
+        # A spoke run + a delegation stamped with this run's _parent_run_id.
+        spoke_run_id = await ar.create_pending_run(
+            goal="spoke subtask", user_id=uid, session_id=sess,
+            workspace_id=None, agent_name="PULSE", max_steps=6)
+        await ar._finalize_run(
+            spoke_run_id, status="done", answer="spoke answer", stopped="final",
+            tool_calls=1, step_count=1, messages=[],
+            steps=[ar.AgentStep("tool_call", {"name": "web_search", "arguments": {}})],
+            error=None)
+        deleg = await ar.create_delegation(
+            from_agent="ATLAS", to_agent="PULSE",
+            delegation_reason="verify tree", session_id=sess,
+            input_payload={"goal": "x", "_parent_run_id": str(run_id)},
+            user_id=uid, initial_status="running")
+        deleg_id = deleg["id"]
+        await ar.complete_delegation(
+            deleg_id,
+            output_payload={"answer": "spoke answer", "run_id": str(spoke_run_id),
+                            "stopped": "final"},
+            user_id=uid)
+
+        tree = await ar.get_run_delegations(run_id)
+        expect(len(tree) == 1 and tree[0]["to_agent"] == "PULSE",
+               "get_run_delegations finds the hop via the _parent_run_id stamp")
+        node = tree[0] if tree else {}
+        expect(bool(node.get("spoke_run"))
+               and node["spoke_run"]["id"] == spoke_run_id,
+               "the spoke's own run is embedded in the delegation node")
+        expect(bool(node.get("spoke_run"))
+               and len(node["spoke_run"]["steps"]) == 1,
+               "the embedded spoke run carries its step trace")
+        empty = await ar.get_run_delegations(uuid.uuid4())
+        expect(empty == [], "an unrelated run id yields no delegations")
+
         # ---- config sanity ----
         expect(isinstance(settings.agent_runtime_max_steps, int)
                and isinstance(settings.agent_delegation_max_parallel, int),
@@ -169,9 +217,16 @@ async def main() -> int:
         async with pool.acquire() as conn:
             await conn.execute(
                 "DELETE FROM communication_drafts WHERE subject=$1", DRAFT_MARKER)
-            if run_id is not None:
+            if deleg_id is not None:
                 await conn.execute(
-                    "DELETE FROM agent_runtime_runs WHERE id=$1", run_id)
+                    "DELETE FROM agent_delegations WHERE id=$1", deleg_id)
+                # delegation create/complete also wrote audit traces for this session
+                await conn.execute(
+                    "DELETE FROM runtime_traces WHERE session_id=$1", sess)
+            for rid in (run_id, spoke_run_id):
+                if rid is not None:
+                    await conn.execute(
+                        "DELETE FROM agent_runtime_runs WHERE id=$1", rid)
 
     print()
     if fails:

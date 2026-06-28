@@ -314,6 +314,74 @@ async def get_run(run_id: uuid.UUID, *, user_id) -> Optional[dict]:
     return dict(row) if row else None
 
 
+async def list_runs(*, user_id, limit: int = 50) -> list[dict]:
+    """Owner-scoped recent runs (summary columns only — no messages/steps blobs,
+    which keeps the list light). Legacy NULL-owner rows are included, matching
+    get_run's policy. Orchestrator runs have agent_name NULL; spoke runs carry
+    their specialist name."""
+    if clients.db_pool is None:
+        return []
+    async with clients.db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, session_id, agent_name, status, goal, model_name,
+                   tool_calls, step_count, max_steps, stopped,
+                   created_at, updated_at, completed_at
+            FROM agent_runtime_runs
+            WHERE user_id = $1 OR user_id IS NULL
+            ORDER BY created_at DESC
+            LIMIT $2
+            """,
+            _as_uuid(user_id), max(1, min(limit, 200)),
+        )
+    return [dict(r) for r in rows]
+
+
+async def _spoke_run_summary(run_id: uuid.UUID) -> Optional[dict]:
+    """Lightweight view of a spoke's own run (its step trace included) for the
+    orchestrator→spoke tree."""
+    if clients.db_pool is None:
+        return None
+    async with clients.db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT id, agent_name, status, stopped, answer,
+                   tool_calls, step_count, steps
+            FROM agent_runtime_runs WHERE id = $1
+            """,
+            run_id,
+        )
+    return dict(row) if row else None
+
+
+async def get_run_delegations(parent_run_id: uuid.UUID) -> list[dict]:
+    """The spoke hops this orchestrator run spawned, each with the spoke's own
+    run (incl. its step trace) embedded — the orchestrator→spoke tree. Correlated
+    via the _parent_run_id stamped into each delegation's input_payload, so it
+    works even for sessionless runs (e.g. the Cora Configuration panel). The
+    caller is responsible for having owner-checked parent_run_id first."""
+    if clients.db_pool is None:
+        return []
+    async with clients.db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, from_agent, to_agent, delegation_reason, status,
+                   output_payload, created_at, completed_at
+            FROM agent_delegations
+            WHERE input_payload->>'_parent_run_id' = $1
+            ORDER BY created_at ASC
+            """,
+            str(parent_run_id),
+        )
+    out: list[dict] = []
+    for r in rows:
+        deleg = dict(r)
+        spoke_rid = _as_uuid((deleg.get("output_payload") or {}).get("run_id"))
+        deleg["spoke_run"] = await _spoke_run_summary(spoke_rid) if spoke_rid else None
+        out.append(deleg)
+    return out
+
+
 async def _build_catalog(
     agent_name: Optional[str], *, include_staging: bool = False
 ) -> list[dict]:
@@ -511,10 +579,13 @@ def _render_task(args: dict) -> str:
 
 
 async def _handle_delegation(
-    args: dict, *, spokes: dict, user_id, session_id, workspace_id, depth: int
+    args: dict, *, spokes: dict, user_id, session_id, workspace_id, depth: int,
+    parent_run_id: Optional[uuid.UUID] = None,
 ) -> str:
     """Run one ATLAS -> spoke hop inline and return the spoke's answer as the
-    observation. Records an agent_delegations row (create -> complete/fail)."""
+    observation. Records an agent_delegations row (create -> complete/fail),
+    stamping the orchestrator's run id into input_payload so the runs view can
+    rebuild the orchestrator→spoke tree."""
     target = (args.get("agent") or "").strip().upper()
     if target not in spokes:
         return f"error: unknown agent {target!r}. Valid: {', '.join(spokes) or '(none)'}."
@@ -523,6 +594,9 @@ async def _handle_delegation(
 
     spoke = spokes[target]
     task = _render_task(args)
+    input_payload = (
+        {**args, "_parent_run_id": str(parent_run_id)} if parent_run_id else args
+    )
     try:
         deleg = await create_delegation(
             from_agent=ORCHESTRATOR_NAME,
@@ -530,7 +604,7 @@ async def _handle_delegation(
             delegation_reason=(args.get("goal") or "")[:300] or None,
             session_id=_as_uuid(session_id),
             workspace_id=_as_uuid(workspace_id),
-            input_payload=args,
+            input_payload=input_payload,
             user_id=_as_uuid(user_id),
             initial_status="running",
         )
@@ -632,7 +706,8 @@ async def _handle_staging(
 
 
 async def _execute_calls(
-    turn: list, *, sem, spokes, agent_name, user_id, session_id, workspace_id, depth
+    turn: list, *, sem, spokes, agent_name, user_id, session_id, workspace_id, depth,
+    parent_run_id: Optional[uuid.UUID] = None,
 ) -> list[str]:
     """Run one turn's tool/delegate calls concurrently (Phase 4), returning
     observations in call order. Delegations are bounded by sem; every call is
@@ -645,6 +720,7 @@ async def _execute_calls(
                     return await _handle_delegation(
                         args, spokes=spokes, user_id=user_id, session_id=session_id,
                         workspace_id=workspace_id, depth=depth,
+                        parent_run_id=parent_run_id,
                     )
             if kind == "staging":
                 return await _handle_staging(
@@ -784,7 +860,7 @@ async def run_agent(
             observations = await _execute_calls(
                 turn, sem=delegation_sem, spokes=spokes, agent_name=agent_name,
                 user_id=user_id, session_id=session_id, workspace_id=workspace_id,
-                depth=_depth,
+                depth=_depth, parent_run_id=run_id,
             )
             for (name, _args, _kind), observation in zip(turn, observations):
                 steps.append(

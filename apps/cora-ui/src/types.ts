@@ -47,6 +47,53 @@ export interface AgentRunResponse {
   steps: AgentRunStep[];
 }
 
+// ---- Runs / task-manager view (Cora Configuration → Runs) ----
+export interface AgentRunSummary {
+  id: string;
+  session_id: string | null;
+  agent_name: string | null; // null = orchestrator (ATLAS); else the spoke
+  status: string;
+  goal: string;
+  model_name: string | null;
+  tool_calls: number;
+  step_count: number;
+  max_steps: number;
+  stopped: string | null;
+  created_at: string;
+  updated_at: string;
+  completed_at: string | null;
+}
+
+export interface AgentSpokeRun {
+  id: string;
+  agent_name: string | null;
+  status: string;
+  stopped: string | null;
+  answer: string | null;
+  tool_calls: number;
+  step_count: number;
+  steps: AgentRunStep[];
+}
+
+export interface AgentDelegationNode {
+  id: string;
+  from_agent: string;
+  to_agent: string;
+  delegation_reason: string | null;
+  status: string;
+  output_payload: Record<string, unknown> | null;
+  created_at: string;
+  completed_at: string | null;
+  spoke_run: AgentSpokeRun | null;
+}
+
+export interface AgentRunDetail extends AgentRunSummary {
+  answer: string | null;
+  error_message: string | null;
+  steps: AgentRunStep[];
+  delegations: AgentDelegationNode[];
+}
+
 export interface ConversationSummary {
   session_id: string;
   created_at: string;

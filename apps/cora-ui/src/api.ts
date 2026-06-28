@@ -13,6 +13,8 @@ import type {
   ResponseTestRequest,
   ResponseTestResult,
   AgentRunResponse,
+  AgentRunSummary,
+  AgentRunDetail,
   AgentRuntimeConfig,
   ChatResponse,
   ConversationDetail,
@@ -253,6 +255,14 @@ export function sendAgentChat(message: string, sessionId?: string | null) {
     method: "POST",
     body: JSON.stringify({ message, session_id: sessionId ?? undefined }),
   });
+}
+
+export function listAgentRuns(limit = 50) {
+  return request<AgentRunSummary[]>(`/chat/agent/runs?limit=${limit}`);
+}
+
+export function getAgentRun(runId: string) {
+  return request<AgentRunDetail>(`/chat/agent/runs/${encodeURIComponent(runId)}`);
 }
 
 export function getConversation(sessionId: string) {

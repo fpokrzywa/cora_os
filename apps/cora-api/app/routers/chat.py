@@ -1194,8 +1194,26 @@ async def chat_agent_async(
 
 
 @router.get(
+    "/chat/agent/runs",
+    summary="List recent agent runs (owner-scoped, summary only)",
+)
+async def chat_agent_list_runs(
+    current: Annotated[CurrentUser, Depends(get_current_user)],
+    limit: int = 50,
+) -> list[dict]:
+    """Recent runs for the runs / task-manager view. Summary columns only —
+    fetch a single run for its full step trace + delegation tree."""
+    if not settings.agent_runtime_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="agent runtime is disabled",
+        )
+    return await agent_runtime.list_runs(user_id=current.id, limit=limit)
+
+
+@router.get(
     "/chat/agent/runs/{run_id}",
-    summary="Fetch a persisted agent run (owner-scoped)",
+    summary="Fetch a persisted agent run (owner-scoped) + its delegation tree",
 )
 async def chat_agent_get_run(
     run_id: str,
@@ -1218,6 +1236,8 @@ async def chat_agent_get_run(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="run not found"
         )
+    # Owner verified above; attach the orchestrator→spoke tree (empty for spokes).
+    run["delegations"] = await agent_runtime.get_run_delegations(rid)
     return run
 
 
