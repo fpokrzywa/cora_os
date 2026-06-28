@@ -35,6 +35,7 @@ from typing import Optional
 import httpx
 
 from app.clients import clients
+from app import llm
 from app import calendar_adapters
 from app import chronos_tools
 from app import clock
@@ -371,8 +372,7 @@ async def extract_event_fields(message: str, kind: str) -> dict:
     Falls back to the regex baseline when the endpoint is unset or the call/parse
     fails — the module still works, just less smart. Never raises."""
     base = _extract_create_fields(message)
-    endpoint = settings.dgx_model_endpoint or None
-    if not endpoint:
+    if not llm.is_chat_configured():
         return base
     tz_name = settings.cora_timezone or "UTC"
     prompt = (
@@ -387,12 +387,8 @@ async def extract_event_fields(message: str, kind: str) -> dict:
         f"Times are in the {tz_name} timezone.\n\nUser request: {message!r}"
     )
     try:
-        async with httpx.AsyncClient(timeout=LLM_TIMEOUT_SECONDS) as client:
-            resp = await client.post(
-                f"{endpoint.rstrip('/')}/api/generate",
-                json={"model": settings.dgx_model_name, "prompt": prompt, "stream": False})
-            resp.raise_for_status()
-            text = (resp.json() or {}).get("response", "")
+        text = await llm.generate_text(
+            prompt, max_tokens=512, temperature=0.2, timeout=LLM_TIMEOUT_SECONDS)
     except (httpx.HTTPError, ValueError) as exc:
         logger.warning("calendar field extraction failed; using regex fallback: %s", exc)
         return base

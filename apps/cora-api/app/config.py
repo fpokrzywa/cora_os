@@ -21,6 +21,15 @@ class Settings(BaseSettings):
     # paying a full cold prefill (~15s) every time. Keep it warm so warm prefill
     # (~0.3s) is the norm; "-1" pins it loaded indefinitely.
     dgx_keep_alive: str = "30m"
+    # Chat-model backend for the user-facing chat + fact-extraction. "ollama" (the
+    # DGX native /api/generate, default) or "openai" (an OpenAI-compatible server
+    # such as vLLM serving gpt-oss-120b at dgx_openai_endpoint). Flipping to "openai"
+    # routes chat + memory/calendar extraction to that model; embeddings, vision, and
+    # the agent-runtime tool loop stay on Ollama regardless. See app/llm.py.
+    dgx_chat_backend: str = "ollama"
+    dgx_openai_endpoint: str = ""   # e.g. http://spark-a84c:8000/v1
+    dgx_openai_model: str = ""      # e.g. openai/gpt-oss-120b
+    dgx_openai_api_key: str = ""    # optional; vLLM usually needs none
     agent_runtime_enabled: bool = False
     agent_runtime_max_steps: int = 6
 

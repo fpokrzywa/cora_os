@@ -15,6 +15,7 @@ from typing import Optional
 
 import httpx
 
+from app import llm
 from app.clients import clients
 from app.clock import current_datetime_preamble
 from app.config import settings
@@ -406,9 +407,7 @@ async def extract_memories_from_conversation(transcript: str) -> list[dict]:
     for permanent memory. Returns a list of {"text": ...} (one concrete fact each), or
     [] when nothing concrete is found or the model/endpoint is unavailable. Never raises.
     Conservative by design: a false-positive trigger just yields [] (nothing saved)."""
-    endpoint = settings.dgx_model_endpoint or None
-    model = settings.dgx_chat_model_name or settings.dgx_model_name
-    if not endpoint or not model or not (transcript or "").strip():
+    if not llm.is_chat_configured() or not (transcript or "").strip():
         return []
     prompt = (
         "From the conversation below, extract the user's durable personal facts to "
@@ -423,13 +422,11 @@ async def extract_memories_from_conversation(transcript: str) -> list[dict]:
         f"Conversation:\n{transcript}"
     )
     try:
-        async with httpx.AsyncClient(timeout=45.0) as client:
-            resp = await client.post(
-                f"{endpoint.rstrip('/')}/api/generate",
-                json={"model": model, "prompt": prompt, "stream": False},
-            )
-            resp.raise_for_status()
-            reply = (resp.json() or {}).get("response", "")
+        # Lower temperature + more room so the (bigger, on vLLM) model extracts
+        # facts faithfully and completely.
+        reply = await llm.generate_text(
+            prompt, max_tokens=1024, temperature=0.3, timeout=60.0
+        )
     except (httpx.HTTPError, ValueError):
         logger.warning("memory extraction model call failed")
         return []

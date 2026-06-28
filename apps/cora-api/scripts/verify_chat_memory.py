@@ -143,6 +143,30 @@ def main() -> int:
     expect(long_blk.count("x") <= 400 and long_blk.rstrip().endswith("…"),
            "memory block caps a long entry's content (prefill stays small)")
 
+    # ---- E) chat backend selection (ollama vs openai/vLLM) ----
+    print("E) chat backend selection")
+    from app import llm
+    from app.config import settings as _s
+    prev = (_s.dgx_chat_backend, _s.dgx_openai_endpoint, _s.dgx_openai_model)
+    try:
+        _s.dgx_chat_backend = "openai"
+        _s.dgx_openai_endpoint = "http://spark-a84c:8000/v1"
+        _s.dgx_openai_model = "openai/gpt-oss-120b"
+        expect(llm.chat_backend() == "openai"
+               and llm.active_chat_model() == "openai/gpt-oss-120b"
+               and llm.active_chat_endpoint() == "http://spark-a84c:8000/v1"
+               and llm.is_chat_configured(),
+               "openai backend selects the vLLM endpoint + model")
+        _s.dgx_openai_endpoint = ""
+        expect(not llm.is_chat_configured(),
+               "openai backend without an endpoint is not configured (fails closed)")
+        _s.dgx_chat_backend = "ollama"
+        expect(llm.chat_backend() == "ollama"
+               and llm.active_chat_endpoint() == _s.dgx_model_endpoint,
+               "ollama backend selects the DGX native endpoint")
+    finally:
+        _s.dgx_chat_backend, _s.dgx_openai_endpoint, _s.dgx_openai_model = prev
+
     print()
     if fails:
         print(f"FAIL ({len(fails)}): " + "; ".join(fails))

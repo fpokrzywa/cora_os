@@ -37,6 +37,7 @@ from app.agents.routing import select_subagent
 from app.agents.planner import create_plan, match_plan_intent
 from app.agents.registry import get_active_version, load_active_routing_keywords
 from app.memory import is_embedding_configured, semantic_search
+from app import llm
 from app.runtime_traces import write_trace
 from app.screen_context import build_screen_context_block
 from app import schema as schema_state
@@ -2884,10 +2885,10 @@ async def chat(
         prompt_source,
     )
 
-    if not endpoint:
+    if not llm.is_chat_configured():
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="DGX_MODEL_ENDPOINT is not configured",
+            detail=f"Chat model backend '{llm.chat_backend()}' is not configured",
         )
 
     try:
@@ -3380,21 +3381,10 @@ async def chat(
 
     llm_started = time.perf_counter()
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            ollama_response = await client.post(
-                f"{endpoint.rstrip('/')}/api/generate",
-                json={
-                    "model": settings.dgx_model_name,
-                    "prompt": prompt,
-                    "stream": False,
-                    "keep_alive": settings.dgx_keep_alive,
-                },
-            )
-            ollama_response.raise_for_status()
-            data = ollama_response.json()
+        assistant_response = await llm.generate_text(prompt, timeout=120.0)
     except httpx.HTTPError as exc:
         llm_duration_ms = int((time.perf_counter() - llm_started) * 1000)
-        logger.exception("ollama request failed session=%s", session_id)
+        logger.exception("chat model request failed session=%s", session_id)
         if routing_delegation_id is not None:
             try:
                 await fail_delegation(
@@ -3413,8 +3403,8 @@ async def chat(
             user_message=request.message,
             memory_count=len(memories_for_prompt),
             memory_ids=memory_ids_in_prompt,
-            model_name=settings.dgx_model_name,
-            model_endpoint=endpoint,
+            model_name=llm.active_chat_model(),
+            model_endpoint=llm.active_chat_endpoint(),
             duration_ms=llm_duration_ms,
             error_message=str(exc),
             workspace_id=workspace_uuid,
@@ -3435,11 +3425,10 @@ async def chat(
         )
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Ollama request failed: {exc}",
+            detail=f"Chat model request failed: {exc}",
         ) from exc
 
     llm_duration_ms = int((time.perf_counter() - llm_started) * 1000)
-    assistant_response = data["response"]
 
     # Chat-to-draft (v0.2): when a routed SIGNAL/CHRONOS turn explicitly asks to
     # SAVE a draft/proposal, persist it as an internal, review-only record via the
@@ -3540,7 +3529,7 @@ async def chat(
             scope_id=scope_id,
             user_message=request.message,
             assistant_response=assistant_response,
-            model_name=settings.dgx_model_name,
+            model_name=llm.active_chat_model(),
             placeholder=False,
             started_at=started_at,
             completed_at=completed_at,
@@ -3559,8 +3548,8 @@ async def chat(
         user_message=request.message,
         memory_count=len(memories_for_prompt),
         memory_ids=memory_ids_in_prompt,
-        model_name=settings.dgx_model_name,
-        model_endpoint=endpoint,
+        model_name=llm.active_chat_model(),
+        model_endpoint=llm.active_chat_endpoint(),
         duration_ms=llm_duration_ms,
         workspace_id=workspace_uuid,
         tool_name="llm_chat",
@@ -3584,7 +3573,7 @@ async def chat(
         agent=PERSONA_NAME,
         selected_agent=selected_agent,
         routing_matched_keywords=matched_keywords,
-        model_endpoint=endpoint,
+        model_endpoint=llm.active_chat_endpoint(),
         response=assistant_response,
         placeholder=False,
         created_at=completed_at.isoformat(),
