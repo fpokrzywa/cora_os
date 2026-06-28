@@ -151,6 +151,7 @@ class AgentResult:
     model: str
     stopped: str  # "final" | "budget" | "error"
     run_id: Optional[str] = None
+    evaluation: Optional[dict] = None  # Phase 6 verdict (top-level runs only)
 
 
 async def _fetch_tool_row(name: str) -> Optional[dict]:
@@ -275,7 +276,7 @@ async def _update_run(
 
 async def _finalize_run(
     run_id: Optional[uuid.UUID], *, status, answer, stopped, tool_calls,
-    step_count, messages, steps, error,
+    step_count, messages, steps, error, evaluation=None,
 ) -> None:
     if run_id is None or clients.db_pool is None:
         return
@@ -286,11 +287,12 @@ async def _finalize_run(
                 UPDATE agent_runtime_runs
                 SET status = $2, answer = $3, stopped = $4, tool_calls = $5,
                     step_count = $6, messages = $7, steps = $8,
-                    error_message = $9, updated_at = NOW(), completed_at = NOW()
+                    error_message = $9, evaluation = $10,
+                    updated_at = NOW(), completed_at = NOW()
                 WHERE id = $1
                 """,
                 run_id, status, answer, stopped, tool_calls, step_count,
-                messages, _steps_to_json(steps), error,
+                messages, _steps_to_json(steps), error, evaluation,
             )
     except Exception:
         logger.exception("agent run finalize failed (continuing)")
@@ -305,7 +307,8 @@ async def get_run(run_id: uuid.UUID, *, user_id) -> Optional[dict]:
             """
             SELECT id, session_id, user_id, agent_name, status, goal, model_name,
                    answer, tool_calls, step_count, max_steps, stopped,
-                   error_message, steps, created_at, updated_at, completed_at
+                   error_message, steps, evaluation,
+                   created_at, updated_at, completed_at
             FROM agent_runtime_runs
             WHERE id = $1 AND (user_id = $2 OR user_id IS NULL)
             """,
@@ -705,6 +708,108 @@ async def _handle_staging(
     return f"error: no staging handler for {name!r}."
 
 
+# ---------- Phase 6: independent evaluator (generator/evaluator split) ----------
+# An adversarial review pass over a FINISHED top-level run. A separate agent
+# identity (assume-broken, no praise) with NO tools judges the answer + staged
+# artifacts against the goal. Review-only + advisory: it produces a verdict the
+# human sees; it never sends, writes, or gates execution. Fail-closed by flag.
+
+EVALUATOR_SYSTEM_PROMPT = (
+    "You are an INDEPENDENT, adversarial reviewer of another AI agent's work. "
+    "Assume the work is BROKEN or INCOMPLETE until proven otherwise. Do NOT "
+    "praise. Your job is to find what fails: gaps against the goal, unsupported "
+    "claims, steps the agent said it did but did not actually do via a tool, and "
+    "anything that would mislead the user. Judge the agent's final answer and any "
+    "artifacts it staged AGAINST the user's original goal and the actual tool "
+    "trace. Respond with ONLY a single JSON object and nothing else:\n"
+    '{"verdict": "pass" | "concerns" | "fail", "reasons": ["..."], "summary": "..."}\n'
+    "Use verdict=pass ONLY if the output fully and correctly satisfies the goal "
+    "with no material gaps; concerns if it largely works but has real issues "
+    "worth flagging; fail if it does not meet the goal or would mislead. Keep "
+    "reasons short and concrete."
+)
+
+_VALID_VERDICTS = {"pass", "concerns", "fail"}
+
+
+def _render_eval_input(goal: str, answer: str, steps: list["AgentStep"]) -> str:
+    """Build the evaluator's read-only review packet: the goal, the final answer,
+    and a compact trace (so it can catch 'claimed to use a tool but didn't')."""
+    lines: list[str] = []
+    for s in steps:
+        if s.kind == "tool_call":
+            args = s.detail.get("arguments") or {}
+            lines.append(f"  called {s.detail.get('name')}({json.dumps(args, default=str)[:200]})")
+        elif s.kind == "tool_result":
+            lines.append(f"  -> {s.detail.get('name')}: {str(s.detail.get('result'))[:300]}")
+    trace = "\n".join(lines) or "  (no tools were called)"
+    return (
+        f"USER GOAL:\n{goal}\n\n"
+        f"AGENT FINAL ANSWER:\n{answer or '(empty)'}\n\n"
+        f"WHAT THE AGENT ACTUALLY DID (tool trace):\n{trace}\n\n"
+        "Review the answer against the goal and the trace, then return your JSON verdict."
+    )
+
+
+def _parse_verdict(content: str) -> dict:
+    """Coerce the evaluator's reply into a verdict dict. Tolerates prose around
+    the JSON; falls back to a 'concerns' verdict carrying the raw text so a
+    malformed reply never silently reads as a pass."""
+    text = (content or "").strip()
+    parsed: Any = None
+    start, end = text.find("{"), text.rfind("}")
+    if start != -1 and end > start:
+        try:
+            parsed = json.loads(text[start : end + 1])
+        except (TypeError, ValueError):
+            parsed = None
+    if isinstance(parsed, dict):
+        verdict = str(parsed.get("verdict") or "").strip().lower()
+        if verdict not in _VALID_VERDICTS:
+            verdict = "concerns"
+        reasons = parsed.get("reasons") or []
+        if not isinstance(reasons, list):
+            reasons = [str(reasons)]
+        reasons = [str(r)[:300] for r in reasons][:8]
+        summary = str(parsed.get("summary") or "")[:1000]
+        return {"verdict": verdict, "reasons": reasons, "summary": summary}
+    return {
+        "verdict": "concerns",
+        "reasons": [],
+        "summary": (text[:1000] or "evaluator returned no structured verdict"),
+    }
+
+
+async def evaluate_run(
+    *, goal: str, answer: str, steps: list["AgentStep"]
+) -> Optional[dict]:
+    """Run the independent evaluator over a finished run. READ-ONLY: no tools,
+    no external effects. Returns {verdict, reasons, summary, model} or None when
+    evaluation is disabled/unconfigured/failed (never raises)."""
+    if not settings.agent_eval_enabled:
+        return None
+    endpoint = (settings.dgx_model_endpoint or "").rstrip("/")
+    model = (
+        (settings.dgx_eval_model_name or "").strip()
+        or settings.dgx_chat_model_name
+        or settings.dgx_model_name
+    )
+    if not endpoint or not model:
+        return None
+    messages = [
+        {"role": "system", "content": EVALUATOR_SYSTEM_PROMPT},
+        {"role": "user", "content": _render_eval_input(goal, answer, steps)},
+    ]
+    try:
+        data = await _chat(endpoint, model, messages, [])  # no tools — judge only
+    except Exception:
+        logger.exception("evaluator chat call failed (continuing without a verdict)")
+        return None
+    verdict = _parse_verdict((data.get("message") or {}).get("content") or "")
+    verdict["model"] = model
+    return verdict
+
+
 async def _execute_calls(
     turn: list, *, sem, spokes, agent_name, user_id, session_id, workspace_id, depth,
     parent_run_id: Optional[uuid.UUID] = None,
@@ -895,14 +1000,21 @@ async def run_agent(
         stopped = "error"
         error = str(exc)
 
+    # Phase 6: an independent evaluator reviews the FINISHED top-level run (only
+    # when enabled + not an error). Advisory + read-only; never blocks the answer.
+    evaluation: Optional[dict] = None
+    if _depth == 0 and stopped != "error":
+        evaluation = await evaluate_run(goal=message, answer=answer, steps=steps)
+
     await _finalize_run(
         run_id,
         status="failed" if stopped == "error" else "done",
         answer=answer, stopped=stopped, tool_calls=tool_calls,
         step_count=step_count, messages=messages, steps=steps, error=error,
+        evaluation=evaluation,
     )
     return AgentResult(
         answer=answer or "(no answer)",
         steps=steps, tool_calls=tool_calls, model=model, stopped=stopped,
-        run_id=str(run_id) if run_id else None,
+        run_id=str(run_id) if run_id else None, evaluation=evaluation,
     )

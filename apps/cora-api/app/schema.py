@@ -1046,6 +1046,9 @@ CREATE TABLE IF NOT EXISTS agent_runtime_runs (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     completed_at TIMESTAMPTZ
 );
+-- Phase 6: independent evaluator verdict (pass/concerns/fail + reasons),
+-- attached to a finished top-level run. NULL = not evaluated.
+ALTER TABLE agent_runtime_runs ADD COLUMN IF NOT EXISTS evaluation JSONB;
 CREATE INDEX IF NOT EXISTS agent_runtime_runs_session_idx
     ON agent_runtime_runs (session_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS agent_runtime_runs_user_idx

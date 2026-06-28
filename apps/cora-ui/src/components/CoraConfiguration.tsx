@@ -9,6 +9,7 @@ import {
 } from "../api";
 import type {
   AgentDelegationNode,
+  AgentEvaluation,
   AgentRunDetail,
   AgentRunResponse,
   AgentRunStep,
@@ -65,6 +66,34 @@ function runOk(status: string | null | undefined): boolean {
   return status !== "failed" && status !== "error" && status !== "cancelled";
 }
 
+// Independent evaluator verdict (Phase 6) — advisory, review-only.
+function EvaluationCard({ evaluation }: { evaluation: AgentEvaluation }) {
+  return (
+    <div className="agent-eval">
+      <div className="agent-eval__head">
+        <span className={`agent-verdict agent-verdict--${evaluation.verdict}`}>
+          evaluator: {evaluation.verdict}
+        </span>
+        {evaluation.model && (
+          <span className="agent-eval__model">
+            judge <code>{evaluation.model}</code>
+          </span>
+        )}
+      </div>
+      {evaluation.summary && (
+        <p className="agent-eval__summary">{evaluation.summary}</p>
+      )}
+      {evaluation.reasons.length > 0 && (
+        <ul className="agent-eval__reasons">
+          {evaluation.reasons.map((r, i) => (
+            <li key={i}>{r}</li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
 function when(ts: string | null): string {
   if (!ts) return "—";
   try {
@@ -104,6 +133,7 @@ function AgentPanel({ config }: { config: AgentRuntimeConfig | null }) {
               <StatusPill label="Runtime" on={config.runtime_enabled} />
               <StatusPill label="Delegation" on={config.delegation_enabled} />
               <StatusPill label="Write / staging" on={config.write_enabled} />
+              <StatusPill label="Evaluator" on={config.eval_enabled} />
             </div>
             <div className="agent-cfg__meta">
               Model <code>{config.chat_model || "—"}</code> · max steps{" "}
@@ -175,6 +205,9 @@ function AgentPanel({ config }: { config: AgentRuntimeConfig | null }) {
                 {result.answer}
               </ReactMarkdown>
             </div>
+            {result.evaluation && (
+              <EvaluationCard evaluation={result.evaluation} />
+            )}
           </div>
         )}
       </section>
@@ -270,6 +303,7 @@ function RunDetail({ runId }: { runId: string }) {
           <ReactMarkdown remarkPlugins={[remarkGfm]}>{detail.answer}</ReactMarkdown>
         </div>
       )}
+      {detail.evaluation && <EvaluationCard evaluation={detail.evaluation} />}
     </div>
   );
 }

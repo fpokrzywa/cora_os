@@ -1104,6 +1104,7 @@ class AgentRunResponse(BaseModel):
     tool_calls: int
     stopped: str  # final | budget | error
     steps: list[dict]
+    evaluation: Optional[dict] = None  # Phase 6 verdict (None unless enabled)
 
 
 @router.post(
@@ -1136,6 +1137,7 @@ async def chat_agent(
         tool_calls=result.tool_calls,
         stopped=result.stopped,
         steps=[{"kind": s.kind, **s.detail} for s in result.steps],
+        evaluation=result.evaluation,
     )
 
 
@@ -1245,9 +1247,11 @@ class AgentConfigResponse(BaseModel):
     runtime_enabled: bool
     delegation_enabled: bool
     write_enabled: bool
+    eval_enabled: bool
     max_steps: int
     max_parallel: int
     chat_model: str
+    eval_model: str
     endpoint_configured: bool
 
 
@@ -1265,9 +1269,16 @@ async def chat_agent_config(
         runtime_enabled=settings.agent_runtime_enabled,
         delegation_enabled=settings.agent_delegation_enabled,
         write_enabled=settings.agent_write_enabled,
+        eval_enabled=settings.agent_eval_enabled,
         max_steps=settings.agent_runtime_max_steps,
         max_parallel=settings.agent_delegation_max_parallel,
         chat_model=settings.dgx_chat_model_name or settings.dgx_model_name or "",
+        eval_model=(
+            settings.dgx_eval_model_name
+            or settings.dgx_chat_model_name
+            or settings.dgx_model_name
+            or ""
+        ),
         endpoint_configured=bool(settings.dgx_model_endpoint),
     )
 

@@ -38,6 +38,19 @@ class Settings(BaseSettings):
     # switches. Fail-closed: off -> the agent loop is read-only (Phase 1-4).
     agent_write_enabled: bool = False
 
+    # Phase 6: independent evaluator (the generator/evaluator split). When true
+    # (AND agent_runtime_enabled), a finished TOP-LEVEL run gets one adversarial
+    # review pass: a separate agent identity (assume-broken, no praise, NO tools)
+    # judges the answer + any staged artifacts against the goal and returns a
+    # verdict (pass/concerns/fail + reasons). REVIEW-ONLY + advisory — it has no
+    # tools and no external effects; it never sends, writes, or gates execution,
+    # it only attaches a verdict to the run for the human to see. Fail-closed:
+    # off -> no evaluation runs. dgx_eval_model_name optionally points the
+    # evaluator at a DIFFERENT model (an independent judge catches blind spots a
+    # self-review misses); falls back to the chat model when unset.
+    agent_eval_enabled: bool = False
+    dgx_eval_model_name: str = ""
+
     n8n_webhook_health_url: str = "http://n8n:5678/webhook/cora-health"
 
     # Self-hosted SearXNG metasearch — backs PULSE's web_search tool. Internal

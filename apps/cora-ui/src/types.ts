@@ -23,10 +23,19 @@ export interface AgentRuntimeConfig {
   runtime_enabled: boolean;
   delegation_enabled: boolean;
   write_enabled: boolean;
+  eval_enabled: boolean;
   max_steps: number;
   max_parallel: number;
   chat_model: string;
+  eval_model: string;
   endpoint_configured: boolean;
+}
+
+export interface AgentEvaluation {
+  verdict: "pass" | "concerns" | "fail";
+  reasons: string[];
+  summary: string;
+  model?: string;
 }
 
 export interface AgentRunStep {
@@ -45,6 +54,7 @@ export interface AgentRunResponse {
   tool_calls: number;
   stopped: "final" | "budget" | "error";
   steps: AgentRunStep[];
+  evaluation?: AgentEvaluation | null;
 }
 
 // ---- Runs / task-manager view (Cora Configuration → Runs) ----
@@ -92,6 +102,7 @@ export interface AgentRunDetail extends AgentRunSummary {
   error_message: string | null;
   steps: AgentRunStep[];
   delegations: AgentDelegationNode[];
+  evaluation?: AgentEvaluation | null;
 }
 
 export interface ConversationSummary {

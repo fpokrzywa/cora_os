@@ -21,6 +21,11 @@ Parts:
   G) Runs view — list_runs is owner-scoped; get_run_delegations rebuilds the
      orchestrator→spoke tree from the _parent_run_id stamp and embeds the spoke
      run's own step trace.
+  H) Independent evaluator (Phase 6) — _parse_verdict is robust (clean JSON,
+     prose-wrapped JSON, malformed → 'concerns', out-of-range verdict normalized);
+     _render_eval_input packs goal/answer/trace; evaluate_run is fail-closed
+     (None when the flag is off OR endpoint/model unset — no model call); the
+     evaluation column round-trips through _finalize_run → get_run.
 
     docker cp apps/cora-api/scripts/verify_agent_runtime.py cora-api:/tmp/var.py
     docker exec -e PYTHONPATH=/app cora-api python /tmp/var.py   # 0=PASS 1=FAIL
@@ -206,6 +211,52 @@ async def main() -> int:
                "the embedded spoke run carries its step trace")
         empty = await ar.get_run_delegations(uuid.uuid4())
         expect(empty == [], "an unrelated run id yields no delegations")
+
+        # ---- H) independent evaluator (Phase 6) ----
+        print("H) evaluator")
+        v = ar._parse_verdict('{"verdict":"fail","reasons":["a","b"],"summary":"nope"}')
+        expect(v["verdict"] == "fail" and v["reasons"] == ["a", "b"],
+               "_parse_verdict reads a clean JSON verdict")
+        v2 = ar._parse_verdict(
+            'Sure: {"verdict":"pass","reasons":[],"summary":"ok"} -- done')
+        expect(v2["verdict"] == "pass", "_parse_verdict extracts JSON embedded in prose")
+        v3 = ar._parse_verdict("totally malformed, no json here")
+        expect(v3["verdict"] == "concerns" and "malformed" in v3["summary"],
+               "a malformed reply falls back to 'concerns' (never a silent pass)")
+        v4 = ar._parse_verdict('{"verdict":"perfect","reasons":"x","summary":"y"}')
+        expect(v4["verdict"] == "concerns" and v4["reasons"] == ["x"],
+               "an out-of-range verdict is normalized to 'concerns'")
+
+        rendered = ar._render_eval_input(
+            "do X", "did X",
+            [ar.AgentStep("tool_call", {"name": "web_search", "arguments": {"query": "x"}}),
+             ar.AgentStep("tool_result", {"name": "web_search", "result": "snippet"})])
+        expect(all(k in rendered for k in
+                   ("USER GOAL", "do X", "AGENT FINAL ANSWER", "did X", "web_search")),
+               "_render_eval_input packs goal + answer + tool trace")
+
+        off = await ar.evaluate_run(goal="g", answer="a", steps=[])
+        expect(off is None, "evaluate_run is None when AGENT_EVAL_ENABLED is off")
+
+        prev_enabled = settings.agent_eval_enabled
+        prev_endpoint = settings.dgx_model_endpoint
+        settings.agent_eval_enabled = True
+        settings.dgx_model_endpoint = ""
+        try:
+            none2 = await ar.evaluate_run(goal="g", answer="a", steps=[])
+        finally:
+            settings.agent_eval_enabled = prev_enabled
+            settings.dgx_model_endpoint = prev_endpoint
+        expect(none2 is None,
+               "evaluate_run stays None when endpoint/model unset (no model call)")
+
+        verdict = {"verdict": "concerns", "reasons": ["r1"], "summary": "s", "model": "t"}
+        await ar._finalize_run(
+            run_id, status="done", answer="ok", stopped="final", tool_calls=1,
+            step_count=2, messages=[], steps=[], error=None, evaluation=verdict)
+        row3 = await ar.get_run(run_id, user_id=uid)
+        expect(bool(row3) and (row3.get("evaluation") or {}).get("verdict") == "concerns",
+               "_finalize_run persists the evaluation; get_run returns it")
 
         # ---- config sanity ----
         expect(isinstance(settings.agent_runtime_max_steps, int)
