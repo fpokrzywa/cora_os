@@ -338,6 +338,7 @@ def _build_prompt(
     workspace_context: Optional[str] = None,
     web_results: Optional[str] = None,
     screen_context: Optional[str] = None,
+    datetime_line: Optional[str] = None,
 ) -> tuple[str, dict]:
     """Build the Ollama prompt and return it with size stats.
 
@@ -352,6 +353,10 @@ def _build_prompt(
     screen_part = screen_context if screen_context else None
     web_part = web_results if web_results else None
     memory_part = _format_memory_block(memories) if memories else None
+    # The live date/time goes right before the user turn — NOT at the front — so it
+    # doesn't change the cached prompt prefix every minute (which would force a full
+    # cold prefill on the model every request). Stable prefix => prompt-cache hits.
+    datetime_part = datetime_line if datetime_line else None
     final_user_part = f"User: {user_message}"
     cue = f"{PERSONA_NAME}:"
 
@@ -366,6 +371,8 @@ def _build_prompt(
         fixed_parts.append(web_part)
     if memory_part:
         fixed_parts.append(memory_part)
+    if datetime_part:
+        fixed_parts.append(datetime_part)
     fixed_parts.extend([final_user_part, cue])
 
     fixed_size = sum(len(p) for p in fixed_parts) + (
@@ -394,6 +401,8 @@ def _build_prompt(
     if memory_part:
         assembled_parts.append(memory_part)
     assembled_parts.extend(included)
+    if datetime_part:
+        assembled_parts.append(datetime_part)
     assembled_parts.extend([final_user_part, cue])
     prompt = separator.join(assembled_parts)
 
@@ -2863,9 +2872,11 @@ async def chat(
     system_prompt, prompt_source, _active_version = await resolve_agent_prompt(
         selected_agent
     )
-    # Prepend the current date/time so every agent (Cora/PULSE/FORGE/...) knows
-    # "today" regardless of the model's training cutoff.
-    system_prompt = f"{current_datetime_preamble()}\n\n{system_prompt}"
+    # The current date/time is injected NEXT TO the user turn (via _build_prompt's
+    # datetime_line), not prepended to the system prompt — keeping it out of the
+    # cached prompt prefix so per-minute changes don't force a cold prefill every
+    # request. The model still sees "today" authoritatively.
+    datetime_line = current_datetime_preamble()
     logger.info(
         "agent prompt source: session=%s selected_agent=%s source=%s",
         session_id,
@@ -3239,6 +3250,7 @@ async def chat(
         workspace_context=workspace_context_text,
         web_results=web_results_text,
         screen_context=screen_context_text,
+        datetime_line=datetime_line,
     )
 
     def _workspace_trace_metadata() -> dict:
