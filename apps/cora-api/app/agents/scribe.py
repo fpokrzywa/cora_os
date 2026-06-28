@@ -7,6 +7,7 @@ other agents on request (keyword search for v0.1; vector retrieval later).
 SCRIBE operates internally; users do not see SCRIBE's voice directly.
 """
 
+import json
 import logging
 import re
 import uuid
@@ -255,6 +256,20 @@ _INTENT_SHOW_MEMORIES = re.compile(
     r"^\s*show\s+memor(?:y|ies)\s+about\s+(.+)$",
     re.IGNORECASE | re.DOTALL,
 )
+# Natural "save this to memory" / contextual "remember <this/these/all of it>"
+# requests that point at the CONVERSATION rather than carrying an inline fact.
+# These route to an LLM extraction over recent turns (kind 'remember_extract')
+# instead of a literal text save — so "make sure all of these are stored in
+# memory" and "can you remember that" actually persist what was just discussed.
+_INTENT_SAVE_TO_MEMORY = re.compile(
+    r"\b(?:sav|stor|keep|kept|put|add|commit|record)\w*\b[^.?!]{0,40}?\bmemor(?:y|ies)\b",
+    re.IGNORECASE | re.DOTALL,
+)
+_INTENT_REMEMBER_CONTEXTUAL = re.compile(
+    r"^\s*(?:can|could|would|will|please|pls)?\s*(?:you\s+)?(?:please\s+)?"
+    r"remember\s+(?:this|that|these|those|it|all\b|everything|us\b|me\b|my\s|our\s)",
+    re.IGNORECASE | re.DOTALL,
+)
 _INTENT_DELETE_MEMORY = re.compile(
     r"^\s*(confirm\s+)?(?:forget|delete)\s+memory\s+([0-9a-fA-F-]{8,36})\s*$",
     re.IGNORECASE,
@@ -280,6 +295,13 @@ def match_chat_memory_intent(message: str) -> Optional[dict]:
     m = _INTENT_REMEMBER_USER.match(message)
     if m:
         return {"kind": "remember_user", "text": m.group(1).strip()}
+    # Broader save-to-memory / contextual-remember requests -> extract from the
+    # conversation. Checked AFTER the strict "remember that <inline fact>" forms so
+    # those still save their text directly. The save-verb pattern ignores questions
+    # ("do you keep things in memory?") so meta-questions don't trigger a save.
+    save_cmd = _INTENT_SAVE_TO_MEMORY.search(message) and not message.rstrip().endswith("?")
+    if save_cmd or _INTENT_REMEMBER_CONTEXTUAL.match(message):
+        return {"kind": "remember_extract"}
     m = _INTENT_SHOW_MEMORIES.match(message)
     if m:
         return {"kind": "show", "query": m.group(1).strip()}
@@ -343,6 +365,75 @@ async def create_chat_memory(
         row["title"],
     )
     return dict(row)
+
+
+def _parse_memory_facts(text: str) -> list[dict]:
+    """Robustly pull a list of {"text": ...} facts from the extractor model's reply
+    (a JSON array, possibly wrapped in prose). Dedups within the batch (case-insensitive),
+    caps the count, and returns [] on anything malformed — never raises."""
+    if not text:
+        return []
+    start, end = text.find("["), text.rfind("]")
+    if start == -1 or end <= start:
+        return []
+    try:
+        arr = json.loads(text[start:end + 1])
+    except (ValueError, TypeError):
+        return []
+    if not isinstance(arr, list):
+        return []
+    out: list[dict] = []
+    seen: set[str] = set()
+    for item in arr:
+        if isinstance(item, dict):
+            raw = item.get("text") or item.get("fact") or ""
+        elif isinstance(item, str):
+            raw = item
+        else:
+            raw = ""
+        fact = " ".join(str(raw).split()).strip()
+        key = fact.lower()
+        if fact and key not in seen:
+            seen.add(key)
+            out.append({"text": fact})
+        if len(out) >= 25:
+            break
+    return out
+
+
+async def extract_memories_from_conversation(transcript: str) -> list[dict]:
+    """LLM pass that pulls discrete, durable USER facts from a conversation transcript
+    for permanent memory. Returns a list of {"text": ...} (one concrete fact each), or
+    [] when nothing concrete is found or the model/endpoint is unavailable. Never raises.
+    Conservative by design: a false-positive trigger just yields [] (nothing saved)."""
+    endpoint = settings.dgx_model_endpoint or None
+    model = settings.dgx_chat_model_name or settings.dgx_model_name
+    if not endpoint or not model or not (transcript or "").strip():
+        return []
+    prompt = (
+        "From the conversation below, extract the user's durable personal facts to "
+        "store in permanent memory. Include ONLY concrete facts worth remembering "
+        "long-term: names, relationships, nicknames, important dates, places, and "
+        "stable preferences. Write each as one short self-contained sentence in the "
+        "third person about the user, e.g. \"The user's wife is Dorothy, nicknamed "
+        "'Meshu'.\" or \"The user's daughter Cailey (nickname 'Goose') was born "
+        "2000-02-29.\" Do NOT include questions, smalltalk, transient state, or "
+        "assistant messages. Output ONLY a JSON array like [{\"text\": \"...\"}] and "
+        "nothing else; use [] if there is nothing concrete to save.\n\n"
+        f"Conversation:\n{transcript}"
+    )
+    try:
+        async with httpx.AsyncClient(timeout=45.0) as client:
+            resp = await client.post(
+                f"{endpoint.rstrip('/')}/api/generate",
+                json={"model": model, "prompt": prompt, "stream": False},
+            )
+            resp.raise_for_status()
+            reply = (resp.json() or {}).get("response", "")
+    except (httpx.HTTPError, ValueError):
+        logger.warning("memory extraction model call failed")
+        return []
+    return _parse_memory_facts(reply)
 
 
 async def fetch_memory_for_mutation(memory_id: uuid.UUID) -> Optional[dict]:

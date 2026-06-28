@@ -43,6 +43,7 @@ from app import schema as schema_state
 from app.agents.scribe import (
     create_chat_memory,
     delete_memory_entry,
+    extract_memories_from_conversation,
     fetch_memory_for_mutation,
     match_chat_memory_intent,
     search_memory,
@@ -102,7 +103,14 @@ CORA_SYSTEM_PROMPT = (
     "things like \"I am ATLAS.\" Only mention ATLAS when the user explicitly "
     "asks how Cora works under the hood.\n\n"
     "Respond helpfully, concisely, and directly. Use prior conversation only "
-    "for context."
+    "for context.\n\n"
+    "You cannot save, store, update, or recall long-term memories on your own. "
+    "NEVER claim you have remembered, saved, stored, or noted something — the "
+    "memory subsystem performs saves and replies with an explicit \"Saved …\" "
+    "confirmation, separate from you. If the user asks you to remember something "
+    "and you did not just see such a confirmation, tell them to say \"remember "
+    "that …\" or \"save this to memory\" so it is actually stored; do not pretend "
+    "it was saved."
 )
 
 # Specialist subagents ATLAS can route to, with their Python-constant fallback
@@ -195,6 +203,20 @@ async def _load_recent_history(
         }
         for row in rows
     ]
+
+
+async def _existing_user_memory_texts(user_id: uuid.UUID) -> set[str]:
+    """Normalized contents of the user's existing memories, so re-running an extract
+    ('store all of this' twice) doesn't create duplicate rows."""
+    if clients.db_pool is None:
+        return set()
+    async with clients.db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT content FROM memory_entries "
+            "WHERE scope_type = 'user' AND scope_id = $1",
+            user_id,
+        )
+    return {" ".join((r["content"] or "").split()).lower() for r in rows}
 
 
 async def _verify_session_ownership(
@@ -1615,6 +1637,44 @@ async def chat(
                     "memory_id": str(row["id"]),
                     "scope_type": "user",
                 })
+
+        elif kind == "remember_extract":
+            # The user asked to remember the CONVERSATION (not an inline string), so
+            # extract durable facts from recent turns and save EACH as a user memory.
+            # We only ever confirm what actually persisted — never a hallucinated save.
+            hist = (
+                [{"role": m.role, "content": m.content} for m in request.history]
+                if request.history
+                else await _load_recent_history(session_uuid, scope_type, scope_id)
+            )
+            lines = [f"{_role_label(h['role'])}: {h['content']}" for h in hist]
+            lines.append(f"{_role_label('user')}: {request.message}")
+            facts = await extract_memories_from_conversation("\n".join(lines))
+            existing = await _existing_user_memory_texts(current.id)
+            saved_titles: list[str] = []
+            for fact in facts:
+                norm = " ".join(fact["text"].split()).lower()
+                if norm in existing:
+                    continue
+                row = await create_chat_memory(
+                    text=fact["text"], scope_type="user", scope_id=current.id,
+                    workspace_id=workspace_uuid,
+                )
+                if row is not None:
+                    saved_titles.append(row["title"])
+                    existing.add(norm)
+            if saved_titles:
+                bullets = "\n".join(f"• {t}" for t in saved_titles)
+                noun = "memory" if len(saved_titles) == 1 else "memories"
+                assistant_response = f"Saved {len(saved_titles)} {noun}:\n{bullets}"
+                tool_result.update({"status": "ok", "saved": len(saved_titles)})
+            else:
+                assistant_response = (
+                    "I didn't find any new facts to save to memory. Tell me the "
+                    "specific details you want kept (for example: \"remember that my "
+                    "wife's name is Dorothy\")."
+                )
+                tool_result.update({"status": "noop", "saved": 0})
 
         elif kind == "remember_global":
             row = await create_chat_memory(
