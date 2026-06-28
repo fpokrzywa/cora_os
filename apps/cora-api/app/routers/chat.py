@@ -78,6 +78,10 @@ from app.jobs import JobError, create_job
 
 MEMORY_SEARCH_LIMIT = 20
 MEMORIES_IN_PROMPT = 5
+# Reciprocal Rank Fusion constant for merging semantic + keyword recall. The
+# standard k=60 keeps any single list's top item from dominating, so a strong
+# keyword hit (e.g. an exact nickname) co-ranks with the top semantic hits.
+RRF_K = 60
 
 logger = logging.getLogger(__name__)
 
@@ -260,6 +264,28 @@ def _role_label(role: str) -> str:
 
 def _estimate_tokens(text: str) -> int:
     return max(1, len(text) // CHARS_PER_TOKEN_ESTIMATE)
+
+
+def _rank_fuse_memories(
+    semantic_rows: list[dict], keyword_rows: list[dict], *, limit: int
+) -> list[dict]:
+    """Merge the two ranked recall lists by Reciprocal Rank Fusion (RRF), dedup by
+    id, and return the top `limit`. RRF score = Σ 1/(RRF_K + rank) across the lists a
+    row appears in, so (a) a memory BOTH searches surface ranks highest, and (b) a
+    strong keyword hit the embedding ranks low still co-ranks with the top semantic
+    hits — instead of being appended after every semantic row and cut by the cap
+    (the bug where an exact nickname match was never injected). Stable on ties."""
+    scores: dict[str, float] = {}
+    rows_by_id: dict[str, dict] = {}
+    for ranked in (semantic_rows, keyword_rows):
+        for rank, row in enumerate(ranked):
+            key = str(row.get("id"))
+            if not key or key == "None":
+                continue
+            rows_by_id.setdefault(key, row)
+            scores[key] = scores.get(key, 0.0) + 1.0 / (RRF_K + rank)
+    ordered = sorted(scores, key=lambda k: scores[k], reverse=True)
+    return [rows_by_id[k] for k in ordered[:limit]]
 
 
 def _format_memory_block(memories: list[dict]) -> str:
@@ -2897,17 +2923,12 @@ async def chat(
         if mem_error is None:
             mem_error = str(exc)
 
-    # Merge with semantic first (better recall), dedupe by id, cap at limit.
-    seen: set[str] = set()
-    memory_candidates: list[dict] = []
-    for row in semantic_rows + keyword_rows:
-        key = str(row.get("id"))
-        if key in seen:
-            continue
-        seen.add(key)
-        memory_candidates.append(row)
-        if len(memory_candidates) >= MEMORY_SEARCH_LIMIT:
-            break
+    # Hybrid merge via Reciprocal Rank Fusion (not "all semantic, then keyword"):
+    # an exact keyword hit the embedding ranks low — e.g. a nickname — must not be
+    # buried past the injection cap. See _rank_fuse_memories.
+    memory_candidates = _rank_fuse_memories(
+        semantic_rows, keyword_rows, limit=MEMORY_SEARCH_LIMIT
+    )
 
     mem_duration_ms = int((time.perf_counter() - mem_started) * 1000)
     memories_for_prompt = memory_candidates[:MEMORIES_IN_PROMPT]

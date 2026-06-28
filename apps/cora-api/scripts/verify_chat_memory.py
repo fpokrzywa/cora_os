@@ -20,6 +20,7 @@ Parts:
 import sys
 
 from app.agents import scribe
+from app.routers.chat import _rank_fuse_memories
 
 
 def main() -> int:
@@ -94,6 +95,29 @@ def main() -> int:
     expect(scribe._parse_memory_facts("") == [], "empty reply -> []")
     big = "[" + ",".join('{"text":"f%d"}' % i for i in range(40)) + "]"
     expect(len(scribe._parse_memory_facts(big)) == 25, "caps the batch at 25 facts")
+
+    # ---- C) recall merge: Reciprocal Rank Fusion ----
+    # The live bug: 20 semantic rows were listed before any keyword row, then only
+    # the top 5 were injected — so an exact keyword hit ('Goose') the embedding
+    # ranked low (semantic rank 15) was never injected.
+    print("C) recall rank fusion")
+    semantic = [{"id": f"s{i}"} for i in range(20)]
+    semantic[15] = {"id": "goose"}              # the nickname memory, ranked low by embeddings
+    keyword = [{"id": "goose"}, {"id": "blob"}]  # but it's the top exact keyword hit
+    fused = _rank_fuse_memories(semantic, keyword, limit=20)
+    top5 = [r["id"] for r in fused[:5]]
+    expect("goose" in top5,
+           "a low-semantic-rank exact keyword hit lands in the injected top-5")
+    expect(fused[0]["id"] == "goose",
+           "a memory in BOTH lists fuses to the very top (co-occurrence boost)")
+    ids = [r["id"] for r in fused]
+    expect(len(ids) == len(set(ids)), "fusion dedups rows by id")
+
+    kw_only = _rank_fuse_memories(
+        [{"id": "s0"}, {"id": "s1"}], [{"id": "kwhit"}], limit=5)
+    expect("kwhit" in [r["id"] for r in kw_only][:5],
+           "a keyword-only top hit is not starved by semantic rows")
+    expect(_rank_fuse_memories([], [], limit=5) == [], "empty inputs -> []")
 
     print()
     if fails:
