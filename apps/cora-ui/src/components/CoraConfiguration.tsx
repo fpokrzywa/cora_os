@@ -139,14 +139,44 @@ function InterruptCard({
     <div className="agent-interrupt">
       <div className="agent-interrupt__head">⏸ Awaiting your approval</div>
       <p className="agent-cfg__note">
-        This run staged review-only artifact(s). Your decision is recorded on the
-        run — nothing is sent or written.
+        This run staged the artifact(s) below. Approving records your decision; if
+        calendar execution is enabled it also creates an approved calendar item on
+        your real calendar. Email drafts are never sent — they stay in your drafts
+        to review and send yourself.
       </p>
       {interrupt.staged.length > 0 && (
         <ul className="agent-interrupt__staged">
           {interrupt.staged.map((s, i) => (
             <li key={i}>
               <code>{s.tool}</code> {s.summary}
+              {s.type === "calendar_create" && (
+                <span className="agent-deleg__reason">
+                  {" "}
+                  → would create on {s.provider}
+                </span>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+      {interrupt.executed && interrupt.executed.length > 0 && (
+        <ul className="agent-interrupt__staged">
+          {interrupt.executed.map((e, i) => (
+            <li key={i}>
+              <span className={`agent-pill agent-pill--${e.ok ? "on" : "off"}`}>
+                {e.ok ? "fired" : "not fired"}
+              </span>{" "}
+              {e.ok
+                ? `created — ${e.title ?? e.event_id ?? "ok"}`
+                : e.reason}
+              {e.ok && e.link && (
+                <>
+                  {" "}
+                  <a href={e.link} target="_blank" rel="noreferrer">
+                    open
+                  </a>
+                </>
+              )}
             </li>
           ))}
         </ul>
@@ -157,7 +187,7 @@ function InterruptCard({
             decided === "approve" ? "pass" : "fail"
           }`}
         >
-          {decided}d — recorded (nothing sent)
+          {decided}d — recorded
         </span>
       ) : (
         <div className="agent-interrupt__btns">
@@ -244,6 +274,8 @@ function AgentPanel({ config }: { config: AgentRuntimeConfig | null }) {
               <StatusPill label="Delegation" on={config.delegation_enabled} />
               <StatusPill label="Write / staging" on={config.write_enabled} />
               <StatusPill label="Evaluator" on={config.eval_enabled} />
+              <StatusPill label="Interrupt" on={config.interrupt_enabled} />
+              <StatusPill label="Execution" on={config.execution_enabled} />
             </div>
             <div className="agent-cfg__meta">
               Model <code>{config.chat_model || "—"}</code> · max steps{" "}

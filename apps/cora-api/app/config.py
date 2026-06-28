@@ -62,6 +62,18 @@ class Settings(BaseSettings):
     # way. Fail-closed: off -> runs finish normally (no pause).
     agent_interrupt_enabled: bool = False
 
+    # Phase 7 (confirm-as-interrupt, OUTWARD half). When true (AND the interrupt
+    # half above), approving a paused run FIRES its staged artifacts through the
+    # existing gated execution paths: a staged calendar CREATE goes through the
+    # SAME _write_gate -> adapter.create_event path the chat-calendar confirm flow
+    # uses, so it ALSO requires calendar_execution_enabled + the per-provider
+    # calendar_write flag + a connected provider (this flag never bypasses the
+    # calendar master gate; both must be on). Email drafts are NEVER sent here —
+    # email send stays hard-disabled regardless. Calendar update/delete are not
+    # fired by the agent yet (create only). Fail-closed: off -> resolve_interrupt
+    # records the decision ONLY and fires nothing (the Phase-7 internal behavior).
+    agent_execution_enabled: bool = False
+
     n8n_webhook_health_url: str = "http://n8n:5678/webhook/cora-health"
 
     # Self-hosted SearXNG metasearch — backs PULSE's web_search tool. Internal

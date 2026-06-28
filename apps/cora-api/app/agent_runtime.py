@@ -27,6 +27,7 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from typing import Any, Optional
 
 import httpx
@@ -37,7 +38,7 @@ from app.agents.delegations import (
     create_delegation,
     fail_delegation,
 )
-from app import chronos_tools, signal_tools
+from app import chat_calendar, chronos_tools, signal_tools
 from app.clients import clients
 from app.config import settings
 from app.tools import dispatch_tool
@@ -110,17 +111,42 @@ STAGING_TOOLS: dict[str, dict] = {
         },
     },
     "chronos_create_schedule_proposal": {
-        "description": "Stage a schedule/meeting PROPOSAL for the user to review. "
-        "Creates a review-only proposal — it does NOT create any calendar event.",
+        "description": "Stage a schedule/meeting PROPOSAL for the user to review and "
+        "approve. Creates a review-only proposal — it does NOT create any calendar "
+        "event by itself. To make the proposal a REAL calendar event the user can "
+        "approve, also provide start_time, end_time (ISO 8601 local time like "
+        "2026-07-01T15:00:00) and provider (google_calendar or outlook_calendar); "
+        "without those it stays a plain proposal.",
         "parameters": {
             "type": "object",
             "properties": {
-                "title": {"type": "string", "description": "Title of the proposal."},
-                "description": {"type": "string", "description": "Details / plan."},
+                "title": {"type": "string", "description": "Title of the proposal / event."},
+                "description": {"type": "string", "description": "Details / plan / agenda."},
                 "proposal_type": {
                     "type": "string",
                     "enum": ["meeting", "timeline", "reminder"],
                     "description": "Kind of proposal (default meeting).",
+                },
+                "start_time": {
+                    "type": "string",
+                    "description": "ISO 8601 start, e.g. 2026-07-01T15:00:00. Required to "
+                    "make it an approvable calendar event.",
+                },
+                "end_time": {
+                    "type": "string",
+                    "description": "ISO 8601 end, e.g. 2026-07-01T16:00:00.",
+                },
+                "timezone": {"type": "string", "description": "IANA tz, e.g. America/New_York."},
+                "location": {"type": "string", "description": "Event location (optional)."},
+                "attendees": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Attendee email addresses (optional).",
+                },
+                "provider": {
+                    "type": "string",
+                    "enum": ["google_calendar", "outlook_calendar"],
+                    "description": "Which connected calendar to create the event on if approved.",
                 },
             },
             "required": ["title"],
@@ -303,15 +329,76 @@ async def _finalize_run(
 # ---------- Phase 7: confirm-as-interrupt (INTERNAL half — no external firing) ----------
 
 
+def _plus_one_hour(iso: str) -> Optional[str]:
+    """ISO start -> ISO start+60min, preserving the input's naive/aware form. None
+    if unparseable."""
+    try:
+        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+    return (dt + timedelta(hours=1)).isoformat()
+
+
+def _proposal_fields_from_args(args: dict) -> dict:
+    """Map chronos_create_schedule_proposal args -> the canonical calendar event
+    `fields` dict adapter.create_event expects (chat_calendar's shape: title,
+    start_time/end_time as ISO strings, description, location, timezone, attendees).
+    Mirrors chat_calendar.extract_event_fields' backfill: when a start is present,
+    default the timezone (the schema asks the model for a NAIVE local time, which
+    Google rejects and Outlook would read as UTC) and default a 60-minute end (the
+    adapters need both ends), so the fired event lands at the intended local time."""
+    fields: dict = {}
+    for k in ("title", "start_time", "end_time", "location", "description", "timezone"):
+        v = args.get(k)
+        if isinstance(v, str) and v.strip():
+            fields[k] = v.strip()
+    att = args.get("attendees")
+    if isinstance(att, list):
+        emails = [a.strip() for a in att if isinstance(a, str) and a.strip()]
+        if emails:
+            fields["attendees"] = emails
+    if fields.get("start_time"):
+        fields.setdefault("timezone", settings.cora_timezone or "UTC")
+        if not fields.get("end_time"):
+            end = _plus_one_hour(fields["start_time"])
+            if end:
+                fields["end_time"] = end
+    return fields
+
+
 def _collect_staged(steps: list["AgentStep"]) -> list[dict]:
-    """The review-only artifacts this run successfully staged (draft/proposal
-    observations), for the human approval card."""
+    """The review-only artifacts this run successfully staged, for the human
+    approval card. Each item carries enough to FIRE on approve (Phase 7 outward
+    half): a calendar proposal that named a start time + provider (and that yields a
+    complete start+end after backfill) becomes a type='calendar_create' item with
+    its provider + event fields; an email draft is type='email_draft' (never fired —
+    email send stays hard-disabled); anything else has no type and is never fired.
+    Fire fields are read from the staging tool_result step's own recorded arguments
+    (the loop stamps each staging result with its originating call args), so two
+    staging calls in ONE turn never cross-wire and the execution path is untouched."""
     out: list[dict] = []
     for s in steps:
-        if s.kind == "tool_result" and s.detail.get("name") in STAGING_TOOLS:
-            result = str(s.detail.get("result") or "")
-            if result.startswith("✓"):
-                out.append({"tool": s.detail.get("name"), "summary": result[:300]})
+        if s.kind != "tool_result" or s.detail.get("name") not in STAGING_TOOLS:
+            continue
+        name = s.detail.get("name")
+        result = str(s.detail.get("result") or "")
+        if not result.startswith("✓"):
+            continue
+        args = s.detail.get("arguments") or {}
+        item: dict = {"tool": name, "summary": result[:300]}
+        if name == "chronos_create_schedule_proposal":
+            fields = _proposal_fields_from_args(args)
+            provider = (args.get("provider") or "").strip()
+            # Fireable only when we have a complete event (start AND end) and a
+            # provider; otherwise it stays a plain review proposal (no type, never
+            # fired) rather than a guaranteed adapter rejection on approve.
+            if fields.get("start_time") and fields.get("end_time") and provider:
+                item["type"] = "calendar_create"
+                item["provider"] = provider
+                item["fields"] = fields
+        elif name == "signal_create_draft":
+            item["type"] = "email_draft"
+        out.append(item)
     return out
 
 
@@ -340,15 +427,64 @@ async def _pause_run(
         logger.exception("agent run pause failed (continuing)")
 
 
+async def _fire_staged(staged: list[dict], *, user_id, workspace_id) -> list[dict]:
+    """Fire approved staged artifacts through their GATED execution paths (Phase 7
+    outward half). A calendar CREATE goes through chat_calendar.agent_fire_calendar_create,
+    which re-checks the CALENDAR_EXECUTION_ENABLED master gate + per-provider
+    calendar_write flag + connection/scope/token — so nothing is written while that
+    gate is off. Email drafts are NEVER sent (send stays hard-disabled); they are
+    recorded as kept-for-review. Returns one outcome per staged item; never raises."""
+    out: list[dict] = []
+    for item in staged or []:
+        kind = item.get("type")
+        tool = item.get("tool")
+        if kind == "calendar_create":
+            res = await chat_calendar.agent_fire_calendar_create(
+                provider=item.get("provider"), user_id=user_id,
+                workspace_id=_as_uuid(workspace_id), fields=item.get("fields") or {},
+            )
+            out.append({"tool": tool, "type": kind, **res})
+        elif kind == "email_draft":
+            out.append({
+                "tool": tool, "type": kind, "ok": False,
+                "reason": "email send is disabled; the draft is kept for you to review and send",
+            })
+        else:
+            out.append({
+                "tool": tool, "type": kind, "ok": False,
+                "reason": "not an executable artifact (kept as a review proposal)",
+            })
+    return out
+
+
+async def _record_executed(run_id: Optional[uuid.UUID], interrupt: dict) -> None:
+    """Persist execution outcomes back onto the run's interrupt payload (best-effort,
+    after the decision has already committed)."""
+    if run_id is None or clients.db_pool is None:
+        return
+    try:
+        async with clients.db_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE agent_runtime_runs SET interrupt = $2, updated_at = NOW() "
+                "WHERE id = $1",
+                run_id, interrupt,
+            )
+    except Exception:
+        logger.exception("agent run record-executed failed (continuing)")
+
+
 async def resolve_interrupt(
     run_id: uuid.UUID, *, user_id, decision: str, note: Optional[str] = None
 ) -> Optional[dict]:
-    """Record a human approve/reject on a run paused at 'waiting_user' and resume
-    it to a terminal state (approve -> done, reject -> cancelled). RECORDS THE
-    DECISION ONLY — it never sends email or writes a calendar; the real external
-    firing is a separate, deliberately-deferred step under the kill switches.
-    Owner-scoped + atomic; returns the updated run, or None if it is not found /
-    not owned / not actually waiting. decision must be 'approve' or 'reject'."""
+    """Record a human approve/reject on a run paused at 'waiting_user' and resume it
+    to a terminal state (approve -> done, reject -> cancelled). The decision is
+    recorded atomically + owner-scoped. On approve, IF agent_execution_enabled is on
+    (off by default), the staged artifacts are then fired through their existing
+    gated paths (calendar CREATE via _write_gate -> adapter; email is never sent) and
+    each outcome is recorded on the run. With agent_execution_enabled off this records
+    the decision ONLY and fires nothing — the Phase-7 internal behavior. Returns the
+    updated run, or None if it is not found / not owned / not actually waiting.
+    decision must be 'approve' or 'reject'."""
     if clients.db_pool is None:
         return None
     decision = (decision or "").strip().lower()
@@ -359,7 +495,7 @@ async def resolve_interrupt(
         async with conn.transaction():
             row = await conn.fetchrow(
                 """
-                SELECT interrupt FROM agent_runtime_runs
+                SELECT interrupt, workspace_id FROM agent_runtime_runs
                 WHERE id = $1 AND (user_id = $2 OR user_id IS NULL)
                   AND status = 'waiting_user'
                 FOR UPDATE
@@ -369,6 +505,7 @@ async def resolve_interrupt(
             if row is None:
                 return None
             interrupt = dict(row["interrupt"] or {})
+            workspace_id = row["workspace_id"]
             interrupt["decision"] = decision
             interrupt["note"] = note
             await conn.execute(
@@ -380,6 +517,21 @@ async def resolve_interrupt(
                 """,
                 run_id, new_status, interrupt,
             )
+
+    # OUTWARD half: fire AFTER the decision commits (no network call under the
+    # FOR UPDATE lock), only on approve and only when BOTH the interrupt and the
+    # execution flags are on (the compound gate the config docstring documents) —
+    # so a run left waiting from when interrupt was on won't fire if it was since
+    # disabled. The calendar master gate still applies inside the fire helper.
+    if (decision == "approve"
+            and settings.agent_interrupt_enabled
+            and settings.agent_execution_enabled):
+        executed = await _fire_staged(
+            interrupt.get("staged") or [], user_id=user_id, workspace_id=workspace_id
+        )
+        if executed:
+            interrupt["executed"] = executed
+            await _record_executed(run_id, interrupt)
     return await get_run(run_id, user_id=user_id)
 
 
@@ -1053,9 +1205,13 @@ async def run_agent(
                 depth=_depth, parent_run_id=run_id,
             )
             for (name, _args, _kind), observation in zip(turn, observations):
-                steps.append(
-                    AgentStep("tool_result", {"name": name, "result": observation[:500]})
-                )
+                detail = {"name": name, "result": observation[:500]}
+                # Stamp staging results with their own call args so _collect_staged
+                # pairs each staged artifact with the RIGHT fields even when a turn
+                # stages more than one (the loop records all calls before any result).
+                if name in STAGING_TOOLS:
+                    detail["arguments"] = _args
+                steps.append(AgentStep("tool_result", detail))
                 messages.append({"role": "tool", "content": observation})
 
             await _update_run(

@@ -24,6 +24,8 @@ export interface AgentRuntimeConfig {
   delegation_enabled: boolean;
   write_enabled: boolean;
   eval_enabled: boolean;
+  interrupt_enabled: boolean;
+  execution_enabled: boolean;
   max_steps: number;
   max_parallel: number;
   chat_model: string;
@@ -46,12 +48,29 @@ export interface AgentAsyncResponse {
 export interface AgentStagedArtifact {
   tool: string;
   summary: string;
+  // Phase 7 outward half: present when the staged item can be fired on approve.
+  type?: "calendar_create" | "email_draft" | null;
+  provider?: string | null;
+  fields?: Record<string, unknown> | null;
+}
+
+export interface AgentExecutedArtifact {
+  tool?: string;
+  type?: string | null;
+  ok: boolean;
+  reason?: string;
+  event_id?: string | null;
+  title?: string | null;
+  link?: string | null;
 }
 
 export interface AgentInterrupt {
   staged: AgentStagedArtifact[];
   decision: "approve" | "reject" | null;
   note: string | null;
+  // Per-artifact outcomes recorded when an approved run actually fired (only when
+  // AGENT_EXECUTION_ENABLED is on); absent otherwise.
+  executed?: AgentExecutedArtifact[] | null;
 }
 
 export interface AgentRunStep {

@@ -1625,6 +1625,54 @@ async def _handle_confirmation(confirmation, pending, *, session_uuid, user_id, 
                   + (f"\n{ev['link']}" if ev.get("link") else ""))
 
 
+async def agent_fire_calendar_create(*, provider, user_id, workspace_id, fields,
+                                     calendar_id: str = "primary") -> dict:
+    """Gated single calendar CREATE for the agent confirm-as-interrupt approve path
+    (Phase 7 outward half). Mirrors _handle_confirmation's create branch but WITHOUT
+    the session pending store: re-check _write_gate (which enforces the dedicated
+    CALENDAR_EXECUTION_ENABLED master gate + the per-provider calendar_write flag +
+    connection/scope/token), broker the token, fire adapter.create_event. Returns
+    {"ok", "reason", "event_id", "title", "link"} and NEVER raises — the caller
+    records the outcome. This helper cannot write while the calendar master gate is
+    off: the gate is checked here, fail-closed. It does not consult
+    agent_execution_enabled — the caller gates on that BEFORE invoking."""
+    provider = (provider or "").strip()
+    fields = fields or {}
+    try:
+        adapter = calendar_adapters.resolve_calendar_adapter(provider)
+        if adapter is None:
+            return {"ok": False, "reason": f"no calendar adapter for {provider or '(none)'}",
+                    "event_id": None}
+        try:
+            uid = user_id if isinstance(user_id, uuid.UUID) else uuid.UUID(str(user_id))
+        except (ValueError, TypeError):
+            return {"ok": False, "reason": "invalid user id", "event_id": None}
+        decision = await _write_gate(provider, uid, "create")
+        if not decision["allowed"]:
+            await _audit(uid, workspace_id, provider, "create", False,
+                         f"agent approve blocked: {decision['reason']}")
+            return {"ok": False, "reason": decision["reason"], "event_id": None}
+        token = await _get_access_token(provider, uid)
+        if not token:
+            await _audit(uid, workspace_id, provider, "create", False,
+                         "agent approve: no usable token")
+            return {"ok": False, "reason": "no usable access token", "event_id": None}
+        try:
+            ev = await adapter.create_event(access_token=token, fields=fields,
+                                            calendar_id=calendar_id or "primary")
+        except (calendar_adapters.CalendarAccessDisabled,
+                calendar_adapters.CalendarError) as exc:
+            await _audit(uid, workspace_id, provider, "create", False, str(exc) or "adapter error")
+            return {"ok": False, "reason": str(exc) or "adapter disabled", "event_id": None}
+        await _audit(uid, workspace_id, provider, "create", True,
+                     "agent approve create ok", event_ref=ev.get("id"))
+        return {"ok": True, "reason": "created", "event_id": ev.get("id"),
+                "title": ev.get("title"), "link": ev.get("link")}
+    except Exception as exc:  # defensive: the approve path must never crash on a fire
+        logger.exception("agent_fire_calendar_create failed provider=%s", provider)
+        return {"ok": False, "reason": f"unexpected error: {exc}", "event_id": None}
+
+
 async def _create_proposal_fallback(fields, message, *, session_uuid, user_id, workspace_uuid) -> Optional[str]:
     try:
         row = await chronos_tools.create_schedule_proposal(

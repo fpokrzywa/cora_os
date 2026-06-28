@@ -31,6 +31,14 @@ Parts:
      completed) with the pending interrupt; resolve_interrupt is owner-scoped,
      rejects an invalid/no-longer-waiting decision, and resolves approve→done /
      reject→cancelled while recording the decision (NO external effect).
+  J) Confirm-as-interrupt OUTWARD half (Phase 7) — _collect_staged builds a
+     fireable calendar_create item (provider + event fields) from a proposal that
+     named a time + provider, an email_draft item, and NO type for a bare proposal;
+     agent_fire_calendar_create is fail-closed + never raises; resolve_interrupt on
+     approve fires NOTHING while AGENT_EXECUTION_ENABLED is off (do-not-break), and
+     with it on fires ONLY the calendar create (email is never sent) and records the
+     per-artifact outcomes. The real gated fire is spied / unknown-provider here, so
+     this NEVER performs a live calendar write.
 
     docker cp apps/cora-api/scripts/verify_agent_runtime.py cora-api:/tmp/var.py
     docker exec -e PYTHONPATH=/app cora-api python /tmp/var.py   # 0=PASS 1=FAIL
@@ -72,6 +80,9 @@ async def main() -> int:
     deleg_id = None
     pause_run_id = None
     reject_run_id = None
+    fire_run_id = None
+    fire_run_id2 = None
+    fire_run_id3 = None
 
     try:
         # ---- A) Catalog scoping ----
@@ -320,6 +331,170 @@ async def main() -> int:
         expect(bool(rejected) and rejected["status"] == "cancelled",
                "reject resolves the run to cancelled (no external effect)")
 
+        # ---- J) confirm-as-interrupt OUTWARD half (Phase 7) ----
+        # NOTE: the real gated calendar fire is NEVER exercised here — it is either
+        # spied (J5/J6) or invoked with an unknown provider (J4) — so this script
+        # can never perform a live calendar write, even against a DB with a
+        # connected calendar. The live path is confirmed by the operator checklist.
+        print("J) confirm-as-interrupt OUTWARD half")
+        cstaged = ar._collect_staged([
+            ar.AgentStep("tool_result", {
+                "name": "chronos_create_schedule_proposal",
+                "arguments": {"title": "Sync", "start_time": "2026-07-01T15:00:00",
+                              "end_time": "2026-07-01T16:00:00",
+                              "provider": "google_calendar"},
+                "result": "✓ Staged a review-only schedule proposal 'Sync'"}),
+        ])
+        expect(len(cstaged) == 1 and cstaged[0].get("type") == "calendar_create"
+               and cstaged[0].get("provider") == "google_calendar"
+               and cstaged[0].get("fields", {}).get("start_time") == "2026-07-01T15:00:00"
+               and cstaged[0].get("fields", {}).get("timezone"),
+               "_collect_staged builds a fireable calendar_create (+ backfilled timezone)")
+
+        # Backfill: a start with NO end becomes fireable with a defaulted 60-min end.
+        noend = ar._collect_staged([
+            ar.AgentStep("tool_result", {
+                "name": "chronos_create_schedule_proposal",
+                "arguments": {"title": "Sync", "start_time": "2026-07-01T15:00:00",
+                              "provider": "google_calendar"},
+                "result": "✓ Staged a review-only schedule proposal 'Sync'"}),
+        ])
+        expect(len(noend) == 1 and noend[0].get("type") == "calendar_create"
+               and noend[0]["fields"].get("end_time") == "2026-07-01T16:00:00",
+               "a start-only proposal is fired with a defaulted 60-minute end")
+
+        # Two proposals in ONE turn must NOT cross-wire (each result carries its
+        # own args; regression for the name-keyed last-write-wins bug).
+        two = ar._collect_staged([
+            ar.AgentStep("tool_result", {
+                "name": "chronos_create_schedule_proposal",
+                "arguments": {"title": "A", "start_time": "2026-07-01T09:00:00",
+                              "end_time": "2026-07-01T10:00:00",
+                              "provider": "google_calendar"},
+                "result": "✓ Staged a review-only schedule proposal 'A'"}),
+            ar.AgentStep("tool_result", {
+                "name": "chronos_create_schedule_proposal",
+                "arguments": {"title": "B", "start_time": "2026-07-02T09:00:00",
+                              "end_time": "2026-07-02T10:00:00",
+                              "provider": "outlook_calendar"},
+                "result": "✓ Staged a review-only schedule proposal 'B'"}),
+        ])
+        expect(len(two) == 2 and two[0]["provider"] == "google_calendar"
+               and two[1]["provider"] == "outlook_calendar"
+               and two[0]["fields"]["title"] == "A" and two[1]["fields"]["title"] == "B",
+               "two staging calls in one turn keep their own provider/fields (no cross-wire)")
+
+        plain = ar._collect_staged([
+            ar.AgentStep("tool_result", {
+                "name": "chronos_create_schedule_proposal",
+                "arguments": {"title": "Just an idea"},
+                "result": "✓ Staged a review-only schedule proposal 'Just an idea'"}),
+        ])
+        expect(len(plain) == 1 and plain[0].get("type") is None,
+               "a proposal with no time/provider is not fireable (no type)")
+
+        estaged = ar._collect_staged([
+            ar.AgentStep("tool_result", {
+                "name": "signal_create_draft",
+                "result": "✓ Staged a review-only email draft 'X'"}),
+        ])
+        expect(len(estaged) == 1 and estaged[0].get("type") == "email_draft",
+               "an email draft is captured as type email_draft")
+
+        noadapter = await ar.chat_calendar.agent_fire_calendar_create(
+            provider="verify_no_such_provider", user_id=uid, workspace_id=None,
+            fields={"title": "x", "start_time": "2026-07-01T15:00:00"})
+        expect(noadapter["ok"] is False and noadapter.get("event_id") is None,
+               "agent_fire_calendar_create is fail-closed + never raises (unknown provider)")
+
+        fire_items = [
+            {"tool": "chronos_create_schedule_proposal", "summary": "Sync",
+             "type": "calendar_create", "provider": "google_calendar",
+             "fields": {"title": "Sync", "start_time": "2026-07-01T15:00:00"}},
+            {"tool": "signal_create_draft", "summary": "Draft", "type": "email_draft"},
+        ]
+
+        async def _spy(sink):
+            async def _fn(**kw):
+                sink.append(kw)
+                return {"ok": True, "reason": "created", "event_id": "evt_verify",
+                        "title": "Sync", "link": None}
+            return _fn
+
+        orig_fire = ar.chat_calendar.agent_fire_calendar_create
+        prev_exec = settings.agent_execution_enabled
+        prev_intr = settings.agent_interrupt_enabled
+
+        # J5: execution OFF (default) -> approve fires NOTHING (do-not-break).
+        fire_run_id = await ar.create_pending_run(
+            goal="stage+fire off", user_id=uid, session_id=sess, max_steps=6)
+        await ar._pause_run(
+            fire_run_id, answer="x", stopped="final", tool_calls=2, step_count=2,
+            messages=[], steps=[], evaluation=None,
+            interrupt={"staged": fire_items, "decision": None, "note": None})
+        calls_off: list = []
+        ar.chat_calendar.agent_fire_calendar_create = await _spy(calls_off)
+        try:
+            settings.agent_interrupt_enabled = True
+            settings.agent_execution_enabled = False
+            r_off = await ar.resolve_interrupt(
+                fire_run_id, user_id=uid, decision="approve")
+        finally:
+            ar.chat_calendar.agent_fire_calendar_create = orig_fire
+            settings.agent_execution_enabled = prev_exec
+            settings.agent_interrupt_enabled = prev_intr
+        expect(bool(r_off) and r_off["status"] == "done" and not calls_off,
+               "approve with AGENT_EXECUTION_ENABLED off fires nothing (records decision only)")
+        expect((r_off.get("interrupt") or {}).get("executed") is None,
+               "no execution outcomes are recorded when execution is off")
+
+        # J5b: execution ON but interrupt OFF -> compound gate still blocks firing.
+        fire_run_id3 = await ar.create_pending_run(
+            goal="stage+gate", user_id=uid, session_id=sess, max_steps=6)
+        await ar._pause_run(
+            fire_run_id3, answer="x", stopped="final", tool_calls=2, step_count=2,
+            messages=[], steps=[], evaluation=None,
+            interrupt={"staged": fire_items, "decision": None, "note": None})
+        calls_gate: list = []
+        ar.chat_calendar.agent_fire_calendar_create = await _spy(calls_gate)
+        try:
+            settings.agent_interrupt_enabled = False
+            settings.agent_execution_enabled = True
+            r_gate = await ar.resolve_interrupt(
+                fire_run_id3, user_id=uid, decision="approve")
+        finally:
+            ar.chat_calendar.agent_fire_calendar_create = orig_fire
+            settings.agent_execution_enabled = prev_exec
+            settings.agent_interrupt_enabled = prev_intr
+        expect(bool(r_gate) and r_gate["status"] == "done" and not calls_gate,
+               "compound gate: execution on but interrupt off fires nothing")
+
+        # J6: execution ON -> approve fires ONLY the calendar_create; email never sent.
+        fire_run_id2 = await ar.create_pending_run(
+            goal="stage+fire on", user_id=uid, session_id=sess, max_steps=6)
+        await ar._pause_run(
+            fire_run_id2, answer="x", stopped="final", tool_calls=2, step_count=2,
+            messages=[], steps=[], evaluation=None,
+            interrupt={"staged": fire_items, "decision": None, "note": None})
+        calls_on: list = []
+        ar.chat_calendar.agent_fire_calendar_create = await _spy(calls_on)
+        try:
+            settings.agent_interrupt_enabled = True
+            settings.agent_execution_enabled = True
+            r_on = await ar.resolve_interrupt(
+                fire_run_id2, user_id=uid, decision="approve")
+        finally:
+            ar.chat_calendar.agent_fire_calendar_create = orig_fire
+            settings.agent_execution_enabled = prev_exec
+            settings.agent_interrupt_enabled = prev_intr
+        expect(len(calls_on) == 1 and calls_on[0].get("provider") == "google_calendar",
+               "approve with execution on fires ONLY the calendar_create (email never sent)")
+        ex = (r_on.get("interrupt") or {}).get("executed") or []
+        expect(len(ex) == 2
+               and any(e.get("type") == "calendar_create" and e.get("ok") for e in ex)
+               and any(e.get("type") == "email_draft" and e.get("ok") is False for e in ex),
+               "executed records the fired calendar event + the not-sent email draft")
+
         # ---- config sanity ----
         expect(isinstance(settings.agent_runtime_max_steps, int)
                and isinstance(settings.agent_delegation_max_parallel, int),
@@ -336,7 +511,8 @@ async def main() -> int:
                 # delegation create/complete also wrote audit traces for this session
                 await conn.execute(
                     "DELETE FROM runtime_traces WHERE session_id=$1", sess)
-            for rid in (run_id, spoke_run_id, pause_run_id, reject_run_id):
+            for rid in (run_id, spoke_run_id, pause_run_id, reject_run_id,
+                        fire_run_id, fire_run_id2, fire_run_id3):
                 if rid is not None:
                     await conn.execute(
                         "DELETE FROM agent_runtime_runs WHERE id=$1", rid)

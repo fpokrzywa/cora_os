@@ -1298,6 +1298,8 @@ class AgentConfigResponse(BaseModel):
     delegation_enabled: bool
     write_enabled: bool
     eval_enabled: bool
+    interrupt_enabled: bool
+    execution_enabled: bool
     max_steps: int
     max_parallel: int
     chat_model: str
@@ -1320,6 +1322,8 @@ async def chat_agent_config(
         delegation_enabled=settings.agent_delegation_enabled,
         write_enabled=settings.agent_write_enabled,
         eval_enabled=settings.agent_eval_enabled,
+        interrupt_enabled=settings.agent_interrupt_enabled,
+        execution_enabled=settings.agent_execution_enabled,
         max_steps=settings.agent_runtime_max_steps,
         max_parallel=settings.agent_delegation_max_parallel,
         chat_model=settings.dgx_chat_model_name or settings.dgx_model_name or "",
