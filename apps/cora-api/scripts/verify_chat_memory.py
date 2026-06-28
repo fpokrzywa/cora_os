@@ -20,7 +20,11 @@ Parts:
 import sys
 
 from app.agents import scribe
-from app.routers.chat import _rank_fuse_memories
+from app.routers.chat import (
+    CORA_SYSTEM_PROMPT,
+    _format_memory_block,
+    _rank_fuse_memories,
+)
 
 
 def main() -> int:
@@ -118,6 +122,19 @@ def main() -> int:
     expect("kwhit" in [r["id"] for r in kw_only][:5],
            "a keyword-only top hit is not starved by semantic rows")
     expect(_rank_fuse_memories([], [], limit=5) == [], "empty inputs -> []")
+
+    # ---- D) concise-answer framing (style guardrails in the prompt) ----
+    # The model recited the whole stored memory ("Goose is the nickname for my
+    # daughter Cailey Amanda Pokrzywa, born February 29, 2000") instead of answering
+    # the question. These guard that the framing instructing concise, non-recited
+    # answers stays in the prompt.
+    print("D) concise-answer framing")
+    blk = _format_memory_block([{"title": "T", "content": "C"}])
+    expect("do not recite" in blk.lower(),
+           "memory block tells the model not to recite/quote entries")
+    expect("recite stored facts" in CORA_SYSTEM_PROMPT
+           and "one-sentence" in CORA_SYSTEM_PROMPT,
+           "system prompt directs concise, one-sentence factual answers")
 
     print()
     if fails:

@@ -106,8 +106,12 @@ CORA_SYSTEM_PROMPT = (
     "ATLAS is internal architecture: never introduce yourself as ATLAS or say "
     "things like \"I am ATLAS.\" Only mention ATLAS when the user explicitly "
     "asks how Cora works under the hood.\n\n"
-    "Respond helpfully, concisely, and directly. Use prior conversation only "
-    "for context.\n\n"
+    "Respond like a person in conversation: answer ONLY what was asked, in about "
+    "as many words as a person would naturally use, then stop. Do not restate the "
+    "question, pad with unrequested details, or recite stored facts. For a simple "
+    "factual question give a one-sentence answer (e.g. \"Who is Sam?\" -> \"Sam is "
+    "your brother.\") instead of repeating everything you know. Offer more only if "
+    "the user asks. Use prior conversation only for context.\n\n"
     "You cannot save, store, update, or recall long-term memories on your own. "
     "NEVER claim you have remembered, saved, stored, or noted something — the "
     "memory subsystem performs saves and replies with an explicit \"Saved …\" "
@@ -289,7 +293,11 @@ def _rank_fuse_memories(
 
 
 def _format_memory_block(memories: list[dict]) -> str:
-    lines = ["Relevant Cora Memory:"]
+    lines = [
+        "Background knowledge about the user (use ONLY what the question needs; "
+        "do NOT recite, list, or quote these entries, and do not mention that you "
+        "have memory):"
+    ]
     for m in memories:
         # Chunk-sourced rows carry source metadata for citation/grounding.
         cite = ""
