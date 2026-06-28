@@ -1105,6 +1105,8 @@ class AgentRunResponse(BaseModel):
     stopped: str  # final | budget | error
     steps: list[dict]
     evaluation: Optional[dict] = None  # Phase 6 verdict (None unless enabled)
+    status: str = "done"  # done | failed | waiting_user
+    interrupt: Optional[dict] = None  # Phase 7 pending approval (waiting_user)
 
 
 @router.post(
@@ -1138,6 +1140,8 @@ async def chat_agent(
         stopped=result.stopped,
         steps=[{"kind": s.kind, **s.detail} for s in result.steps],
         evaluation=result.evaluation,
+        status=result.status,
+        interrupt=result.interrupt,
     )
 
 
@@ -1240,6 +1244,52 @@ async def chat_agent_get_run(
         )
     # Owner verified above; attach the orchestrator→spoke tree (empty for spokes).
     run["delegations"] = await agent_runtime.get_run_delegations(rid)
+    return run
+
+
+class AgentDecisionRequest(BaseModel):
+    decision: str  # "approve" | "reject"
+    note: Optional[str] = None
+
+
+@router.post(
+    "/chat/agent/runs/{run_id}/decision",
+    summary="Approve/reject a run paused at waiting_user (records the decision ONLY)",
+)
+async def chat_agent_decide(
+    run_id: str,
+    request: AgentDecisionRequest,
+    current: Annotated[CurrentUser, Depends(get_current_user)],
+) -> dict:
+    """Phase 7 confirm-as-interrupt: resolve a run paused for human approval.
+    Records the decision and resumes the run to a terminal state — it does NOT
+    send email or write a calendar (the real external firing stays a separate,
+    deferred step). Owner-scoped; 404 if no such run is awaiting the caller."""
+    if not settings.agent_runtime_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="agent runtime is disabled",
+        )
+    if request.decision not in ("approve", "reject"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="decision must be 'approve' or 'reject'",
+        )
+    try:
+        rid = uuid.UUID(run_id)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="run_id must be a UUID",
+        ) from exc
+    run = await agent_runtime.resolve_interrupt(
+        rid, user_id=current.id, decision=request.decision, note=request.note
+    )
+    if run is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="no run awaiting your decision",
+        )
     return run
 
 

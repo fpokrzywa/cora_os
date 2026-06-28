@@ -26,6 +26,11 @@ Parts:
      _render_eval_input packs goal/answer/trace; evaluate_run is fail-closed
      (None when the flag is off OR endpoint/model unset — no model call); the
      evaluation column round-trips through _finalize_run → get_run.
+  I) Confirm-as-interrupt (Phase 7) — _collect_staged keeps only successful
+     staging observations; _pause_run leaves the run at waiting_user (NOT
+     completed) with the pending interrupt; resolve_interrupt is owner-scoped,
+     rejects an invalid/no-longer-waiting decision, and resolves approve→done /
+     reject→cancelled while recording the decision (NO external effect).
 
     docker cp apps/cora-api/scripts/verify_agent_runtime.py cora-api:/tmp/var.py
     docker exec -e PYTHONPATH=/app cora-api python /tmp/var.py   # 0=PASS 1=FAIL
@@ -65,6 +70,8 @@ async def main() -> int:
     run_id = None
     spoke_run_id = None
     deleg_id = None
+    pause_run_id = None
+    reject_run_id = None
 
     try:
         # ---- A) Catalog scoping ----
@@ -258,6 +265,61 @@ async def main() -> int:
         expect(bool(row3) and (row3.get("evaluation") or {}).get("verdict") == "concerns",
                "_finalize_run persists the evaluation; get_run returns it")
 
+        # ---- I) confirm-as-interrupt (Phase 7) ----
+        print("I) confirm-as-interrupt")
+        staged = ar._collect_staged([
+            ar.AgentStep("tool_result",
+                         {"name": "signal_create_draft",
+                          "result": "✓ Staged a review-only email draft 'X'"}),
+            ar.AgentStep("tool_result",
+                         {"name": "web_search", "result": "✓ not a staging tool"}),
+            ar.AgentStep("tool_result",
+                         {"name": "signal_create_draft",
+                          "result": "error: a draft needs a body."}),
+        ])
+        expect(len(staged) == 1 and staged[0]["tool"] == "signal_create_draft",
+               "_collect_staged keeps only successful staging observations")
+
+        pause_run_id = await ar.create_pending_run(
+            goal="stage + pause", user_id=uid, session_id=sess, max_steps=6)
+        await ar._pause_run(
+            pause_run_id, answer="staged a draft", stopped="final", tool_calls=1,
+            step_count=1, messages=[], steps=[], evaluation=None,
+            interrupt={"staged": staged, "decision": None, "note": None})
+        paused = await ar.get_run(pause_run_id, user_id=uid)
+        expect(bool(paused) and paused["status"] == "waiting_user"
+               and paused["completed_at"] is None,
+               "_pause_run leaves the run at waiting_user (not completed)")
+        expect(bool((paused.get("interrupt") or {}).get("staged")),
+               "the pending interrupt (staged artifacts) is persisted")
+
+        other = await ar.resolve_interrupt(
+            pause_run_id, user_id=uuid.uuid4(), decision="approve")
+        expect(other is None, "resolve_interrupt is owner-scoped (other user -> None)")
+        bad = await ar.resolve_interrupt(pause_run_id, user_id=uid, decision="maybe")
+        expect(bad is None, "resolve_interrupt rejects an invalid decision")
+
+        approved = await ar.resolve_interrupt(
+            pause_run_id, user_id=uid, decision="approve", note="ok")
+        expect(bool(approved) and approved["status"] == "done"
+               and approved["completed_at"] is not None
+               and (approved.get("interrupt") or {}).get("decision") == "approve",
+               "approve resolves the run to done + records the decision")
+        again = await ar.resolve_interrupt(
+            pause_run_id, user_id=uid, decision="approve")
+        expect(again is None, "a run no longer waiting cannot be re-decided")
+
+        reject_run_id = await ar.create_pending_run(
+            goal="stage + reject", user_id=uid, session_id=sess, max_steps=6)
+        await ar._pause_run(
+            reject_run_id, answer="x", stopped="final", tool_calls=0, step_count=0,
+            messages=[], steps=[], evaluation=None,
+            interrupt={"staged": [], "decision": None, "note": None})
+        rejected = await ar.resolve_interrupt(
+            reject_run_id, user_id=uid, decision="reject")
+        expect(bool(rejected) and rejected["status"] == "cancelled",
+               "reject resolves the run to cancelled (no external effect)")
+
         # ---- config sanity ----
         expect(isinstance(settings.agent_runtime_max_steps, int)
                and isinstance(settings.agent_delegation_max_parallel, int),
@@ -274,7 +336,7 @@ async def main() -> int:
                 # delegation create/complete also wrote audit traces for this session
                 await conn.execute(
                     "DELETE FROM runtime_traces WHERE session_id=$1", sess)
-            for rid in (run_id, spoke_run_id):
+            for rid in (run_id, spoke_run_id, pause_run_id, reject_run_id):
                 if rid is not None:
                     await conn.execute(
                         "DELETE FROM agent_runtime_runs WHERE id=$1", rid)

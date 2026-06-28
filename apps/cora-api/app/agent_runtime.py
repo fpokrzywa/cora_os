@@ -152,6 +152,8 @@ class AgentResult:
     stopped: str  # "final" | "budget" | "error"
     run_id: Optional[str] = None
     evaluation: Optional[dict] = None  # Phase 6 verdict (top-level runs only)
+    status: str = "done"  # DB run status: done | failed | waiting_user
+    interrupt: Optional[dict] = None  # Phase 7 pending approval (waiting_user)
 
 
 async def _fetch_tool_row(name: str) -> Optional[dict]:
@@ -298,6 +300,89 @@ async def _finalize_run(
         logger.exception("agent run finalize failed (continuing)")
 
 
+# ---------- Phase 7: confirm-as-interrupt (INTERNAL half — no external firing) ----------
+
+
+def _collect_staged(steps: list["AgentStep"]) -> list[dict]:
+    """The review-only artifacts this run successfully staged (draft/proposal
+    observations), for the human approval card."""
+    out: list[dict] = []
+    for s in steps:
+        if s.kind == "tool_result" and s.detail.get("name") in STAGING_TOOLS:
+            result = str(s.detail.get("result") or "")
+            if result.startswith("✓"):
+                out.append({"tool": s.detail.get("name"), "summary": result[:300]})
+    return out
+
+
+async def _pause_run(
+    run_id: Optional[uuid.UUID], *, answer, stopped, tool_calls, step_count,
+    messages, steps, evaluation, interrupt,
+) -> None:
+    """Pause a run for human approval: status 'waiting_user', completed_at left
+    NULL (it is not finished). Best-effort, like _finalize_run."""
+    if run_id is None or clients.db_pool is None:
+        return
+    try:
+        async with clients.db_pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE agent_runtime_runs
+                SET status = 'waiting_user', answer = $2, stopped = $3,
+                    tool_calls = $4, step_count = $5, messages = $6, steps = $7,
+                    evaluation = $8, interrupt = $9, updated_at = NOW()
+                WHERE id = $1
+                """,
+                run_id, answer, stopped, tool_calls, step_count, messages,
+                _steps_to_json(steps), evaluation, interrupt,
+            )
+    except Exception:
+        logger.exception("agent run pause failed (continuing)")
+
+
+async def resolve_interrupt(
+    run_id: uuid.UUID, *, user_id, decision: str, note: Optional[str] = None
+) -> Optional[dict]:
+    """Record a human approve/reject on a run paused at 'waiting_user' and resume
+    it to a terminal state (approve -> done, reject -> cancelled). RECORDS THE
+    DECISION ONLY — it never sends email or writes a calendar; the real external
+    firing is a separate, deliberately-deferred step under the kill switches.
+    Owner-scoped + atomic; returns the updated run, or None if it is not found /
+    not owned / not actually waiting. decision must be 'approve' or 'reject'."""
+    if clients.db_pool is None:
+        return None
+    decision = (decision or "").strip().lower()
+    if decision not in {"approve", "reject"}:
+        return None
+    new_status = "done" if decision == "approve" else "cancelled"
+    async with clients.db_pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                """
+                SELECT interrupt FROM agent_runtime_runs
+                WHERE id = $1 AND (user_id = $2 OR user_id IS NULL)
+                  AND status = 'waiting_user'
+                FOR UPDATE
+                """,
+                run_id, _as_uuid(user_id),
+            )
+            if row is None:
+                return None
+            interrupt = dict(row["interrupt"] or {})
+            interrupt["decision"] = decision
+            interrupt["note"] = note
+            await conn.execute(
+                """
+                UPDATE agent_runtime_runs
+                SET status = $2, interrupt = $3,
+                    updated_at = NOW(), completed_at = NOW()
+                WHERE id = $1
+                """,
+                run_id, new_status, interrupt,
+            )
+    return await get_run(run_id, user_id=user_id)
+
+
 async def get_run(run_id: uuid.UUID, *, user_id) -> Optional[dict]:
     """Owner-scoped read of a persisted run (legacy NULL owner allowed)."""
     if clients.db_pool is None:
@@ -307,7 +392,7 @@ async def get_run(run_id: uuid.UUID, *, user_id) -> Optional[dict]:
             """
             SELECT id, session_id, user_id, agent_name, status, goal, model_name,
                    answer, tool_calls, step_count, max_steps, stopped,
-                   error_message, steps, evaluation,
+                   error_message, steps, evaluation, interrupt,
                    created_at, updated_at, completed_at
             FROM agent_runtime_runs
             WHERE id = $1 AND (user_id = $2 OR user_id IS NULL)
@@ -1006,15 +1091,33 @@ async def run_agent(
     if _depth == 0 and stopped != "error":
         evaluation = await evaluate_run(goal=message, answer=answer, steps=steps)
 
-    await _finalize_run(
-        run_id,
-        status="failed" if stopped == "error" else "done",
-        answer=answer, stopped=stopped, tool_calls=tool_calls,
-        step_count=step_count, messages=messages, steps=steps, error=error,
-        evaluation=evaluation,
+    # Phase 7: pause a top-level run that STAGED something for human approval
+    # (status 'waiting_user'). Records what is pending — fires NOTHING external.
+    interrupt: Optional[dict] = None
+    final_status = "failed" if stopped == "error" else "done"
+    interrupt_on = (
+        settings.agent_runtime_enabled
+        and settings.agent_write_enabled
+        and settings.agent_interrupt_enabled
     )
+    staged = _collect_staged(steps) if (_depth == 0 and stopped != "error") else []
+    if interrupt_on and staged:
+        interrupt = {"staged": staged, "decision": None, "note": None}
+        final_status = "waiting_user"
+        await _pause_run(
+            run_id, answer=answer, stopped=stopped, tool_calls=tool_calls,
+            step_count=step_count, messages=messages, steps=steps,
+            evaluation=evaluation, interrupt=interrupt,
+        )
+    else:
+        await _finalize_run(
+            run_id, status=final_status, answer=answer, stopped=stopped,
+            tool_calls=tool_calls, step_count=step_count, messages=messages,
+            steps=steps, error=error, evaluation=evaluation,
+        )
     return AgentResult(
         answer=answer or "(no answer)",
         steps=steps, tool_calls=tool_calls, model=model, stopped=stopped,
         run_id=str(run_id) if run_id else None, evaluation=evaluation,
+        status=final_status, interrupt=interrupt,
     )

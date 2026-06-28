@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
+  decideAgentRun,
   getAgentConfig,
   getAgentRun,
   listAgentRuns,
@@ -11,6 +12,7 @@ import {
 import type {
   AgentDelegationNode,
   AgentEvaluation,
+  AgentInterrupt,
   AgentRunDetail,
   AgentRunResponse,
   AgentRunStep,
@@ -67,10 +69,11 @@ function runOk(status: string | null | undefined): boolean {
   return status !== "failed" && status !== "error" && status !== "cancelled";
 }
 
-// Terminal run states — polling stops here (pending/running/waiting_* keep going).
-const TERMINAL_STATUSES = new Set(["done", "failed", "cancelled"]);
-function isTerminal(status: string | null | undefined): boolean {
-  return TERMINAL_STATUSES.has(status ?? "");
+// Statuses still being driven by the worker — keep polling. waiting_user is NOT
+// here: it's the human's turn, so polling stops and the approval card shows.
+const POLLING_STATUSES = new Set(["pending", "running", "waiting_tool"]);
+function isPollable(status: string | null | undefined): boolean {
+  return POLLING_STATUSES.has(status ?? "");
 }
 
 // Independent evaluator verdict (Phase 6) — advisory, review-only.
@@ -97,6 +100,83 @@ function EvaluationCard({ evaluation }: { evaluation: AgentEvaluation }) {
           ))}
         </ul>
       )}
+    </div>
+  );
+}
+
+// Confirm-as-interrupt (Phase 7) — a run paused at waiting_user. Approving
+// records the decision ONLY; it never sends or writes anything.
+function InterruptCard({
+  runId,
+  interrupt,
+  onResolved,
+}: {
+  runId: string;
+  interrupt: AgentInterrupt;
+  onResolved?: () => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [decided, setDecided] = useState<string | null>(interrupt.decision);
+  const [err, setErr] = useState<string | null>(null);
+
+  const decide = async (decision: "approve" | "reject") => {
+    if (busy) return;
+    setBusy(true);
+    setErr(null);
+    try {
+      await decideAgentRun(runId, decision);
+      setDecided(decision);
+      onResolved?.();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Decision failed");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="agent-interrupt">
+      <div className="agent-interrupt__head">⏸ Awaiting your approval</div>
+      <p className="agent-cfg__note">
+        This run staged review-only artifact(s). Your decision is recorded on the
+        run — nothing is sent or written.
+      </p>
+      {interrupt.staged.length > 0 && (
+        <ul className="agent-interrupt__staged">
+          {interrupt.staged.map((s, i) => (
+            <li key={i}>
+              <code>{s.tool}</code> {s.summary}
+            </li>
+          ))}
+        </ul>
+      )}
+      {decided ? (
+        <span
+          className={`agent-verdict agent-verdict--${
+            decided === "approve" ? "pass" : "fail"
+          }`}
+        >
+          {decided}d — recorded (nothing sent)
+        </span>
+      ) : (
+        <div className="agent-interrupt__btns">
+          <button
+            className="btn btn--primary"
+            disabled={busy}
+            onClick={() => decide("approve")}
+          >
+            Approve
+          </button>
+          <button
+            className="btn btn--ghost"
+            disabled={busy}
+            onClick={() => decide("reject")}
+          >
+            Reject
+          </button>
+        </div>
+      )}
+      {err && <div className="chat__error">{err}</div>}
     </div>
   );
 }
@@ -257,6 +337,14 @@ function AgentPanel({ config }: { config: AgentRuntimeConfig | null }) {
             {result.evaluation && (
               <EvaluationCard evaluation={result.evaluation} />
             )}
+            {result.status === "waiting_user" &&
+              result.interrupt &&
+              result.run_id && (
+                <InterruptCard
+                  runId={result.run_id}
+                  interrupt={result.interrupt}
+                />
+              )}
           </div>
         )}
       </section>
@@ -298,6 +386,8 @@ function DelegationNode({ deleg }: { deleg: AgentDelegationNode }) {
 function RunDetail({ runId, poll = false }: { runId: string; poll?: boolean }) {
   const [detail, setDetail] = useState<AgentRunDetail | null>(null);
   const [err, setErr] = useState<string | null>(null);
+  const [reloadKey, setReloadKey] = useState(0);
+  const reload = () => setReloadKey((k) => k + 1);
 
   useEffect(() => {
     let active = true;
@@ -309,8 +399,9 @@ function RunDetail({ runId, poll = false }: { runId: string; poll?: boolean }) {
         .then((d) => {
           if (!active) return;
           setDetail(d);
-          // Keep polling while the run is still in flight (async mode only).
-          if (poll && !isTerminal(d.status)) {
+          // Keep polling while the worker is still driving it (async mode);
+          // stop at waiting_user (the human's turn) and terminal states.
+          if (poll && isPollable(d.status)) {
             timer = setTimeout(tick, 2000);
           }
         })
@@ -324,12 +415,12 @@ function RunDetail({ runId, poll = false }: { runId: string; poll?: boolean }) {
       active = false;
       if (timer) clearTimeout(timer);
     };
-  }, [runId, poll]);
+  }, [runId, poll, reloadKey]);
 
   if (err) return <div className="chat__error">{err}</div>;
   if (!detail) return <div className="agent-cfg__note">Loading run…</div>;
 
-  const live = poll && !isTerminal(detail.status);
+  const live = poll && isPollable(detail.status);
 
   return (
     <div className="agent-cfg__result">
@@ -375,6 +466,13 @@ function RunDetail({ runId, poll = false }: { runId: string; poll?: boolean }) {
         </div>
       )}
       {detail.evaluation && <EvaluationCard evaluation={detail.evaluation} />}
+      {detail.status === "waiting_user" && detail.interrupt && (
+        <InterruptCard
+          runId={detail.id}
+          interrupt={detail.interrupt}
+          onResolved={reload}
+        />
+      )}
     </div>
   );
 }

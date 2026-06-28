@@ -51,6 +51,17 @@ class Settings(BaseSettings):
     agent_eval_enabled: bool = False
     dgx_eval_model_name: str = ""
 
+    # Phase 7 (confirm-as-interrupt, INTERNAL half only). When true (AND
+    # agent_runtime_enabled AND agent_write_enabled), a top-level run that STAGED
+    # a review-only artifact pauses at status 'waiting_user' instead of finishing,
+    # recording what is pending so a human can approve/reject it (POST
+    # /chat/agent/runs/{id}/decision). The decision is recorded at the RUN level
+    # ONLY — it does NOT send email or write a calendar; the real external firing
+    # stays a separate, deliberately-deferred step under the kill switches. The
+    # staged drafts/proposals remain in their existing review-only queues either
+    # way. Fail-closed: off -> runs finish normally (no pause).
+    agent_interrupt_enabled: bool = False
+
     n8n_webhook_health_url: str = "http://n8n:5678/webhook/cora-health"
 
     # Self-hosted SearXNG metasearch — backs PULSE's web_search tool. Internal

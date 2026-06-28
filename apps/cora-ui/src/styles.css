@@ -2901,3 +2901,32 @@ textarea.cora-input {
   font-size: 12.5px;
   color: var(--text-muted);
 }
+
+/* Confirm-as-interrupt approval card (Cora Configuration → Phase 7) */
+.agent-interrupt {
+  margin-top: 12px;
+  border: 1px solid rgba(251, 191, 36, 0.5);
+  border-left-width: 3px;
+  border-radius: 8px;
+  background: var(--bg-elev);
+  padding: 10px 12px;
+}
+.agent-interrupt__head {
+  font-size: 13px;
+  font-weight: 600;
+  color: #fbbf24;
+  margin-bottom: 4px;
+}
+.agent-interrupt__staged {
+  margin: 6px 0 10px;
+  padding-left: 18px;
+  font-size: 12.5px;
+  color: var(--text-muted);
+}
+.agent-interrupt__staged code {
+  color: var(--text);
+}
+.agent-interrupt__btns {
+  display: flex;
+  gap: 8px;
+}

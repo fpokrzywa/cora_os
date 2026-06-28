@@ -273,6 +273,17 @@ export function getAgentRun(runId: string) {
   return request<AgentRunDetail>(`/chat/agent/runs/${encodeURIComponent(runId)}`);
 }
 
+export function decideAgentRun(
+  runId: string,
+  decision: "approve" | "reject",
+  note?: string,
+) {
+  return request<AgentRunDetail>(
+    `/chat/agent/runs/${encodeURIComponent(runId)}/decision`,
+    { method: "POST", body: JSON.stringify({ decision, note: note ?? undefined }) },
+  );
+}
+
 export function getConversation(sessionId: string) {
   return request<ConversationDetail>(`/conversations/${sessionId}`);
 }

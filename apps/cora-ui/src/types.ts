@@ -43,6 +43,17 @@ export interface AgentAsyncResponse {
   status: string;
 }
 
+export interface AgentStagedArtifact {
+  tool: string;
+  summary: string;
+}
+
+export interface AgentInterrupt {
+  staged: AgentStagedArtifact[];
+  decision: "approve" | "reject" | null;
+  note: string | null;
+}
+
 export interface AgentRunStep {
   kind: "tool_call" | "tool_result" | "final" | "error";
   name?: string;
@@ -60,6 +71,8 @@ export interface AgentRunResponse {
   stopped: "final" | "budget" | "error";
   steps: AgentRunStep[];
   evaluation?: AgentEvaluation | null;
+  status: string; // done | failed | waiting_user
+  interrupt?: AgentInterrupt | null;
 }
 
 // ---- Runs / task-manager view (Cora Configuration → Runs) ----
@@ -108,6 +121,7 @@ export interface AgentRunDetail extends AgentRunSummary {
   steps: AgentRunStep[];
   delegations: AgentDelegationNode[];
   evaluation?: AgentEvaluation | null;
+  interrupt?: AgentInterrupt | null;
 }
 
 export interface ConversationSummary {
