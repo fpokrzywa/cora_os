@@ -29,6 +29,8 @@ interface Props {
   onSelectWorkspace: (id: string | null) => void;
   onOpenAdminConsole: () => void;
   adminConsoleActive: boolean;
+  onOpenCoraConfig: () => void;
+  coraConfigActive: boolean;
   impersonating: boolean;
   onStopImpersonating: () => void;
 }
@@ -69,6 +71,8 @@ export function Sidebar({
   onSelectWorkspace,
   onOpenAdminConsole,
   adminConsoleActive,
+  onOpenCoraConfig,
+  coraConfigActive,
   impersonating,
   onStopImpersonating,
 }: Props) {
@@ -335,8 +339,17 @@ export function Sidebar({
         />
       )}
 
-      {canAdmin && !impersonating && (
-        <nav className="sidebar__menu" aria-label="Navigation">
+      <nav className="sidebar__menu" aria-label="Navigation">
+        <button
+          className={`menu-item${coraConfigActive ? " menu-item--active" : ""}`}
+          onClick={onOpenCoraConfig}
+        >
+          <span className="menu-item__icon" aria-hidden>
+            ✦
+          </span>
+          <span className="menu-item__label">Cora Configuration</span>
+        </button>
+        {canAdmin && !impersonating && (
           <button
             className={`menu-item${adminConsoleActive ? " menu-item--active" : ""}`}
             onClick={onOpenAdminConsole}
@@ -347,8 +360,8 @@ export function Sidebar({
             <span className="menu-item__label">Admin Console</span>
             <span className="menu-item__badge">admin</span>
           </button>
-        </nav>
-      )}
+        )}
+      </nav>
 
       {impersonating && (
         <div className="impersonation-banner">

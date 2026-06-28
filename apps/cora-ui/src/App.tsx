@@ -4,6 +4,7 @@ import { ChatPanel } from "./components/ChatPanel";
 import { MemoryViewer } from "./components/MemoryViewer";
 import { Login } from "./components/Login";
 import { AdminConsole } from "./components/AdminConsole";
+import { CoraConfiguration } from "./components/CoraConfiguration";
 import { listWorkspaces } from "./api";
 import { setScreenView } from "./screenContext";
 import type { Workspace } from "./types";
@@ -32,7 +33,7 @@ import type {
   User,
 } from "./types";
 
-type ViewMode = "chat" | "admin-console";
+type ViewMode = "chat" | "admin-console" | "cora-config";
 
 export function App() {
   const [user, setUser] = useState<User | null>(null);
@@ -375,6 +376,8 @@ export function App() {
         onSelectWorkspace={setCurrentWorkspaceId}
         onOpenAdminConsole={() => setViewMode("admin-console")}
         adminConsoleActive={viewMode === "admin-console"}
+        onOpenCoraConfig={() => setViewMode("cora-config")}
+        coraConfigActive={viewMode === "cora-config"}
         impersonating={impersonating}
         onStopImpersonating={handleStopImpersonating}
       />
@@ -388,6 +391,8 @@ export function App() {
             listWorkspaces().then(setWorkspaces).catch(() => {})
           }
         />
+      ) : viewMode === "cora-config" ? (
+        <CoraConfiguration standalone />
       ) : (
         <ChatPanel
           messages={messages}

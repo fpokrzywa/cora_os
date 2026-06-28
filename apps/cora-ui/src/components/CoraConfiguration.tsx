@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { setScreenView } from "../screenContext";
 import {
   decideAgentRun,
   getAgentConfig,
@@ -556,9 +557,19 @@ function AgentRuns() {
   );
 }
 
-export function CoraConfiguration({ sub }: { sub?: string }) {
+// In the Admin Console, AdminConsole's outer bar drives the Agent/Runs sub-tabs
+// and passes `sub`. Rendered standalone (the sidebar entry open to every user),
+// this owns its own sub-tab row + screen-context reporting.
+export function CoraConfiguration({
+  sub,
+  standalone = false,
+}: {
+  sub?: string;
+  standalone?: boolean;
+}) {
   const [config, setConfig] = useState<AgentRuntimeConfig | null>(null);
   const [cfgErr, setCfgErr] = useState<string | null>(null);
+  const [localSub, setLocalSub] = useState("agent");
 
   useEffect(() => {
     getAgentConfig()
@@ -567,6 +578,20 @@ export function CoraConfiguration({ sub }: { sub?: string }) {
         setCfgErr(e instanceof Error ? e.message : "Failed to load config"),
       );
   }, []);
+
+  const activeSub = standalone ? localSub : sub;
+
+  // Report the active screen so chat can answer "what am I looking at?". Only in
+  // standalone mode — the Admin Console reports its own tab/sub-tab state.
+  useEffect(() => {
+    if (!standalone) return;
+    const isRuns = activeSub === "runs";
+    setScreenView(
+      "cora-config",
+      isRuns ? "cora-config/runs" : "cora-config/agent",
+      `Cora Configuration · ${isRuns ? "Runs" : "Agent"}`,
+    );
+  }, [standalone, activeSub]);
 
   return (
     <div className="admin">
@@ -578,9 +603,31 @@ export function CoraConfiguration({ sub }: { sub?: string }) {
         </p>
       </header>
 
+      {standalone && (
+        <nav
+          className="admin-console__subtabs"
+          aria-label="Cora Configuration sections"
+        >
+          {[
+            { key: "agent", label: "Agent" },
+            { key: "runs", label: "Runs" },
+          ].map((s) => (
+            <button
+              key={s.key}
+              className={`admin-console__subtab${
+                activeSub === s.key ? " admin-console__subtab--active" : ""
+              }`}
+              onClick={() => setLocalSub(s.key)}
+            >
+              {s.label}
+            </button>
+          ))}
+        </nav>
+      )}
+
       {cfgErr && <div className="chat__error">{cfgErr}</div>}
 
-      {sub === "runs" ? <AgentRuns /> : <AgentPanel config={config} />}
+      {activeSub === "runs" ? <AgentRuns /> : <AgentPanel config={config} />}
     </div>
   );
 }
