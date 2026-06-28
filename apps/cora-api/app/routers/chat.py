@@ -78,6 +78,9 @@ from app.jobs import JobError, create_job
 
 MEMORY_SEARCH_LIMIT = 20
 MEMORIES_IN_PROMPT = 5
+# Cap each injected memory's content so one long entry (e.g. a whole pasted
+# conversation saved as one memory) can't bloat the prompt and slow prefill.
+MEMORY_CONTENT_CHARS = 400
 # Reciprocal Rank Fusion constant for merging semantic + keyword recall. The
 # standard k=60 keeps any single list's top item from dominating, so a strong
 # keyword hit (e.g. an exact nickname) co-ranks with the top semantic hits.
@@ -320,7 +323,10 @@ def _format_memory_block(memories: list[dict]) -> str:
                 bits.append(f"chunk #{m['chunk_index']}")
             if bits:
                 cite = f" ({' · '.join(bits)})"
-        lines.append(f"- [{m['title']}]{cite} {m['content']}")
+        content = m["content"]
+        if len(content) > MEMORY_CONTENT_CHARS:
+            content = content[:MEMORY_CONTENT_CHARS].rstrip() + "…"
+        lines.append(f"- [{m['title']}]{cite} {content}")
     return "\n".join(lines)
 
 
@@ -3369,6 +3375,7 @@ async def chat(
                     "model": settings.dgx_model_name,
                     "prompt": prompt,
                     "stream": False,
+                    "keep_alive": settings.dgx_keep_alive,
                 },
             )
             ollama_response.raise_for_status()

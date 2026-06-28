@@ -139,6 +139,9 @@ def main() -> int:
            "memory block pins second-person voice (you/your, not I/my/we)")
     expect("address the user as" in CORA_SYSTEM_PROMPT,
            "system prompt pins second-person address (never speak as the user)")
+    long_blk = _format_memory_block([{"title": "T", "content": "x" * 5000}])
+    expect(long_blk.count("x") <= 400 and long_blk.rstrip().endswith("…"),
+           "memory block caps a long entry's content (prefill stays small)")
 
     print()
     if fails:

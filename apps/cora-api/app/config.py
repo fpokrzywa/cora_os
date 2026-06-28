@@ -16,6 +16,11 @@ class Settings(BaseSettings):
     # agent_runtime_enabled is true, and only the curated READ-ONLY catalog is
     # reachable. max_steps bounds the reason→act→observe loop.
     dgx_chat_model_name: str = ""
+    # How long the DGX (Ollama) keeps the chat model loaded after a request. The
+    # default 5m means sporadic chats reload the model AND lose the prompt cache,
+    # paying a full cold prefill (~15s) every time. Keep it warm so warm prefill
+    # (~0.3s) is the norm; "-1" pins it loaded indefinitely.
+    dgx_keep_alive: str = "30m"
     agent_runtime_enabled: bool = False
     agent_runtime_max_steps: int = 6
 
