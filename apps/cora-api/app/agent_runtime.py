@@ -673,7 +673,117 @@ def _parse_args(raw: Any) -> dict:
     return {}
 
 
-async def _chat(endpoint: str, model: str, messages: list[dict], tools: list[dict]) -> dict:
+def _agent_backend() -> str:
+    """Which inference backend the agent tool-loop (and its evaluator) talk to:
+    'ollama' (DGX native /api/chat, default) or 'openai' (an OpenAI-compatible
+    server such as vLLM). Independent of the chat-route backend (dgx_chat_backend)
+    so the loop migrates/rolls back on its own. Fail-safe default ollama."""
+    return (settings.dgx_agent_backend or "ollama").strip().lower()
+
+
+def _agent_endpoint() -> str:
+    if _agent_backend() == "openai":
+        return (settings.dgx_openai_endpoint or "").rstrip("/")
+    return (settings.dgx_model_endpoint or "").rstrip("/")
+
+
+def _agent_model() -> str:
+    if _agent_backend() == "openai":
+        return settings.dgx_openai_model or ""
+    return settings.dgx_chat_model_name or settings.dgx_model_name or ""
+
+
+def _to_openai_messages(messages: list[dict]) -> list[dict]:
+    """Translate the canonical (Ollama-shaped) running thread into OpenAI
+    chat-completions messages. Synthesizes deterministic tool_call ids and pairs
+    each following 'tool' message to the call it answers, IN ORDER — which the loop
+    guarantees: an n-call assistant turn is immediately followed by its n results in
+    call order. Ollama tool-call arguments are objects; OpenAI wants a JSON string,
+    so dict arguments are dumped (string arguments pass through)."""
+    out: list[dict] = []
+    pending_ids: list[str] = []
+    turn_idx = 0
+    for m in messages:
+        role = m.get("role")
+        calls = m.get("tool_calls") if role == "assistant" else None
+        if calls:
+            pending_ids = []
+            oai_calls = []
+            for j, c in enumerate(calls):
+                cid = f"call_{turn_idx}_{j}"
+                pending_ids.append(cid)
+                fn = (c or {}).get("function") or {}
+                args = fn.get("arguments")
+                arg_str = args if isinstance(args, str) else json.dumps(args or {}, default=str)
+                oai_calls.append(
+                    {
+                        "id": cid,
+                        "type": "function",
+                        "function": {"name": fn.get("name") or "", "arguments": arg_str},
+                    }
+                )
+            out.append(
+                {"role": "assistant", "content": m.get("content") or "", "tool_calls": oai_calls}
+            )
+            turn_idx += 1
+        elif role == "tool":
+            cid = pending_ids.pop(0) if pending_ids else f"call_{turn_idx}_x"
+            out.append({"role": "tool", "tool_call_id": cid, "content": m.get("content") or ""})
+        else:
+            out.append({"role": role, "content": m.get("content") or ""})
+    return out
+
+
+def _normalize_openai_response(data: dict) -> dict:
+    """Normalize an OpenAI chat-completions response into the Ollama-shaped
+    {"message": {content, tool_calls:[{function:{name, arguments}}]}} the loop and
+    evaluator consume. Drops tool_call id/type; arguments stay a JSON string
+    (_parse_args handles both str and dict)."""
+    try:
+        msg = (data.get("choices") or [])[0].get("message") or {}
+    except (IndexError, AttributeError, TypeError):
+        return {"message": {"content": ""}}
+    norm: dict = {"content": msg.get("content") or ""}
+    raw = msg.get("tool_calls") or []
+    if raw:
+        norm["tool_calls"] = [
+            {
+                "function": {
+                    "name": ((c or {}).get("function") or {}).get("name") or "",
+                    "arguments": ((c or {}).get("function") or {}).get("arguments") or "",
+                }
+            }
+            for c in raw
+        ]
+    return {"message": norm}
+
+
+async def _chat(
+    backend: str, endpoint: str, model: str, messages: list[dict], tools: list[dict]
+) -> dict:
+    """One model turn against the active agent backend, returned in the canonical
+    Ollama shape {"message": {...}} regardless of backend. The OpenAI path posts to
+    /chat/completions (thread translated, tool ids synthesized) and normalizes the
+    reply back; the Ollama path is unchanged."""
+    if backend == "openai":
+        payload: dict = {
+            "model": model,
+            "messages": _to_openai_messages(messages),
+            "temperature": 0,
+        }
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
+        headers = {"Content-Type": "application/json"}
+        if settings.dgx_openai_api_key:
+            headers["Authorization"] = f"Bearer {settings.dgx_openai_api_key}"
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            resp = await client.post(
+                f"{endpoint}/chat/completions", json=payload, headers=headers
+            )
+            resp.raise_for_status()
+            return _normalize_openai_response(resp.json())
+
     async with httpx.AsyncClient(timeout=120.0) as client:
         resp = await client.post(
             f"{endpoint}/api/chat",
@@ -1025,12 +1135,12 @@ async def evaluate_run(
     evaluation is disabled/unconfigured/failed (never raises)."""
     if not settings.agent_eval_enabled:
         return None
-    endpoint = (settings.dgx_model_endpoint or "").rstrip("/")
-    model = (
-        (settings.dgx_eval_model_name or "").strip()
-        or settings.dgx_chat_model_name
-        or settings.dgx_model_name
-    )
+    backend = _agent_backend()
+    endpoint = _agent_endpoint()
+    # The evaluator follows the agent backend (same server). Its optional independent
+    # judge model must be one THAT backend serves; otherwise it falls back to the
+    # backend's agent model. On ollama this matches the prior fallback chain exactly.
+    model = (settings.dgx_eval_model_name or "").strip() or _agent_model()
     if not endpoint or not model:
         return None
     messages = [
@@ -1038,7 +1148,7 @@ async def evaluate_run(
         {"role": "user", "content": _render_eval_input(goal, answer, steps)},
     ]
     try:
-        data = await _chat(endpoint, model, messages, [])  # no tools — judge only
+        data = await _chat(backend, endpoint, model, messages, [])  # no tools — judge only
     except Exception:
         logger.exception("evaluator chat call failed (continuing without a verdict)")
         return None
@@ -1098,8 +1208,9 @@ async def run_agent(
 
     When run_id is given, the loop binds to that pre-created 'pending' row
     (Phase 3 worker-driven run) instead of creating a fresh one."""
-    endpoint = (settings.dgx_model_endpoint or "").rstrip("/")
-    model = settings.dgx_chat_model_name or settings.dgx_model_name
+    backend = _agent_backend()
+    endpoint = _agent_endpoint()
+    model = _agent_model()
     if not endpoint or not model:
         if run_id is not None:  # don't strand a bound 'pending' row
             await _finalize_run(
@@ -1162,7 +1273,7 @@ async def run_agent(
     try:
         for _ in range(budget):
             step_count += 1
-            data = await _chat(endpoint, model, messages, catalog)
+            data = await _chat(backend, endpoint, model, messages, catalog)
             msg = data.get("message") or {}
             raw_calls = msg.get("tool_calls") or []
             # Keep the assistant turn (with any tool_calls) in the running thread.
@@ -1221,7 +1332,7 @@ async def run_agent(
         else:
             # Budget exhausted: one final no-tools pass so gathered work isn't lost.
             data = await _chat(
-                endpoint, model,
+                backend, endpoint, model,
                 messages + [{
                     "role": "user",
                     "content": "Give your best final answer now from what you've "

@@ -30,6 +30,12 @@ class Settings(BaseSettings):
     dgx_openai_endpoint: str = ""   # e.g. http://spark-a84c:8000/v1
     dgx_openai_model: str = ""      # e.g. openai/gpt-oss-120b
     dgx_openai_api_key: str = ""    # optional; vLLM usually needs none
+    # Inference backend for the agent-runtime TOOL LOOP (and its evaluator):
+    # "ollama" (DGX native /api/chat, default) or "openai" (an OpenAI-compatible
+    # server such as vLLM, reusing dgx_openai_endpoint/model). Independent of
+    # dgx_chat_backend so the loop migrates/rolls back on its own. Fail-safe default
+    # ollama — a fresh .env keeps the proven behavior until flipped. See app/agent_runtime.py.
+    dgx_agent_backend: str = "ollama"
     agent_runtime_enabled: bool = False
     agent_runtime_max_steps: int = 6
 

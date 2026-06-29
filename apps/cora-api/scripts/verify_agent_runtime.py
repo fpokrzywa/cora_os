@@ -39,6 +39,13 @@ Parts:
      with it on fires ONLY the calendar create (email is never sent) and records the
      per-artifact outcomes. The real gated fire is spied / unknown-provider here, so
      this NEVER performs a live calendar write.
+  K) Backend selection + OpenAI/vLLM bridge (tool-loop migration) — _agent_backend
+     defaults to ollama (DGX endpoint + chat model) and selects the vLLM endpoint +
+     model when dgx_agent_backend='openai'; _to_openai_messages translates the
+     canonical thread (synthesized tool_call ids, object args -> JSON string, each
+     tool result paired to its call in order); _normalize_openai_response maps a
+     chat-completions reply back to the Ollama-shaped {"message": {...}} the loop
+     reads (and is null-safe on a malformed body). No network is touched.
 
     docker cp apps/cora-api/scripts/verify_agent_runtime.py cora-api:/tmp/var.py
     docker exec -e PYTHONPATH=/app cora-api python /tmp/var.py   # 0=PASS 1=FAIL
@@ -499,6 +506,75 @@ async def main() -> int:
         expect(isinstance(settings.agent_runtime_max_steps, int)
                and isinstance(settings.agent_delegation_max_parallel, int),
                "agent runtime config values are present")
+
+        # ---- K) backend selection + OpenAI/vLLM bridge (tool loop migration) ----
+        print("K) agent backend selection + openai bridge")
+        prev = (settings.dgx_agent_backend, settings.dgx_openai_endpoint,
+                settings.dgx_openai_model, settings.dgx_chat_model_name,
+                settings.dgx_model_name, settings.dgx_model_endpoint)
+        try:
+            settings.dgx_agent_backend = ""
+            settings.dgx_model_endpoint = "http://dgx:11434"
+            settings.dgx_chat_model_name = "cora-qwen3:4b"
+            expect(ar._agent_backend() == "ollama"
+                   and ar._agent_endpoint() == "http://dgx:11434"
+                   and ar._agent_model() == "cora-qwen3:4b",
+                   "unset backend defaults to ollama (DGX endpoint + chat model)")
+            settings.dgx_agent_backend = "openai"
+            settings.dgx_openai_endpoint = "http://spark-a84c:8000/v1"
+            settings.dgx_openai_model = "openai/gpt-oss-120b"
+            expect(ar._agent_backend() == "openai"
+                   and ar._agent_endpoint() == "http://spark-a84c:8000/v1"
+                   and ar._agent_model() == "openai/gpt-oss-120b",
+                   "openai backend selects the vLLM endpoint + model")
+        finally:
+            (settings.dgx_agent_backend, settings.dgx_openai_endpoint,
+             settings.dgx_openai_model, settings.dgx_chat_model_name,
+             settings.dgx_model_name, settings.dgx_model_endpoint) = prev
+
+        # The canonical (Ollama-shaped) running thread -> OpenAI messages: ids are
+        # synthesized and each tool result is paired to its call IN ORDER, and
+        # object arguments become a JSON string.
+        thread = [
+            {"role": "system", "content": "S"},
+            {"role": "user", "content": "U"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"function": {"name": "t1", "arguments": {"a": 1}}},
+                {"function": {"name": "t2", "arguments": {"b": 2}}},
+            ]},
+            {"role": "tool", "content": "obs1"},
+            {"role": "tool", "content": "obs2"},
+            {"role": "assistant", "content": "done"},
+        ]
+        oai = ar._to_openai_messages(thread)
+        a_turn = oai[2]
+        expect(a_turn["role"] == "assistant" and len(a_turn["tool_calls"]) == 2
+               and a_turn["tool_calls"][0]["id"] == "call_0_0"
+               and a_turn["tool_calls"][1]["id"] == "call_0_1"
+               and a_turn["tool_calls"][0]["type"] == "function",
+               "assistant tool_calls get synthesized ids")
+        expect(ar._parse_args(a_turn["tool_calls"][0]["function"]["arguments"]) == {"a": 1},
+               "object tool-call arguments are serialized to a JSON string")
+        expect(oai[3] == {"role": "tool", "tool_call_id": "call_0_0", "content": "obs1"}
+               and oai[4]["tool_call_id"] == "call_0_1",
+               "each tool result is paired to its call id in order")
+        expect(oai[0] == {"role": "system", "content": "S"}
+               and oai[5] == {"role": "assistant", "content": "done"},
+               "system/user and a tool-less assistant turn pass through unchanged")
+
+        # An OpenAI chat-completions reply -> canonical {"message": {...}} the loop reads.
+        resp = {"choices": [{"message": {"content": "hi", "tool_calls": [
+            {"id": "call_x", "type": "function",
+             "function": {"name": "web_search", "arguments": "{\"q\": \"x\"}"}},
+        ]}}]}
+        norm = ar._normalize_openai_response(resp)["message"]
+        expect(norm["content"] == "hi"
+               and norm["tool_calls"][0]["function"]["name"] == "web_search"
+               and ar._parse_args(norm["tool_calls"][0]["function"]["arguments"]) == {"q": "x"},
+               "openai response normalizes to the Ollama-shaped message + tool_calls")
+        expect(ar._normalize_openai_response({})["message"] == {"content": ""}
+               and ar._normalize_openai_response({"choices": []})["message"] == {"content": ""},
+               "a malformed/empty openai response normalizes to empty content (no raise)")
 
     finally:
         # Clean up the disposable rows we created.
