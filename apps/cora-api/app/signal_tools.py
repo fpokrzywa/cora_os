@@ -6,6 +6,7 @@ governed `internal_action` runner / chat-trigger may call create_communication_d
 """
 
 import logging
+import re
 import uuid
 from typing import Optional
 
@@ -35,6 +36,54 @@ def _require_pool():
     if clients.db_pool is None:
         raise SignalToolError("Postgres pool unavailable", code="unavailable")
     return clients.db_pool
+
+
+# Email sign-off normalization. A draft written for the user must close with the
+# user's name (or the Cora fallback), NEVER an internal agent codename like SIGNAL —
+# the draft body is the model reply verbatim, so a stray "Best regards, SIGNAL" would
+# otherwise ship. Shared by the chat-route SIGNAL path AND the email lifecycle.
+SIGNOFF_FALLBACK = "Cora - the AI Assistant"
+
+_EMAIL_CLOSINGS = sorted(
+    ("best regards", "kind regards", "warm regards", "warmest regards", "best wishes",
+     "many thanks", "thank you", "thanks again", "talk soon", "respectfully",
+     "sincerely", "regards", "cheers", "warmly", "thanks", "best"),
+    key=len, reverse=True,  # longest-first so 'best regards' wins over 'best'
+)
+_SIGNOFF_RE = re.compile(
+    r"(?is)\n[ \t]*(" + "|".join(re.escape(c) for c in _EMAIL_CLOSINGS)
+    + r")[ \t]*,?[ \t]*\n+.*\Z"
+)
+
+
+def normalize_email_signoff(body: str, signoff_name: str) -> str:
+    """Force an email body to close with `signoff_name`, never an internal agent
+    codename. Replaces the model's signatory block under any common closing, or
+    appends a clean closing when none is present. Idempotent."""
+    text = (body or "").rstrip()
+    if not text:
+        return text
+    m = _SIGNOFF_RE.search(text)
+    if m:
+        closing = m.group(1).strip()
+        closing = closing[:1].upper() + closing[1:]
+        return text[: m.start()].rstrip() + f"\n\n{closing},\n{signoff_name}"
+    return text + f"\n\nBest regards,\n{signoff_name}"
+
+
+async def user_signoff_name(user_id: uuid.UUID) -> str:
+    """The user's display name for email sign-offs, or the Cora fallback. Never
+    raises — a lookup failure falls back too."""
+    if clients.db_pool is not None:
+        try:
+            async with clients.db_pool.acquire() as conn:
+                name = await conn.fetchval(
+                    "SELECT display_name FROM users WHERE id = $1", user_id)
+            if name and name.strip():
+                return name.strip()
+        except Exception:
+            logger.exception("user signoff-name lookup failed; using fallback")
+    return SIGNOFF_FALLBACK
 
 
 async def create_communication_draft(

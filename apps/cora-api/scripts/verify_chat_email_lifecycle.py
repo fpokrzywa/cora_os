@@ -74,6 +74,14 @@ async def main() -> int:
         ctx = await cel.get_context(sess)
         did = ctx.get("current_active_draft_id")
         expect(did is not None, "create set current_active_draft_id")
+        # Sign-off normalization (the real path): no internal agent codename in the
+        # body, and a clean sign-off applied (fallback name — this test user has no
+        # display_name). The strip/append logic itself is covered exhaustively in
+        # verify_chat_signal_signoff.py.
+        d0 = await signal_tools.get_draft(did)
+        expect(d0 and "SIGNAL" not in (d0["body"] or "")
+               and "Cora - the AI Assistant" in (d0["body"] or ""),
+               "created draft body is sign-off-normalized (no agent codename)")
 
         # 2. revise (ambiguous follow-up resolved via context)
         h, txt = await run("Make it shorter and warmer.")

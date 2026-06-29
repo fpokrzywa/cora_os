@@ -311,8 +311,10 @@ async def _h_create(*, message, session_uuid, user_id, workspace_uuid, scope_typ
                 status="denied", error_message=decision.reason)
             return f"_Saving a draft isn't permitted by the current policy ({decision.reason})._"
     prompt = (
-        "You are SIGNAL, drafting an internal email for review (it will NOT be sent). "
-        "Write a professional email based on this request. Output EXACTLY a line "
+        "You are drafting an internal email on the user's behalf for review (it will "
+        "NOT be sent). Write a professional email based on this request. Do NOT sign "
+        "the email with an internal/agent name (Cora, ATLAS, SIGNAL, etc.); if you add "
+        "a closing, sign with the user's own name. Output EXACTLY a line "
         "'Subject: <subject>', then if a recipient is named a line 'To: <name>', then a "
         "blank line, then the email body. Request: " + message)
     started = time.perf_counter()
@@ -322,6 +324,8 @@ async def _h_create(*, message, session_uuid, user_id, workspace_uuid, scope_typ
         logger.exception("chat email create generation failed")
         return f"_I couldn't draft the email right now ({exc})._"
     fields = _extract_fields(text, fallback_title=message)
+    fields["body"] = signal_tools.normalize_email_signoff(
+        fields["body"], await signal_tools.user_signoff_name(user_id))
     row = await signal_tools.create_communication_draft(
         workspace_id=workspace_uuid, user_id=user_id, draft_type="email",
         title=fields["title"], subject=fields["subject"], body=fields["body"],
@@ -352,6 +356,8 @@ async def _h_revise(draft, *, message, session_uuid, user_id, workspace_uuid, sc
     except Exception as exc:
         return f"_I couldn't revise the draft right now ({exc})._"
     fields = _extract_fields(revised, fallback_title=draft.get("title") or "")
+    fields["body"] = signal_tools.normalize_email_signoff(
+        fields["body"], await signal_tools.user_signoff_name(user_id))
     meta = dict(draft.get("metadata") or {})
     history = list(meta.get("revision_history") or [])
     history.append({"body": draft.get("body"), "subject": draft.get("subject")})

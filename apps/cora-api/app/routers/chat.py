@@ -127,7 +127,10 @@ CORA_SYSTEM_PROMPT = (
     "confirmation, separate from you. If the user asks you to remember something "
     "and you did not just see such a confirmation, tell them to say \"remember "
     "that …\" or \"save this to memory\" so it is actually stored; do not pretend "
-    "it was saved."
+    "it was saved.\n\n"
+    "When you draft an email on the user's behalf, do NOT sign it with an internal "
+    "name (Cora, ATLAS, SIGNAL, or any agent name). If you add a closing, sign with "
+    "the user's own name; the system appends the correct signature."
 )
 
 # Specialist subagents ATLAS can route to, with their Python-constant fallback
@@ -748,7 +751,7 @@ def _first_line_title(text: str, fallback: str) -> str:
     return fallback.strip()[:200] or "Untitled"
 
 
-def _extract_signal_fields(user_message: str, response: str) -> dict:
+def _extract_signal_fields(user_message: str, response: str, signoff_name: str) -> dict:
     subj_m = _SUBJECT_RE.search(response)
     subject = subj_m.group(1).strip()[:300] if subj_m else None
     recip_m = _RECIPIENT_RE.search(response)
@@ -759,7 +762,7 @@ def _extract_signal_fields(user_message: str, response: str) -> dict:
         "title": title,
         "subject": subject,
         "recipient_hint": recipient_hint,
-        "body": response,
+        "body": signal_tools.normalize_email_signoff(response, signoff_name),
         "tone": None,
     }
 
@@ -828,7 +831,8 @@ async def maybe_create_signal_draft_from_chat(
             "above for you to copy._"
         )
 
-    fields = _extract_signal_fields(user_message, response)
+    signoff_name = await signal_tools.user_signoff_name(user_id)
+    fields = _extract_signal_fields(user_message, response, signoff_name)
     logger.info(
         "chat-to-draft SIGNAL: invoking %s session=%s title=%r",
         tool_name, session_uuid, fields["title"],
