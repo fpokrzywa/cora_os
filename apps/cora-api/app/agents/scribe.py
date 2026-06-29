@@ -447,6 +447,46 @@ async def fetch_memory_for_mutation(memory_id: uuid.UUID) -> Optional[dict]:
     return dict(row) if row else None
 
 
+async def resolve_memory_id_prefix(
+    ref: str, *, user_id: uuid.UUID, is_admin: bool
+) -> dict:
+    """Resolve a short hex id prefix (the 8-char id `show memories` prints, or any
+    leading slice of a memory UUID) to a single entry the requester may see.
+
+    The prefix is matched only within the requester's VISIBLE set — global + their
+    own user-scoped + legacy-NULL rows (admins see all) — so it can neither resolve
+    to, nor be rendered ambiguous by, another user's private memory. Visibility here
+    mirrors _memory_visible_to in routers.chat.
+
+    Returns one of:
+      {"status": "ok", "id": UUID}
+      {"status": "not_found"}
+      {"status": "ambiguous"}   # >1 visible match — caller asks for more characters
+    """
+    if clients.db_pool is None:
+        return {"status": "not_found"}
+    like = ref.lower() + "%"
+    if is_admin:
+        sql = "SELECT id FROM memory_entries WHERE id::text LIKE $1 ORDER BY id LIMIT 2"
+        args = (like,)
+    else:
+        sql = (
+            "SELECT id FROM memory_entries "
+            "WHERE id::text LIKE $1 "
+            "  AND ( scope_type = 'global' "
+            "        OR (scope_type = 'user' AND (scope_id = $2 OR scope_id IS NULL)) ) "
+            "ORDER BY id LIMIT 2"
+        )
+        args = (like, user_id)
+    async with clients.db_pool.acquire() as conn:
+        rows = await conn.fetch(sql, *args)
+    if not rows:
+        return {"status": "not_found"}
+    if len(rows) > 1:
+        return {"status": "ambiguous"}
+    return {"status": "ok", "id": rows[0]["id"]}
+
+
 async def delete_memory_entry(memory_id: uuid.UUID) -> bool:
     if clients.db_pool is None:
         return False

@@ -167,6 +167,31 @@ def main() -> int:
     finally:
         _s.dgx_chat_backend, _s.dgx_openai_endpoint, _s.dgx_openai_model = prev
 
+    # ---- F) delete/update accept the short id prefix `show memories` prints ----
+    # The bug: `show memories` printed an 8-char id but delete/update required a full
+    # UUID (uuid.UUID parse), so the short id round-tripped to "provide the full UUID".
+    # The matcher already captures 8–36 hex chars; DB resolution of a prefix to a full
+    # id (resolve_memory_id_prefix) is exercised live in-app.
+    print("F) delete/update capture a short id prefix + confirm form")
+    d = scribe.match_chat_memory_intent("forget memory a1b2c3d4")
+    expect(d and d["kind"] == "delete" and d["memory_id"] == "a1b2c3d4"
+           and d["confirm"] is False,
+           "'forget memory <8-hex>' -> delete, captures the prefix, unconfirmed")
+    expect(scribe.match_chat_memory_intent("delete memory a1b2c3d4") is not None,
+           "'delete memory <prefix>' is equivalent to 'forget memory <prefix>'")
+    dc = scribe.match_chat_memory_intent("confirm delete memory a1b2c3d4")
+    expect(dc and dc["kind"] == "delete" and dc["confirm"] is True
+           and dc["memory_id"] == "a1b2c3d4",
+           "'confirm delete memory <prefix>' -> delete, confirmed")
+    expect(scribe.match_chat_memory_intent("forget memory a1b2") is None,
+           "a <8-char id does not match (avoids over-broad prefix deletes)")
+    u = scribe.match_chat_memory_intent("update memory a1b2c3d4 to the new fact")
+    expect(u and u["kind"] == "update" and u["memory_id"] == "a1b2c3d4"
+           and u["text"] == "the new fact" and u["confirm"] is False,
+           "'update memory <prefix> to <X>' captures prefix + new text")
+    expect(callable(getattr(scribe, "resolve_memory_id_prefix", None)),
+           "scribe exposes resolve_memory_id_prefix (prefix -> full id resolver)")
+
     print()
     if fails:
         print(f"FAIL ({len(fails)}): " + "; ".join(fails))

@@ -47,6 +47,7 @@ from app.agents.scribe import (
     extract_memories_from_conversation,
     fetch_memory_for_mutation,
     match_chat_memory_intent,
+    resolve_memory_id_prefix,
     search_memory,
     title_from_text,
     update_memory_content,
@@ -1800,13 +1801,29 @@ async def chat(
                 assistant_response = "\n".join(lines)
 
         elif kind in ("delete", "update"):
-            mem_uuid = _parse_uuid_or_none(memory_intent["memory_id"])
+            # `ref` is what the user typed: a full UUID, or the short id prefix
+            # `show memories` prints (e.g. 8 hex chars). Resolve a prefix within the
+            # user's visible set so the short id is actionable end-to-end from chat.
+            ref = memory_intent["memory_id"]
+            mem_uuid = _parse_uuid_or_none(ref)
+            resolve_status = "ok"
             if mem_uuid is None:
-                assistant_response = (
-                    f"That doesn't look like a valid memory id. Provide the full UUID."
+                resolved = await resolve_memory_id_prefix(
+                    ref, user_id=current.id, is_admin=is_admin
                 )
-                tool_result["status"] = "error"
-                tool_result["reason"] = "invalid uuid"
+                mem_uuid = resolved.get("id")
+                resolve_status = resolved["status"]
+
+            if mem_uuid is None:
+                if resolve_status == "ambiguous":
+                    assistant_response = (
+                        f"More than one memory id starts with «{ref}» — add a few "
+                        "more characters to pick just one."
+                    )
+                    tool_result["status"] = "ambiguous"
+                else:
+                    assistant_response = f"No memory found matching «{ref}»."
+                    tool_result["status"] = "not_found"
             else:
                 target = await fetch_memory_for_mutation(mem_uuid)
                 if target is None:
@@ -1828,8 +1845,8 @@ async def chat(
                     if not memory_intent["confirm"]:
                         assistant_response = (
                             f"Are you sure you want to delete memory "
-                            f"{mem_uuid} («{target['title']}»)? Reply "
-                            f"'confirm delete memory {mem_uuid}' to proceed."
+                            f"{ref} («{target['title']}»)? Reply "
+                            f"'confirm delete memory {ref}' to proceed."
                         )
                         tool_result["status"] = "confirmation_required"
                         tool_result["memory_id"] = str(mem_uuid)
@@ -1847,9 +1864,9 @@ async def chat(
                     if not memory_intent["confirm"]:
                         preview = title_from_text(new_text)
                         assistant_response = (
-                            f"Updating memory {mem_uuid} («{target['title']}») "
+                            f"Updating memory {ref} («{target['title']}») "
                             f"to «{preview}». Reply "
-                            f"'confirm update memory {mem_uuid} to {new_text}' "
+                            f"'confirm update memory {ref} to {new_text}' "
                             "to proceed."
                         )
                         tool_result["status"] = "confirmation_required"
