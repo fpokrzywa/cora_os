@@ -93,7 +93,8 @@ class InboxAdapter:
     # broker AFTER the governance gate passes and passes it per call; nothing
     # here stores or logs it.
     async def list_messages(self, *, access_token: Optional[str] = None,
-                            query: Optional[str] = None, limit: int = 10) -> list:
+                            query: Optional[str] = None, limit: int = 10,
+                            unread: bool = False) -> list:
         raise NotImplementedError
 
     async def search_messages(self, *, access_token: Optional[str] = None,
@@ -146,11 +147,13 @@ class GmailInboxAdapter(InboxAdapter):
         return self._normalize(msg)
 
     async def list_messages(self, *, access_token: Optional[str] = None,
-                            query: Optional[str] = None, limit: int = 10) -> list:
+                            query: Optional[str] = None, limit: int = 10,
+                            unread: bool = False) -> list:
         token = self._require_token(access_token)
         params: dict = {"maxResults": max(1, min(limit, 25))}
-        if query:
-            params["q"] = query
+        q_parts = [p for p in (query, "is:unread" if unread else None) if p]
+        if q_parts:
+            params["q"] = " ".join(q_parts)
         listing = await _http_get_json(f"{_GMAIL_BASE}/messages", token=token,
                                        params=params)
         out = []
@@ -199,13 +202,16 @@ class OutlookInboxAdapter(InboxAdapter):
         }
 
     async def list_messages(self, *, access_token: Optional[str] = None,
-                            query: Optional[str] = None, limit: int = 10) -> list:
+                            query: Optional[str] = None, limit: int = 10,
+                            unread: bool = False) -> list:
         token = self._require_token(access_token)
         params: dict = {"$top": max(1, min(limit, 25)), "$select": _GRAPH_SELECT}
         if query:
-            # $search and $orderby are mutually exclusive on Graph.
+            # $search is mutually exclusive with $filter/$orderby on Graph.
             params["$search"] = f'"{query}"'
         else:
+            if unread:
+                params["$filter"] = "isRead eq false"
             params["$orderby"] = "receivedDateTime desc"
         listing = await _http_get_json(f"{_GRAPH_BASE}/messages", token=token,
                                        params=params)

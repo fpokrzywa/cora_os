@@ -95,6 +95,12 @@ def detect_inbox_command(message: str) -> Optional[tuple[str, Optional[str]]]:
             or "latest emails" in m or "recent emails" in m \
             or "emails need my attention" in m or "what emails need my attention" in m:
         return ("list", None)
+    # Unread-specific list: "what's unread", "what do I have unread", "any unread",
+    # "unread emails", "show/list unread". Checked AFTER summarize/search/list so
+    # "summarize unread" still summarizes. Provider adjective already stripped, so this
+    # catches "what do I have in my outlook that is unread" too.
+    if "unread" in m:
+        return ("list_unread", None)
     return None
 
 
@@ -275,8 +281,9 @@ def _blocked_msg(provider, decision) -> str:
 # Rendering (source metadata — spec #7)
 # --------------------------------------------------------------------------- #
 
-def _render_list(provider, msgs) -> str:
-    lines = [f"**{provider} — {len(msgs)} message(s)** (read-only)"]
+def _render_list(provider, msgs, unread=False) -> str:
+    noun = "unread" if unread else "message(s)"
+    lines = [f"**{provider} — {len(msgs)} {noun}** (read-only)"]
     for i, mm in enumerate(msgs, 1):
         lines.append(f"{i}. [{provider}] `{str(mm.get('id'))[:10]}` · from {mm.get('from','—')} · "
                      f"{_trunc(mm.get('subject'))} · {mm.get('date','—')}")
@@ -301,9 +308,10 @@ def _skip_note(skipped) -> str:
         f"{_short(s['provider'])} ({s['reason']})" for s in skipped) + "._")
 
 
-def _render_list_multi(providers, msgs, skipped) -> str:
+def _render_list_multi(providers, msgs, skipped, unread=False) -> str:
     head = " + ".join(_short(p) for p in providers)
-    lines = [f"**Inbox — {len(msgs)} message(s)** ({head}, read-only)"]
+    noun = "unread" if unread else "message(s)"
+    lines = [f"**Inbox — {len(msgs)} {noun}** ({head}, read-only)"]
     for i, mm in enumerate(msgs, 1):
         lines.append(f"{i}. [{_short(mm.get('provider'))}] `{str(mm.get('id'))[:10]}` · "
                      f"from {mm.get('from','—')} · {_trunc(mm.get('subject'))} · {mm.get('date','—')}")
@@ -335,19 +343,26 @@ async def handle_inbox_command(
     mailboxes when no provider is named; read_thread/draft_reply (single latest message)
     + any named-provider request stay single."""
     kind, query = cmd
+    # "list_unread" is a list filtered to unread — normalize the kind (so the
+    # kind-keyed trace/render logic is unchanged) and carry the filter as a flag.
+    unread = kind == "list_unread"
+    if unread:
+        kind = "list"
     if kind in ("list", "search", "summarize"):
         providers = await _resolve_read_providers(message, user_id)
         if len(providers) > 1:
-            return await _handle_inbox_multi(kind, query, providers, session_uuid=session_uuid,
+            return await _handle_inbox_multi(kind, query, providers, unread=unread,
+                                             session_uuid=session_uuid,
                                              user_id=user_id, workspace_uuid=workspace_uuid)
         provider = providers[0]
     else:
         provider = await _resolve_provider(message, user_id)
-    return await _handle_inbox_single(kind, query, provider, session_uuid=session_uuid,
+    return await _handle_inbox_single(kind, query, provider, unread=unread,
+                                      session_uuid=session_uuid,
                                       user_id=user_id, workspace_uuid=workspace_uuid)
 
 
-async def _read_one_inbox(provider, kind, query, *, session_uuid, user_id, workspace_uuid):
+async def _read_one_inbox(provider, kind, query, *, unread=False, session_uuid, user_id, workspace_uuid):
     """Gate + broker + read ONE mailbox for list/search/summarize (msgs tagged with
     their provider). Audits per provider. Returns (msgs|None, {provider, reason})."""
     decision = await _gate(provider, user_id)
@@ -370,7 +385,7 @@ async def _read_one_inbox(provider, kind, query, *, session_uuid, user_id, works
         if kind == "search":
             msgs = await adapter.search_messages(access_token=token, query=query or "", limit=10)
         else:
-            msgs = await adapter.list_messages(access_token=token, limit=10)
+            msgs = await adapter.list_messages(access_token=token, limit=10, unread=unread)
     except inbox_adapters.InboxReadDisabled:
         await _audit(user_id, workspace_uuid, provider, kind, False, "adapter disabled")
         return None, {"provider": provider, "reason": "adapter disabled"}
@@ -386,13 +401,13 @@ async def _read_one_inbox(provider, kind, query, *, session_uuid, user_id, works
     return msgs, {"provider": provider, "reason": "ok"}
 
 
-async def _handle_inbox_multi(kind, query, providers, *, session_uuid, user_id, workspace_uuid):
+async def _handle_inbox_multi(kind, query, providers, *, unread=False, session_uuid, user_id, workspace_uuid):
     """Read list/search/summarize across MULTIPLE mailboxes and merge (newest first)."""
     await _trace(session_uuid, user_id, workspace_uuid, trace_type=TRACE_LISTED, status="ok",
-                 result={"providers": providers, "kind": kind, "query": query})
+                 result={"providers": providers, "kind": kind, "query": query, "unread": unread})
     merged, oks, skipped = [], [], []
     for p in providers:
-        msgs, info = await _read_one_inbox(p, kind, query, session_uuid=session_uuid,
+        msgs, info = await _read_one_inbox(p, kind, query, unread=unread, session_uuid=session_uuid,
                                            user_id=user_id, workspace_uuid=workspace_uuid)
         if msgs is not None:
             merged.extend(msgs)
@@ -409,7 +424,7 @@ async def _handle_inbox_multi(kind, query, providers, *, session_uuid, user_id, 
         await _trace(session_uuid, user_id, workspace_uuid, trace_type=TRACE_SUMMARY,
                      result={"providers": oks, "count": len(merged)})
         return True, _render_summary_multi(oks, merged, skipped)
-    return True, _render_list_multi(oks, merged, skipped)
+    return True, _render_list_multi(oks, merged, skipped, unread=unread)
 
 
 async def gather_inbox_highlights(*, user_id, workspace_uuid, session_uuid, limit=5):
@@ -431,7 +446,7 @@ async def gather_inbox_highlights(*, user_id, workspace_uuid, session_uuid, limi
     return {"messages": merged[:limit], "providers_ok": oks, "skipped": skipped}
 
 
-async def _handle_inbox_single(kind, query, provider, *, session_uuid, user_id, workspace_uuid):
+async def _handle_inbox_single(kind, query, provider, *, unread=False, session_uuid, user_id, workspace_uuid):
     req_trace = {"list": TRACE_LISTED, "search": TRACE_SEARCH, "summarize": TRACE_SUMMARY,
                  "read_thread": TRACE_READ, "draft_reply": TRACE_REPLY}[kind]
     await _trace(session_uuid, user_id, workspace_uuid, trace_type=req_trace, status="ok",
@@ -466,7 +481,7 @@ async def _handle_inbox_single(kind, query, provider, *, session_uuid, user_id, 
                       "reconnected). No mailbox data was accessed and nothing was sent.")
     try:
         if kind in ("list", "summarize"):
-            msgs = await adapter.list_messages(access_token=token, limit=10)
+            msgs = await adapter.list_messages(access_token=token, limit=10, unread=unread)
         elif kind == "search":
             msgs = await adapter.search_messages(access_token=token,
                                                  query=query or "", limit=10)
@@ -498,7 +513,7 @@ async def _handle_inbox_single(kind, query, provider, *, session_uuid, user_id, 
     if kind == "read_thread":
         await _trace(session_uuid, user_id, workspace_uuid, trace_type=TRACE_READ,
                      result={"provider": provider, "count": len(msgs)})
-    return True, _render_list(provider, msgs)
+    return True, _render_list(provider, msgs, unread=unread)
 
 
 async def _draft_reply(provider, src, *, session_uuid, user_id, workspace_uuid) -> str:

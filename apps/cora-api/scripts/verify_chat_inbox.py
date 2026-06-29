@@ -66,6 +66,15 @@ async def main() -> int:
     expect(ci.detect_inbox_command("Draft a reply to this email, but do not send it.") == ("draft_reply", None), "detect draft_reply")
     expect(ci.detect_inbox_command("Find emails about the project delay.") == ("search", "the project delay"), "detect find about")
     expect(ci.detect_inbox_command("Draft an email to Mark.") is None, "v1.9 create must not be inbox")
+    # Unread-list detection (the reported gap: this used to fall through to general chat).
+    expect(ci.detect_inbox_command("What do I have in my outlook that is unread?") == ("list_unread", None),
+           "detect unread-list (the reported phrasing)")
+    expect(ci.detect_inbox_command("what's unread") == ("list_unread", None),
+           "detect 'what's unread'")
+    expect(ci.detect_inbox_command("any unread emails?") == ("list_unread", None),
+           "detect 'any unread emails'")
+    expect(ci.detect_inbox_command("Summarize unread emails.") == ("summarize", None),
+           "summarize still wins over the unread-list catch")
 
     # Snapshot the operator's REAL inbox_read flag state (they may have enabled it
     # for live use), then force fail-closed for the test; restored in finally so
@@ -173,7 +182,7 @@ async def main() -> int:
             inbox_adapters._http_get_json = orig_http
 
         # --- C) gate-pass + mocked adapter returns data ---
-        async def _fake_list(*, access_token=None, query=None, limit=10):
+        async def _fake_list(*, access_token=None, query=None, limit=10, unread=False):
             return list(FAKE_MSGS)
 
         async def _fake_search(*, access_token=None, query="", limit=10):
@@ -216,12 +225,12 @@ async def main() -> int:
                 encrypt_secret(FAKE_ACCESS), encrypt_secret("r"))
         ms_adapter = inbox_adapters.resolve_inbox_adapter("outlook_mail")
 
-        async def _gm_list(*, access_token=None, query=None, limit=10):
+        async def _gm_list(*, access_token=None, query=None, limit=10, unread=False):
             return [{"id": "gm1", "thread_id": "tg", "from": "Alice <alice@gmail.com>",
                      "subject": "Gmail hello", "date": "Wed, 24 Jun 2026 09:00:00 +0000",
                      "snippet": "hi from gmail"}]
 
-        async def _om_list(*, access_token=None, query=None, limit=10):
+        async def _om_list(*, access_token=None, query=None, limit=10, unread=False):
             return [{"id": "om1", "thread_id": "to", "from": "Bob <bob@outlook.com>",
                      "subject": "Outlook hello", "date": "2026-06-24T14:00:00Z",
                      "snippet": "hi from outlook"}]
