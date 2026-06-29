@@ -20,10 +20,8 @@ import time
 import uuid
 from typing import Optional
 
-import httpx
-
 from app.clients import clients
-from app.config import settings
+from app import llm
 from app import execution_adapters as eadapt
 from app import final_interlock as fi
 from app import integration_readiness as ir
@@ -158,15 +156,9 @@ async def set_context(session_id: uuid.UUID, **fields) -> None:
 # --------------------------------------------------------------------------- #
 
 async def _generate_text(prompt: str) -> str:
-    endpoint = settings.dgx_model_endpoint
-    if not endpoint:
+    if not llm.is_chat_configured():
         raise EmailLifecycleError("model endpoint not configured", code="unavailable")
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        r = await client.post(
-            f"{endpoint.rstrip('/')}/api/generate",
-            json={"model": settings.dgx_model_name, "prompt": prompt, "stream": False})
-        r.raise_for_status()
-        return (r.json().get("response") or "").strip()
+    return (await llm.generate_text(prompt, max_tokens=800, timeout=60.0)).strip()
 
 
 def _extract_fields(text: str, fallback_title: str) -> dict:

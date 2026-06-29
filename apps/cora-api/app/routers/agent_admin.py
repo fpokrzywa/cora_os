@@ -14,6 +14,7 @@ from app.agents.registry import load_active_routing_keywords
 from app.agents.routing import diagnose_routing
 from app.agents.scribe import search_memory
 from app.auth import CurrentUser, require_admin
+from app import llm
 from app.clients import clients
 from app.clock import current_datetime_preamble
 from app.config import settings
@@ -801,24 +802,13 @@ async def test_response(
     parts.append(f"{PERSONA_NAME}:")
     prompt = "\n\n".join(parts)
 
-    endpoint = settings.dgx_model_endpoint or ""
-    if not endpoint:
+    if not llm.is_chat_configured():
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="DGX_MODEL_ENDPOINT is not configured",
+            detail="chat model backend is not configured",
         )
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            resp = await client.post(
-                f"{endpoint.rstrip('/')}/api/generate",
-                json={
-                    "model": settings.dgx_model_name,
-                    "prompt": prompt,
-                    "stream": False,
-                },
-            )
-            resp.raise_for_status()
-            text = resp.json().get("response", "")
+        text = await llm.generate_text(prompt, max_tokens=800, timeout=60.0)
     except httpx.HTTPError as exc:
         logger.exception("test-response LLM call failed")
         raise HTTPException(

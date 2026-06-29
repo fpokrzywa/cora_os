@@ -12,9 +12,9 @@ from typing import Optional
 
 import httpx
 
+from app import llm
 from app import schema as schema_state
 from app.clients import clients
-from app.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -144,8 +144,7 @@ async def generate_briefing_summary(articles: list[dict]) -> Optional[str]:
     """Generate a PULSE-style briefing over the given articles using the DGX
     model. Bounded input (no full bodies). Returns text or None if unavailable.
     """
-    endpoint = (settings.dgx_model_endpoint or "").rstrip("/")
-    if not endpoint or not articles:
+    if not llm.is_chat_configured() or not articles:
         return None
 
     # Lazy import to avoid any import-order coupling with the chat router.
@@ -191,17 +190,10 @@ async def generate_briefing_summary(articles: list[dict]) -> Optional[str]:
     )
 
     try:
-        async with httpx.AsyncClient(timeout=MODEL_TIMEOUT_SECONDS) as client:
-            resp = await client.post(
-                f"{endpoint}/api/generate",
-                json={
-                    "model": settings.dgx_model_name,
-                    "prompt": prompt,
-                    "stream": False,
-                },
-            )
-            resp.raise_for_status()
-            return resp.json().get("response", "") or None
+        text = await llm.generate_text(
+            prompt, max_tokens=1200, timeout=MODEL_TIMEOUT_SECONDS
+        )
+        return text or None
     except httpx.HTTPError:
         logger.exception("news briefing summary generation failed")
         return None

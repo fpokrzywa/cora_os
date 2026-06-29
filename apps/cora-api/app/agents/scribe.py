@@ -108,38 +108,26 @@ def build_scribe_prompt(messages: list[dict]) -> str:
     )
 
 
-async def summarize_messages(
-    messages: list[dict], model_name: Optional[str] = None
-) -> str:
-    """Call Ollama with the SCRIBE prompt and return the summary text.
+async def summarize_messages(messages: list[dict]) -> str:
+    """Summarize a conversation with the SCRIBE prompt via the active chat backend
+    (app.llm — Ollama or vLLM, per DGX_CHAT_BACKEND).
 
     Raises:
-        RuntimeError if DGX endpoint is not configured.
+        RuntimeError if the chat backend is not configured.
         httpx.HTTPError on transport / non-2xx model failure.
     """
-    endpoint = settings.dgx_model_endpoint
-    if not endpoint:
-        raise RuntimeError("DGX_MODEL_ENDPOINT is not configured")
-
-    model = model_name or settings.dgx_model_name
+    if not llm.is_chat_configured():
+        raise RuntimeError("chat model backend is not configured")
     prompt = build_scribe_prompt(messages)
-
     logger.info(
-        "scribe summarize: messages=%s prompt_chars=%s model=%s",
+        "scribe summarize: messages=%s prompt_chars=%s backend=%s",
         len(messages),
         len(prompt),
-        model,
+        llm.chat_backend(),
     )
-
-    async with httpx.AsyncClient(timeout=OLLAMA_TIMEOUT_SECONDS) as client:
-        resp = await client.post(
-            f"{endpoint.rstrip('/')}/api/generate",
-            json={"model": model, "prompt": prompt, "stream": False},
-        )
-        resp.raise_for_status()
-        data = resp.json()
-
-    summary = data["response"]
+    summary = await llm.generate_text(
+        prompt, max_tokens=1024, timeout=OLLAMA_TIMEOUT_SECONDS
+    )
     logger.info("scribe summarize complete: summary_chars=%s", len(summary))
     return summary
 
