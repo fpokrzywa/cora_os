@@ -152,9 +152,9 @@ function InterruptCard({
       )}
       <p className="agent-cfg__note">
         This run staged the artifact(s) below. Approving records your decision; if
-        calendar execution is enabled it also creates an approved calendar item on
-        your real calendar. Email drafts are never sent — they stay in your drafts
-        to review and send yourself.
+        calendar execution is enabled it also applies the approved calendar change
+        (create, update, or cancel) on your real calendar. Email drafts are never
+        sent — they stay in your drafts to review and send yourself.
       </p>
       {interrupt.staged.length > 0 && (
         <ul className="agent-interrupt__staged">
@@ -165,6 +165,18 @@ function InterruptCard({
                 <span className="agent-deleg__reason">
                   {" "}
                   → would create on {s.provider}
+                </span>
+              )}
+              {s.type === "calendar_update" && (
+                <span className="agent-deleg__reason">
+                  {" "}
+                  → would update on {s.provider}
+                </span>
+              )}
+              {s.type === "calendar_delete" && (
+                <span className="agent-deleg__reason">
+                  {" "}
+                  → would cancel on {s.provider}
                 </span>
               )}
             </li>
@@ -179,7 +191,13 @@ function InterruptCard({
                 {e.ok ? "fired" : "not fired"}
               </span>{" "}
               {e.ok
-                ? `created — ${e.title ?? e.event_id ?? "ok"}`
+                ? `${
+                    e.type === "calendar_update"
+                      ? "updated"
+                      : e.type === "calendar_delete"
+                        ? "cancelled"
+                        : "created"
+                  } — ${e.title ?? e.event_id ?? "ok"}`
                 : e.reason}
               {e.ok && e.link && (
                 <>

@@ -1208,6 +1208,30 @@ ON CONFLICT (name) DO NOTHING
 # Proposal review-action tools (Governed Tool Planning v0.5). Each review action
 # is governed + audited under its own tool. All are review-only — none create,
 # send, or modify any external calendar event.
+SEED_CHRONOS_UPDATE_EVENT_TOOL_SQL = """
+INSERT INTO tools (name, description, type,
+                   enabled, requires_confirmation, risk_level, allowed_agents)
+VALUES (
+    'chronos_update_calendar_event',
+    'Stages a review-only request to UPDATE an existing calendar event for the user to approve. Does NOT change any calendar by itself.',
+    'internal_action',
+    TRUE, TRUE, 'low', ARRAY['CHRONOS']
+)
+ON CONFLICT (name) DO NOTHING
+"""
+
+SEED_CHRONOS_CANCEL_EVENT_TOOL_SQL = """
+INSERT INTO tools (name, description, type,
+                   enabled, requires_confirmation, risk_level, allowed_agents)
+VALUES (
+    'chronos_cancel_calendar_event',
+    'Stages a review-only request to CANCEL (delete) an existing calendar event for the user to approve. Does NOT change any calendar by itself.',
+    'internal_action',
+    TRUE, TRUE, 'low', ARRAY['CHRONOS']
+)
+ON CONFLICT (name) DO NOTHING
+"""
+
 SEED_CHRONOS_REVIEW_TOOL_SQL = """
 INSERT INTO tools (name, description, type,
                    enabled, requires_confirmation, risk_level, allowed_agents)
@@ -1650,6 +1674,8 @@ async def init_schema() -> None:
         await conn.execute(SEED_SIGNAL_APPROVE_TOOL_SQL)
         await conn.execute(SEED_SIGNAL_ARCHIVE_TOOL_SQL)
         await conn.execute(SEED_CHRONOS_PROPOSAL_TOOL_SQL)
+        await conn.execute(SEED_CHRONOS_UPDATE_EVENT_TOOL_SQL)
+        await conn.execute(SEED_CHRONOS_CANCEL_EVENT_TOOL_SQL)
         await conn.execute(SEED_CHRONOS_REVIEW_TOOL_SQL)
         await conn.execute(SEED_CHRONOS_APPROVE_TOOL_SQL)
         await conn.execute(SEED_CHRONOS_ARCHIVE_TOOL_SQL)

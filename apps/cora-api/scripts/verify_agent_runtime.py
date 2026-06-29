@@ -268,7 +268,14 @@ async def main() -> int:
                    ("USER GOAL", "do X", "AGENT FINAL ANSWER", "did X", "web_search")),
                "_render_eval_input packs goal + answer + tool trace")
 
-        off = await ar.evaluate_run(goal="g", answer="a", steps=[])
+        # Force the flag off for this check so it's independent of the live deploy
+        # (which may run with AGENT_EVAL_ENABLED on).
+        _eval_was = settings.agent_eval_enabled
+        settings.agent_eval_enabled = False
+        try:
+            off = await ar.evaluate_run(goal="g", answer="a", steps=[])
+        finally:
+            settings.agent_eval_enabled = _eval_was
         expect(off is None, "evaluate_run is None when AGENT_EVAL_ENABLED is off")
 
         prev_enabled = settings.agent_eval_enabled
@@ -658,6 +665,103 @@ async def main() -> int:
         finally:
             settings.agent_eval_gate_enabled = prev_gate
             settings.agent_execution_enabled = prev_exec_l
+
+        # ---- M) calendar UPDATE / DELETE firing (extends Phase 7 beyond create) ----
+        # _collect_staged builds fireable calendar_update / calendar_delete items from
+        # the staging tool args; the fire helpers are fail-closed + never raise; and
+        # _fire_staged routes each kind to its matching helper. No live write here —
+        # the helpers are spied or hit with an unknown provider (same as Part J).
+        print("M) calendar update/delete firing")
+        upd = ar._collect_staged([
+            ar.AgentStep("tool_result", {
+                "name": "chronos_update_calendar_event",
+                "arguments": {"provider": "google_calendar", "event_id": "evt_abc",
+                              "start_time": "2026-07-01T16:00:00"},
+                "result": "✓ Staged a review-only request to UPDATE google_calendar event"}),
+        ])
+        expect(len(upd) == 1 and upd[0].get("type") == "calendar_update"
+               and upd[0].get("provider") == "google_calendar"
+               and upd[0].get("event_id") == "evt_abc"
+               and upd[0]["fields"].get("start_time") == "2026-07-01T16:00:00"
+               and upd[0]["fields"].get("end_time") == "2026-07-01T17:00:00",
+               "_collect_staged builds a fireable calendar_update (+ backfilled end)")
+
+        dele = ar._collect_staged([
+            ar.AgentStep("tool_result", {
+                "name": "chronos_cancel_calendar_event",
+                "arguments": {"provider": "outlook_calendar", "event_id": "evt_xyz"},
+                "result": "✓ Staged a review-only request to CANCEL outlook_calendar event"}),
+        ])
+        expect(len(dele) == 1 and dele[0].get("type") == "calendar_delete"
+               and dele[0].get("provider") == "outlook_calendar"
+               and dele[0].get("event_id") == "evt_xyz",
+               "_collect_staged builds a fireable calendar_delete")
+
+        # An update with no changeable field, and a cancel missing the event_id, are
+        # NOT fireable (no type) — they stay plain review notes.
+        bad = ar._collect_staged([
+            ar.AgentStep("tool_result", {
+                "name": "chronos_update_calendar_event",
+                "arguments": {"provider": "google_calendar", "event_id": "evt_abc"},
+                "result": "✓ Staged a review-only request to UPDATE google_calendar event"}),
+            ar.AgentStep("tool_result", {
+                "name": "chronos_cancel_calendar_event",
+                "arguments": {"provider": "google_calendar"},
+                "result": "✓ Staged a review-only request to CANCEL google_calendar event"}),
+        ])
+        expect(len(bad) == 2 and bad[0].get("type") is None and bad[1].get("type") is None,
+               "update with no fields / cancel with no event_id are not fireable (no type)")
+
+        upd_noadapter = await ar.chat_calendar.agent_fire_calendar_update(
+            provider="verify_no_such_provider", user_id=uid, workspace_id=None,
+            event_id="evt_abc", fields={"start_time": "2026-07-01T16:00:00"})
+        del_noadapter = await ar.chat_calendar.agent_fire_calendar_delete(
+            provider="verify_no_such_provider", user_id=uid, workspace_id=None,
+            event_id="evt_abc")
+        expect(upd_noadapter["ok"] is False and del_noadapter["ok"] is False,
+               "agent_fire_calendar_update/delete are fail-closed + never raise (unknown provider)")
+        upd_noid = await ar.chat_calendar.agent_fire_calendar_update(
+            provider="google_calendar", user_id=uid, workspace_id=None,
+            event_id="", fields={"title": "x"})
+        expect(upd_noid["ok"] is False and "event_id" in upd_noid["reason"],
+               "agent_fire_calendar_update refuses an empty event_id (no write attempted)")
+
+        # _fire_staged routes each kind to the matching helper. Spy all three so no
+        # live write can happen, then assert routing + outcome passthrough.
+        orig_c = ar.chat_calendar.agent_fire_calendar_create
+        orig_u = ar.chat_calendar.agent_fire_calendar_update
+        orig_d = ar.chat_calendar.agent_fire_calendar_delete
+
+        async def _spy_kind(sink, kind):
+            async def _fn(**kw):
+                sink.append({"kind": kind, **kw})
+                return {"ok": True, "reason": kind, "event_id": "evt_fired"}
+            return _fn
+
+        routed: list = []
+        ar.chat_calendar.agent_fire_calendar_create = await _spy_kind(routed, "create")
+        ar.chat_calendar.agent_fire_calendar_update = await _spy_kind(routed, "update")
+        ar.chat_calendar.agent_fire_calendar_delete = await _spy_kind(routed, "delete")
+        try:
+            outcomes = await ar._fire_staged([
+                {"tool": "chronos_update_calendar_event", "type": "calendar_update",
+                 "provider": "google_calendar", "event_id": "evt_abc",
+                 "fields": {"start_time": "2026-07-01T16:00:00"}},
+                {"tool": "chronos_cancel_calendar_event", "type": "calendar_delete",
+                 "provider": "outlook_calendar", "event_id": "evt_xyz"},
+            ], user_id=uid, workspace_id=None)
+        finally:
+            ar.chat_calendar.agent_fire_calendar_create = orig_c
+            ar.chat_calendar.agent_fire_calendar_update = orig_u
+            ar.chat_calendar.agent_fire_calendar_delete = orig_d
+        expect(len(routed) == 2
+               and routed[0]["kind"] == "update" and routed[0]["event_id"] == "evt_abc"
+               and routed[1]["kind"] == "delete" and routed[1]["event_id"] == "evt_xyz",
+               "_fire_staged routes calendar_update→update helper, calendar_delete→delete helper")
+        expect(len(outcomes) == 2
+               and outcomes[0]["type"] == "calendar_update" and outcomes[0]["ok"] is True
+               and outcomes[1]["type"] == "calendar_delete" and outcomes[1]["ok"] is True,
+               "_fire_staged returns one outcome per item, tagged with its type")
 
     finally:
         # Clean up the disposable rows we created.

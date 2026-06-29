@@ -50,8 +50,14 @@ export interface AgentStagedArtifact {
   tool: string;
   summary: string;
   // Phase 7 outward half: present when the staged item can be fired on approve.
-  type?: "calendar_create" | "email_draft" | null;
+  type?:
+    | "calendar_create"
+    | "calendar_update"
+    | "calendar_delete"
+    | "email_draft"
+    | null;
   provider?: string | null;
+  event_id?: string | null;
   fields?: Record<string, unknown> | null;
 }
 

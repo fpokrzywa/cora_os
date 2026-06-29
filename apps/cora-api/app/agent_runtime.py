@@ -152,6 +152,50 @@ STAGING_TOOLS: dict[str, dict] = {
             "required": ["title"],
         },
     },
+    "chronos_update_calendar_event": {
+        "description": "Stage a review-only UPDATE to an EXISTING calendar event for "
+        "the user to approve. Does NOT change anything by itself. Requires the "
+        "event's provider (google_calendar or outlook_calendar) and its event_id "
+        "(an id surfaced by a calendar listing or given by the user); include ONLY "
+        "the fields to change — title, start_time/end_time (ISO 8601 local time like "
+        "2026-07-01T15:00:00), location, description.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "provider": {
+                    "type": "string",
+                    "enum": ["google_calendar", "outlook_calendar"],
+                    "description": "Which connected calendar the event lives on.",
+                },
+                "event_id": {"type": "string", "description": "Id of the existing event to change."},
+                "title": {"type": "string", "description": "New title (optional)."},
+                "start_time": {"type": "string", "description": "New ISO 8601 start (optional)."},
+                "end_time": {"type": "string", "description": "New ISO 8601 end (optional)."},
+                "timezone": {"type": "string", "description": "IANA tz for the new times (optional)."},
+                "location": {"type": "string", "description": "New location (optional)."},
+                "description": {"type": "string", "description": "New details (optional)."},
+            },
+            "required": ["provider", "event_id"],
+        },
+    },
+    "chronos_cancel_calendar_event": {
+        "description": "Stage a review-only CANCELLATION (delete) of an EXISTING "
+        "calendar event for the user to approve. Does NOT delete anything by itself. "
+        "Requires the event's provider (google_calendar or outlook_calendar) and its "
+        "event_id (an id surfaced by a calendar listing or given by the user).",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "provider": {
+                    "type": "string",
+                    "enum": ["google_calendar", "outlook_calendar"],
+                    "description": "Which connected calendar the event lives on.",
+                },
+                "event_id": {"type": "string", "description": "Id of the existing event to cancel."},
+            },
+            "required": ["provider", "event_id"],
+        },
+    },
 }
 
 AGENT_SYSTEM_PROMPT = (
@@ -396,6 +440,24 @@ def _collect_staged(steps: list["AgentStep"]) -> list[dict]:
                 item["type"] = "calendar_create"
                 item["provider"] = provider
                 item["fields"] = fields
+        elif name == "chronos_update_calendar_event":
+            fields = _proposal_fields_from_args(args)
+            provider = (args.get("provider") or "").strip()
+            event_id = (args.get("event_id") or "").strip()
+            # Fireable only with a provider, a target event_id, AND at least one
+            # field to change; otherwise it stays a plain review note (never fired).
+            if provider and event_id and fields:
+                item["type"] = "calendar_update"
+                item["provider"] = provider
+                item["event_id"] = event_id
+                item["fields"] = fields
+        elif name == "chronos_cancel_calendar_event":
+            provider = (args.get("provider") or "").strip()
+            event_id = (args.get("event_id") or "").strip()
+            if provider and event_id:
+                item["type"] = "calendar_delete"
+                item["provider"] = provider
+                item["event_id"] = event_id
         elif name == "signal_create_draft":
             item["type"] = "email_draft"
         out.append(item)
@@ -429,11 +491,12 @@ async def _pause_run(
 
 async def _fire_staged(staged: list[dict], *, user_id, workspace_id) -> list[dict]:
     """Fire approved staged artifacts through their GATED execution paths (Phase 7
-    outward half). A calendar CREATE goes through chat_calendar.agent_fire_calendar_create,
-    which re-checks the CALENDAR_EXECUTION_ENABLED master gate + per-provider
-    calendar_write flag + connection/scope/token — so nothing is written while that
-    gate is off. Email drafts are NEVER sent (send stays hard-disabled); they are
-    recorded as kept-for-review. Returns one outcome per staged item; never raises."""
+    outward half). A calendar CREATE/UPDATE/DELETE goes through the matching
+    chat_calendar.agent_fire_calendar_* helper, each of which re-checks the
+    CALENDAR_EXECUTION_ENABLED master gate + per-provider calendar_write flag +
+    connection/scope/token — so nothing is written while that gate is off. Email
+    drafts are NEVER sent (send stays hard-disabled); they are recorded as
+    kept-for-review. Returns one outcome per staged item; never raises."""
     out: list[dict] = []
     for item in staged or []:
         kind = item.get("type")
@@ -442,6 +505,19 @@ async def _fire_staged(staged: list[dict], *, user_id, workspace_id) -> list[dic
             res = await chat_calendar.agent_fire_calendar_create(
                 provider=item.get("provider"), user_id=user_id,
                 workspace_id=_as_uuid(workspace_id), fields=item.get("fields") or {},
+            )
+            out.append({"tool": tool, "type": kind, **res})
+        elif kind == "calendar_update":
+            res = await chat_calendar.agent_fire_calendar_update(
+                provider=item.get("provider"), user_id=user_id,
+                workspace_id=_as_uuid(workspace_id), event_id=item.get("event_id"),
+                fields=item.get("fields") or {},
+            )
+            out.append({"tool": tool, "type": kind, **res})
+        elif kind == "calendar_delete":
+            res = await chat_calendar.agent_fire_calendar_delete(
+                provider=item.get("provider"), user_id=user_id,
+                workspace_id=_as_uuid(workspace_id), event_id=item.get("event_id"),
             )
             out.append({"tool": tool, "type": kind, **res})
         elif kind == "email_draft":
@@ -1068,6 +1144,31 @@ async def _handle_staging(
                 f"✓ Staged a review-only schedule proposal '{row['title']}' "
                 f"(id {str(row['id'])[:8]}, status {row['status']}). No calendar "
                 "event was created — the user reviews it to act."
+            )
+        if name == "chronos_update_calendar_event":
+            provider = (args.get("provider") or "").strip()
+            event_id = (args.get("event_id") or "").strip()
+            fields = _proposal_fields_from_args(args)
+            if not provider or not event_id:
+                return "error: an update needs a provider and an event_id."
+            if not fields:
+                return ("error: an update needs at least one field to change "
+                        "(title, start_time/end_time, location, description).")
+            changed = ", ".join(sorted(fields))
+            return (
+                f"✓ Staged a review-only request to UPDATE {provider} event "
+                f"{event_id[:12]}… ({changed}). Nothing was changed — the user "
+                "approves it to apply the change to the real calendar."
+            )
+        if name == "chronos_cancel_calendar_event":
+            provider = (args.get("provider") or "").strip()
+            event_id = (args.get("event_id") or "").strip()
+            if not provider or not event_id:
+                return "error: a cancellation needs a provider and an event_id."
+            return (
+                f"✓ Staged a review-only request to CANCEL {provider} event "
+                f"{event_id[:12]}…. Nothing was changed — the user approves it to "
+                "delete the event from the real calendar."
             )
     except Exception as exc:
         logger.exception("staging %s failed", name)

@@ -1669,6 +1669,103 @@ async def agent_fire_calendar_create(*, provider, user_id, workspace_id, fields,
         return {"ok": False, "reason": f"unexpected error: {exc}", "event_id": None}
 
 
+async def agent_fire_calendar_update(*, provider, user_id, workspace_id, event_id,
+                                     fields, calendar_id: str = "primary") -> dict:
+    """Gated single calendar UPDATE for the agent confirm-as-interrupt approve path.
+    Mirrors agent_fire_calendar_create but targets an EXISTING event: re-check
+    _write_gate('update') (CALENDAR_EXECUTION_ENABLED master gate + per-provider
+    calendar_write flag + connection/scope/token), broker the token, fire
+    adapter.update_event with only the changed fields. Returns {"ok","reason",
+    "event_id","title","link"} and NEVER raises; fail-closed on the master gate. The
+    caller gates on agent_execution_enabled BEFORE invoking."""
+    provider = (provider or "").strip()
+    event_id = (event_id or "").strip()
+    fields = fields or {}
+    try:
+        adapter = calendar_adapters.resolve_calendar_adapter(provider)
+        if adapter is None:
+            return {"ok": False, "reason": f"no calendar adapter for {provider or '(none)'}",
+                    "event_id": None}
+        if not event_id:
+            return {"ok": False, "reason": "no event_id to update", "event_id": None}
+        try:
+            uid = user_id if isinstance(user_id, uuid.UUID) else uuid.UUID(str(user_id))
+        except (ValueError, TypeError):
+            return {"ok": False, "reason": "invalid user id", "event_id": None}
+        decision = await _write_gate(provider, uid, "update")
+        if not decision["allowed"]:
+            await _audit(uid, workspace_id, provider, "update", False,
+                         f"agent approve blocked: {decision['reason']}", event_ref=event_id)
+            return {"ok": False, "reason": decision["reason"], "event_id": None}
+        token = await _get_access_token(provider, uid)
+        if not token:
+            await _audit(uid, workspace_id, provider, "update", False,
+                         "agent approve: no usable token", event_ref=event_id)
+            return {"ok": False, "reason": "no usable access token", "event_id": None}
+        try:
+            ev = await adapter.update_event(access_token=token, event_id=event_id,
+                                            fields=fields, calendar_id=calendar_id or "primary")
+        except (calendar_adapters.CalendarAccessDisabled,
+                calendar_adapters.CalendarError) as exc:
+            await _audit(uid, workspace_id, provider, "update", False,
+                         str(exc) or "adapter error", event_ref=event_id)
+            return {"ok": False, "reason": str(exc) or "adapter disabled", "event_id": None}
+        await _audit(uid, workspace_id, provider, "update", True,
+                     "agent approve update ok", event_ref=ev.get("id"))
+        return {"ok": True, "reason": "updated", "event_id": ev.get("id"),
+                "title": ev.get("title"), "link": ev.get("link")}
+    except Exception as exc:  # defensive: the approve path must never crash on a fire
+        logger.exception("agent_fire_calendar_update failed provider=%s", provider)
+        return {"ok": False, "reason": f"unexpected error: {exc}", "event_id": None}
+
+
+async def agent_fire_calendar_delete(*, provider, user_id, workspace_id, event_id,
+                                     calendar_id: str = "primary") -> dict:
+    """Gated single calendar DELETE/cancel for the agent confirm-as-interrupt approve
+    path. Mirrors agent_fire_calendar_create but cancels an EXISTING event: re-check
+    _write_gate('delete'), broker the token, fire adapter.delete_event. Returns
+    {"ok","reason","event_id","title","link"} and NEVER raises; fail-closed on the
+    master gate. The caller gates on agent_execution_enabled BEFORE invoking."""
+    provider = (provider or "").strip()
+    event_id = (event_id or "").strip()
+    try:
+        adapter = calendar_adapters.resolve_calendar_adapter(provider)
+        if adapter is None:
+            return {"ok": False, "reason": f"no calendar adapter for {provider or '(none)'}",
+                    "event_id": None}
+        if not event_id:
+            return {"ok": False, "reason": "no event_id to cancel", "event_id": None}
+        try:
+            uid = user_id if isinstance(user_id, uuid.UUID) else uuid.UUID(str(user_id))
+        except (ValueError, TypeError):
+            return {"ok": False, "reason": "invalid user id", "event_id": None}
+        decision = await _write_gate(provider, uid, "delete")
+        if not decision["allowed"]:
+            await _audit(uid, workspace_id, provider, "delete", False,
+                         f"agent approve blocked: {decision['reason']}", event_ref=event_id)
+            return {"ok": False, "reason": decision["reason"], "event_id": None}
+        token = await _get_access_token(provider, uid)
+        if not token:
+            await _audit(uid, workspace_id, provider, "delete", False,
+                         "agent approve: no usable token", event_ref=event_id)
+            return {"ok": False, "reason": "no usable access token", "event_id": None}
+        try:
+            ev = await adapter.delete_event(access_token=token, event_id=event_id,
+                                            calendar_id=calendar_id or "primary")
+        except (calendar_adapters.CalendarAccessDisabled,
+                calendar_adapters.CalendarError) as exc:
+            await _audit(uid, workspace_id, provider, "delete", False,
+                         str(exc) or "adapter error", event_ref=event_id)
+            return {"ok": False, "reason": str(exc) or "adapter disabled", "event_id": None}
+        await _audit(uid, workspace_id, provider, "delete", True,
+                     "agent approve delete ok", event_ref=event_id)
+        return {"ok": True, "reason": "deleted",
+                "event_id": (ev or {}).get("id") or event_id, "title": None, "link": None}
+    except Exception as exc:  # defensive: the approve path must never crash on a fire
+        logger.exception("agent_fire_calendar_delete failed provider=%s", provider)
+        return {"ok": False, "reason": f"unexpected error: {exc}", "event_id": None}
+
+
 async def _create_proposal_fallback(fields, message, *, session_uuid, user_id, workspace_uuid) -> Optional[str]:
     try:
         row = await chronos_tools.create_schedule_proposal(
