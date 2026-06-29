@@ -46,6 +46,10 @@ Parts:
      tool result paired to its call in order); _normalize_openai_response maps a
      chat-completions reply back to the Ollama-shaped {"message": {...}} the loop
      reads (and is null-safe on a malformed body). No network is touched.
+  L) Evaluator-gated approval (Phase 6 + 7) — with agent_eval_gate_enabled off a
+     'fail' verdict approves normally; on, it BLOCKS approve (returns a blocked
+     marker, leaves the run waiting_user, fires nothing) while reject and non-'fail'
+     verdicts pass, and override=True forces the approve through (recording it).
 
     docker cp apps/cora-api/scripts/verify_agent_runtime.py cora-api:/tmp/var.py
     docker exec -e PYTHONPATH=/app cora-api python /tmp/var.py   # 0=PASS 1=FAIL
@@ -90,6 +94,10 @@ async def main() -> int:
     fire_run_id = None
     fire_run_id2 = None
     fire_run_id3 = None
+    gate_run_id = None
+    gate_run_id2 = None
+    gate_run_id3 = None
+    gate_run_id4 = None
 
     try:
         # ---- A) Catalog scoping ----
@@ -265,13 +273,18 @@ async def main() -> int:
 
         prev_enabled = settings.agent_eval_enabled
         prev_endpoint = settings.dgx_model_endpoint
+        prev_backend = settings.dgx_agent_backend
         settings.agent_eval_enabled = True
+        # Force the ollama backend so zeroing dgx_model_endpoint unsets the ACTIVE
+        # endpoint the (backend-aware) evaluator reads — independent of the deploy.
+        settings.dgx_agent_backend = "ollama"
         settings.dgx_model_endpoint = ""
         try:
             none2 = await ar.evaluate_run(goal="g", answer="a", steps=[])
         finally:
             settings.agent_eval_enabled = prev_enabled
             settings.dgx_model_endpoint = prev_endpoint
+            settings.dgx_agent_backend = prev_backend
         expect(none2 is None,
                "evaluate_run stays None when endpoint/model unset (no model call)")
 
@@ -576,6 +589,76 @@ async def main() -> int:
                and ar._normalize_openai_response({"choices": []})["message"] == {"content": ""},
                "a malformed/empty openai response normalizes to empty content (no raise)")
 
+        # ---- L) evaluator-gated approval (ties Phase 6 + 7) ----
+        # A run paused at waiting_user carrying a 'fail' verdict: approve is blocked
+        # only when agent_eval_gate_enabled is on, and override forces it through.
+        print("L) evaluator-gated approval")
+        prev_gate = settings.agent_eval_gate_enabled
+        prev_exec_l = settings.agent_execution_enabled
+        try:
+            settings.agent_execution_enabled = False  # isolate the gate from firing
+
+            # Gate OFF: a 'fail' verdict approves normally (unchanged behavior).
+            gate_run_id = await ar.create_pending_run(
+                goal="gate off + fail verdict", user_id=uid, session_id=sess, max_steps=6)
+            await ar._pause_run(
+                gate_run_id, answer="x", stopped="final", tool_calls=0, step_count=0,
+                messages=[], steps=[], evaluation={"verdict": "fail", "reasons": [], "summary": ""},
+                interrupt={"staged": [], "decision": None, "note": None})
+            settings.agent_eval_gate_enabled = False
+            r = await ar.resolve_interrupt(gate_run_id, user_id=uid, decision="approve")
+            expect(bool(r) and not r.get("blocked") and r["status"] == "done",
+                   "gate OFF: a 'fail' verdict approves normally")
+
+            # Gate ON: a 'fail' verdict blocks approve (no state change, nothing fired).
+            settings.agent_eval_gate_enabled = True
+            gate_run_id2 = await ar.create_pending_run(
+                goal="gate on + fail verdict", user_id=uid, session_id=sess, max_steps=6)
+            await ar._pause_run(
+                gate_run_id2, answer="x", stopped="final", tool_calls=0, step_count=0,
+                messages=[], steps=[], evaluation={"verdict": "fail", "reasons": ["broken"], "summary": ""},
+                interrupt={"staged": [], "decision": None, "note": None})
+            blocked = await ar.resolve_interrupt(gate_run_id2, user_id=uid, decision="approve")
+            expect(isinstance(blocked, dict) and blocked.get("blocked") is True
+                   and blocked.get("verdict") == "fail",
+                   "gate ON: a 'fail' verdict blocks approve (returns blocked marker)")
+            still = await ar.get_run(gate_run_id2, user_id=uid)
+            expect(still["status"] == "waiting_user"
+                   and (still.get("interrupt") or {}).get("decision") is None,
+                   "a blocked approve leaves the run untouched (still waiting_user)")
+
+            # Reject is NEVER gated.
+            rej = await ar.resolve_interrupt(gate_run_id2, user_id=uid, decision="reject")
+            expect(bool(rej) and rej["status"] == "cancelled",
+                   "gate ON: reject is never blocked")
+
+            # Override forces a 'fail' approve through and records the override.
+            gate_run_id3 = await ar.create_pending_run(
+                goal="gate on + override", user_id=uid, session_id=sess, max_steps=6)
+            await ar._pause_run(
+                gate_run_id3, answer="x", stopped="final", tool_calls=0, step_count=0,
+                messages=[], steps=[], evaluation={"verdict": "fail", "reasons": [], "summary": ""},
+                interrupt={"staged": [], "decision": None, "note": None})
+            ovr = await ar.resolve_interrupt(
+                gate_run_id3, user_id=uid, decision="approve", override=True)
+            expect(bool(ovr) and not ovr.get("blocked") and ovr["status"] == "done"
+                   and (ovr.get("interrupt") or {}).get("override") is True,
+                   "override=True forces a 'fail' approve through + records the override")
+
+            # A non-'fail' verdict is never gated even with the gate on.
+            gate_run_id4 = await ar.create_pending_run(
+                goal="gate on + concerns verdict", user_id=uid, session_id=sess, max_steps=6)
+            await ar._pause_run(
+                gate_run_id4, answer="x", stopped="final", tool_calls=0, step_count=0,
+                messages=[], steps=[], evaluation={"verdict": "concerns", "reasons": [], "summary": ""},
+                interrupt={"staged": [], "decision": None, "note": None})
+            okc = await ar.resolve_interrupt(gate_run_id4, user_id=uid, decision="approve")
+            expect(bool(okc) and not okc.get("blocked") and okc["status"] == "done",
+                   "gate ON: a 'concerns' verdict approves normally (only 'fail' is gated)")
+        finally:
+            settings.agent_eval_gate_enabled = prev_gate
+            settings.agent_execution_enabled = prev_exec_l
+
     finally:
         # Clean up the disposable rows we created.
         async with pool.acquire() as conn:
@@ -588,7 +671,8 @@ async def main() -> int:
                 await conn.execute(
                     "DELETE FROM runtime_traces WHERE session_id=$1", sess)
             for rid in (run_id, spoke_run_id, pause_run_id, reject_run_id,
-                        fire_run_id, fire_run_id2, fire_run_id3):
+                        fire_run_id, fire_run_id2, fire_run_id3,
+                        gate_run_id, gate_run_id2, gate_run_id3, gate_run_id4):
                 if rid is not None:
                     await conn.execute(
                         "DELETE FROM agent_runtime_runs WHERE id=$1", rid)

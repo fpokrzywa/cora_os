@@ -110,26 +110,33 @@ function EvaluationCard({ evaluation }: { evaluation: AgentEvaluation }) {
 function InterruptCard({
   runId,
   interrupt,
+  evaluation,
   onResolved,
 }: {
   runId: string;
   interrupt: AgentInterrupt;
+  evaluation?: AgentEvaluation | null;
   onResolved?: () => void;
 }) {
   const [busy, setBusy] = useState(false);
   const [decided, setDecided] = useState<string | null>(interrupt.decision);
   const [err, setErr] = useState<string | null>(null);
+  // Set when an approve is refused by the evaluator gate (HTTP 409) — reveals an
+  // explicit "Override & approve" action so a 'fail' verdict can be forced past.
+  const [gateBlocked, setGateBlocked] = useState(false);
 
-  const decide = async (decision: "approve" | "reject") => {
+  const decide = async (decision: "approve" | "reject", override?: boolean) => {
     if (busy) return;
     setBusy(true);
     setErr(null);
     try {
-      await decideAgentRun(runId, decision);
+      await decideAgentRun(runId, decision, undefined, override);
       setDecided(decision);
       onResolved?.();
     } catch (e) {
-      setErr(e instanceof Error ? e.message : "Decision failed");
+      const msg = e instanceof Error ? e.message : "Decision failed";
+      if (msg.startsWith("409")) setGateBlocked(true);
+      setErr(msg);
     } finally {
       setBusy(false);
     }
@@ -138,6 +145,11 @@ function InterruptCard({
   return (
     <div className="agent-interrupt">
       <div className="agent-interrupt__head">⏸ Awaiting your approval</div>
+      {evaluation && (
+        <div className={`agent-verdict agent-verdict--${evaluation.verdict}`}>
+          evaluator verdict: <strong>{evaluation.verdict}</strong>
+        </div>
+      )}
       <p className="agent-cfg__note">
         This run staged the artifact(s) below. Approving records your decision; if
         calendar execution is enabled it also creates an approved calendar item on
@@ -188,7 +200,25 @@ function InterruptCard({
           }`}
         >
           {decided}d — recorded
+          {interrupt.override ? " (overrode evaluator)" : ""}
         </span>
+      ) : gateBlocked ? (
+        <div className="agent-interrupt__btns">
+          <button
+            className="btn btn--primary"
+            disabled={busy}
+            onClick={() => decide("approve", true)}
+          >
+            Override &amp; approve
+          </button>
+          <button
+            className="btn btn--ghost"
+            disabled={busy}
+            onClick={() => decide("reject")}
+          >
+            Reject
+          </button>
+        </div>
       ) : (
         <div className="agent-interrupt__btns">
           <button
@@ -274,6 +304,7 @@ function AgentPanel({ config }: { config: AgentRuntimeConfig | null }) {
               <StatusPill label="Delegation" on={config.delegation_enabled} />
               <StatusPill label="Write / staging" on={config.write_enabled} />
               <StatusPill label="Evaluator" on={config.eval_enabled} />
+              <StatusPill label="Eval gate" on={config.eval_gate_enabled} />
               <StatusPill label="Interrupt" on={config.interrupt_enabled} />
               <StatusPill label="Execution" on={config.execution_enabled} />
             </div>
@@ -376,6 +407,7 @@ function AgentPanel({ config }: { config: AgentRuntimeConfig | null }) {
                 <InterruptCard
                   runId={result.run_id}
                   interrupt={result.interrupt}
+                  evaluation={result.evaluation}
                 />
               )}
           </div>
@@ -503,6 +535,7 @@ function RunDetail({ runId, poll = false }: { runId: string; poll?: boolean }) {
         <InterruptCard
           runId={detail.id}
           interrupt={detail.interrupt}
+          evaluation={detail.evaluation}
           onResolved={reload}
         />
       )}

@@ -24,6 +24,7 @@ export interface AgentRuntimeConfig {
   delegation_enabled: boolean;
   write_enabled: boolean;
   eval_enabled: boolean;
+  eval_gate_enabled: boolean;
   interrupt_enabled: boolean;
   execution_enabled: boolean;
   max_steps: number;
@@ -68,6 +69,8 @@ export interface AgentInterrupt {
   staged: AgentStagedArtifact[];
   decision: "approve" | "reject" | null;
   note: string | null;
+  // True when an approve was forced past an evaluator 'fail' gate.
+  override?: boolean | null;
   // Per-artifact outcomes recorded when an approved run actually fired (only when
   // AGENT_EXECUTION_ENABLED is on); absent otherwise.
   executed?: AgentExecutedArtifact[] | null;

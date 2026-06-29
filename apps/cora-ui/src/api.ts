@@ -277,10 +277,14 @@ export function decideAgentRun(
   runId: string,
   decision: "approve" | "reject",
   note?: string,
+  override?: boolean,
 ) {
   return request<AgentRunDetail>(
     `/chat/agent/runs/${encodeURIComponent(runId)}/decision`,
-    { method: "POST", body: JSON.stringify({ decision, note: note ?? undefined }) },
+    {
+      method: "POST",
+      body: JSON.stringify({ decision, note: note ?? undefined, override: override || undefined }),
+    },
   );
 }
 

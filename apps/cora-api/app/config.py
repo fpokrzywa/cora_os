@@ -94,6 +94,16 @@ class Settings(BaseSettings):
     # records the decision ONLY and fires nothing (the Phase-7 internal behavior).
     agent_execution_enabled: bool = False
 
+    # Evaluator-gated approval (ties Phase 6 + 7). When true, APPROVING a paused run
+    # whose independent-evaluator verdict is 'fail' is BLOCKED — resolve_interrupt
+    # refuses (HTTP 409) and fires nothing — UNLESS the human explicitly overrides
+    # (decision payload override=true). 'pass'/'concerns'/absent verdicts approve
+    # normally; reject is never gated. Independent of agent_execution_enabled (it
+    # gates the decision, not the firing). Needs agent_eval_enabled to produce a
+    # verdict to gate on. Fail-closed: off -> approval is never blocked (Phase-7
+    # behavior unchanged).
+    agent_eval_gate_enabled: bool = False
+
     n8n_webhook_health_url: str = "http://n8n:5678/webhook/cora-health"
 
     # Self-hosted SearXNG metasearch — backs PULSE's web_search tool. Internal

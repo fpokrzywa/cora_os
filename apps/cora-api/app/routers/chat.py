@@ -1328,6 +1328,8 @@ async def chat_agent_get_run(
 class AgentDecisionRequest(BaseModel):
     decision: str  # "approve" | "reject"
     note: Optional[str] = None
+    # Override an evaluator 'fail' gate (agent_eval_gate_enabled) on approve.
+    override: bool = False
 
 
 @router.post(
@@ -1361,12 +1363,18 @@ async def chat_agent_decide(
             detail="run_id must be a UUID",
         ) from exc
     run = await agent_runtime.resolve_interrupt(
-        rid, user_id=current.id, decision=request.decision, note=request.note
+        rid, user_id=current.id, decision=request.decision, note=request.note,
+        override=request.override,
     )
     if run is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="no run awaiting your decision",
+        )
+    if run.get("blocked"):
+        # Evaluator-gated approval refused a 'fail' verdict (no override).
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail=run["reason"]
         )
     return run
 
@@ -1376,6 +1384,7 @@ class AgentConfigResponse(BaseModel):
     delegation_enabled: bool
     write_enabled: bool
     eval_enabled: bool
+    eval_gate_enabled: bool
     interrupt_enabled: bool
     execution_enabled: bool
     max_steps: int
@@ -1400,6 +1409,7 @@ async def chat_agent_config(
         delegation_enabled=settings.agent_delegation_enabled,
         write_enabled=settings.agent_write_enabled,
         eval_enabled=settings.agent_eval_enabled,
+        eval_gate_enabled=settings.agent_eval_gate_enabled,
         interrupt_enabled=settings.agent_interrupt_enabled,
         execution_enabled=settings.agent_execution_enabled,
         max_steps=settings.agent_runtime_max_steps,

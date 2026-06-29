@@ -474,7 +474,8 @@ async def _record_executed(run_id: Optional[uuid.UUID], interrupt: dict) -> None
 
 
 async def resolve_interrupt(
-    run_id: uuid.UUID, *, user_id, decision: str, note: Optional[str] = None
+    run_id: uuid.UUID, *, user_id, decision: str, note: Optional[str] = None,
+    override: bool = False,
 ) -> Optional[dict]:
     """Record a human approve/reject on a run paused at 'waiting_user' and resume it
     to a terminal state (approve -> done, reject -> cancelled). The decision is
@@ -482,9 +483,15 @@ async def resolve_interrupt(
     (off by default), the staged artifacts are then fired through their existing
     gated paths (calendar CREATE via _write_gate -> adapter; email is never sent) and
     each outcome is recorded on the run. With agent_execution_enabled off this records
-    the decision ONLY and fires nothing — the Phase-7 internal behavior. Returns the
-    updated run, or None if it is not found / not owned / not actually waiting.
-    decision must be 'approve' or 'reject'."""
+    the decision ONLY and fires nothing — the Phase-7 internal behavior.
+
+    Evaluator gate (agent_eval_gate_enabled): an APPROVE on a run whose evaluator
+    verdict is 'fail' is BLOCKED (nothing recorded, nothing fired, run stays waiting)
+    unless override=True. Returns {"blocked": True, "verdict", "reason"} in that case.
+    'pass'/'concerns'/absent verdicts and any reject are never gated.
+
+    Returns the updated run, the blocked marker, or None if it is not found / not
+    owned / not actually waiting. decision must be 'approve' or 'reject'."""
     if clients.db_pool is None:
         return None
     decision = (decision or "").strip().lower()
@@ -495,7 +502,7 @@ async def resolve_interrupt(
         async with conn.transaction():
             row = await conn.fetchrow(
                 """
-                SELECT interrupt, workspace_id FROM agent_runtime_runs
+                SELECT interrupt, evaluation, workspace_id FROM agent_runtime_runs
                 WHERE id = $1 AND (user_id = $2 OR user_id IS NULL)
                   AND status = 'waiting_user'
                 FOR UPDATE
@@ -504,10 +511,23 @@ async def resolve_interrupt(
             )
             if row is None:
                 return None
+            # Evaluator-gated approval: a 'fail' verdict blocks approve unless the
+            # human overrides. Checked under the lock, BEFORE any state change, so a
+            # blocked attempt leaves the run exactly as it was (still waiting_user).
+            verdict = str((dict(row["evaluation"] or {})).get("verdict") or "").lower()
+            if (decision == "approve" and settings.agent_eval_gate_enabled
+                    and verdict == "fail" and not override):
+                return {
+                    "blocked": True,
+                    "verdict": verdict,
+                    "reason": "Evaluator verdict 'fail' blocks approval; override to proceed.",
+                }
             interrupt = dict(row["interrupt"] or {})
             workspace_id = row["workspace_id"]
             interrupt["decision"] = decision
             interrupt["note"] = note
+            if override and decision == "approve":
+                interrupt["override"] = True
             await conn.execute(
                 """
                 UPDATE agent_runtime_runs
