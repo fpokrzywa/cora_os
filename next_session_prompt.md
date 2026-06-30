@@ -8,7 +8,7 @@ bugs. This doc is the entry point; deeper detail lives in code docstrings, the c
 `dgx_inference_backends` (do NOT re-summarize or rebuild shipped work).
 
 ## Git / deploy state (verify first)
-- **Everything is on `main`** — local `main` == `origin/main` @ **`df63b73`**. No feature branches remain
+- **Everything is on `main`** — local `main` == `origin/main` @ **`0ff4f44`**. No feature branches remain
   (each item this session FF-merged to `main` + pruned its branch). Quick check: `git log --oneline -8`,
   `docker compose ps`.
 - Stack up + healthy: `cora-api`, `cora-worker`, `cora-ui`, `cora-postgres`, MCPs, `cora-searxng` — built
@@ -29,14 +29,28 @@ bugs. This doc is the entry point; deeper detail lives in code docstrings, the c
   cora-worker` (env-only, no rebuild; code default is `ollama`).
 - **Agent flags ON:** `AGENT_RUNTIME_ENABLED`, `AGENT_DELEGATION_ENABLED`, `AGENT_WRITE_ENABLED`,
   `AGENT_INTERRUPT_ENABLED`, `AGENT_EVAL_ENABLED`, `AGENT_EVAL_GATE_ENABLED`, `AGENT_DELEGATION_MAX_PARALLEL=3`.
-- **OFF (the outward kill switches):** `AGENT_EXECUTION_ENABLED`, `EXTERNAL_EXECUTION_ENABLED`,
-  `CALENDAR_EXECUTION_ENABLED` (DB-override-toggleable in the app). Email send is hard-disabled regardless.
+- **OFF (the outward kill switch that matters):** `AGENT_EXECUTION_ENABLED` (the agent master gate —
+  `resolve_interrupt` checks it before `_fire_staged`, so the agent fires NOTHING while it's off).
+  `EXTERNAL_EXECUTION_ENABLED` is off (email). NOTE: `calendar_execution_enabled` is currently **ON** via a
+  DB runtime override (admin-toggled), and the per-provider `calendar_write` flag is on for google + microsoft
+  — so the ONLY thing gating an agent calendar write is `AGENT_EXECUTION_ENABLED`. Email send is hard-disabled
+  regardless.
 - ⚠️ **DGX vLLM server (`vllm-oss` container) MUST run with `--enable-auto-tool-choice --tool-call-parser
   openai`** for the agent loop's tool calls to parse (else empty `tool_calls` + `stop_reason 200012`). Set up
   this session by recreating the container (a raw `docker run`, NOT compose). See `dgx_inference_backends`.
 
 ## What shipped recently — DON'T rebuild (newest first)
 Reference, don't re-derive. All on `main`.
+- **Calendar UPDATE/DELETE firing + live-confirmed CREATE/UPDATE/DELETE** (`0ff4f44`) — the agent could only
+  fire a calendar CREATE; it now stages + fires UPDATE and CANCEL too, under the same gates. Two review-only
+  staging tools (`chronos_update_calendar_event`, `chronos_cancel_calendar_event`, seeded internal_action/
+  CHRONOS, taking provider + event_id [+ changed fields]); `_collect_staged` emits `calendar_update`/
+  `calendar_delete`; `_fire_staged` routes each to `chat_calendar.agent_fire_calendar_update`/`_delete`
+  (re-check `_write_gate('update'/'delete')`, fail-closed, never raises). InterruptCard renders the new types.
+  `verify_agent_runtime` Part M. **The whole agent approve→fire path (`resolve_interrupt → _fire_staged`) was
+  LIVE-CONFIRMED** against the real google_calendar: create→update→delete all fired (`allowed=t`,
+  `agent approve … ok` in `calendar_access_events`), calendar left clean, `AGENT_EXECUTION_ENABLED` armed
+  IN-PROCESS only (persistent flag still false, no restart). Backlog items 1 + 2 are DONE.
 - **Unread-inbox query** (`df63b73`) — "what do I have in my outlook that is unread" now detects → routes to
   the inbox handler → filters unread per provider (Gmail `is:unread`, Outlook `$filter=isRead eq false`).
   Was falling through to the general LLM. `verify_chat_inbox.py`. Live-verified (real 10 unread Outlook).
@@ -81,15 +95,15 @@ Reference, don't re-derive. All on `main`.
 - Don't recreate the postgres volume. Don't edit `cora-stack/docker-compose.yml` unless asked.
 
 ## 🛠️ Build backlog (operator picks)
-1. **Live calendar firing (outward — needs the operator + a throwaway event)** — the last unverified-live step:
-   enable `AGENT_EXECUTION_ENABLED` + `CALENDAR_EXECUTION_ENABLED` (interrupt + write already on) and confirm a
-   staged calendar CREATE fires on approve, on a THROWAWAY event. The machinery exists (`resolve_interrupt` →
-   `_fire_staged`); this is the live confirmation. Highest care.
-2. **Calendar update/delete firing** — the agent only fires CREATE today; extend to update/delete under the same gates.
-3. **Global-memory recall noise** — some demo/global memories rank into a user's personal recall; a scoping/cleanup
+*(Items 1 + 2 — live calendar firing and calendar update/delete firing — are DONE and live-confirmed; see
+the top of "What shipped recently".)*
+1. **Global-memory recall noise** — some demo/global memories rank into a user's personal recall; a scoping/cleanup
    pass would sharpen day-to-day chat. Small, safe, code-only.
-4. **`/chat` SSE streaming** — frontend + backend, for snappier perceived latency.
-5. **App-config-screen relocation under Cora Configuration** ("option 2") — UI polish.
+2. **`/chat` SSE streaming** — frontend + backend, for snappier perceived latency.
+3. **App-config-screen relocation under Cora Configuration** ("option 2") — UI polish.
+4. **Agent calendar READ tool** — the agent has no calendar read tool, so today it can only update/delete an
+   event whose `event_id` is already in the conversation (e.g. one the user pastes). A governed
+   `chronos_list_calendar_events` read tool would let it discover targets autonomously (NL "cancel my 3pm").
 
 ## Operator-only loose ends (surface, don't do)
 - `vllm-oss-prev` was already removed this session. If the DGX vLLM is ever restarted/rebooted, re-confirm it
@@ -110,8 +124,8 @@ Reference, don't re-derive. All on `main`.
   (`docker cp …:/tmp/v.py && docker exec -e PYTHONPATH=/app cora-api python /tmp/v.py`) + a route smoke when it
   touches a route → commit on a `feat/`/`fix/` branch → report with concrete in-app test steps → on **"push"**,
   FF `main` + push + delete the branch.
-- **26 `scripts/verify_*.py`** cover the suite (deterministic, in-container; `verify_agent_runtime.py` = 71
-  assertions Parts A–L). Behavioral `/chat` testing needs an operator JWT (browser DevTools → any API call's
+- **26 `scripts/verify_*.py`** cover the suite (deterministic, in-container; `verify_agent_runtime.py` = 78
+  assertions Parts A–M). Behavioral `/chat` testing needs an operator JWT (browser DevTools → any API call's
   `Authorization: Bearer …`); `/auth/register` is admin-locked.
 - Keep `HANDOFF_SESSION.md` + these memories current as work lands (update, don't just append):
   `agent_runtime_build`, `dgx_inference_backends`.
