@@ -45,7 +45,7 @@ Ranking = leverage (for voice) × effort. Effort: **S** ≈ hours, **M** ≈ ~a 
 | 8 | ✅ **Generation cancellation / barge-in** (`47e4481`) — mid-stream disconnect aborts the upstream vLLM gen (httpx teardown) + records a `cancelled` trace + persists the partial | Barge-in (user talks over Cora) needs a real stop | S–M — **DONE** (`verify_chat_cancel.py`) |
 | 9 | **Decide email-send stance for voice** — send is architecturally absent; "email Bob" will always refuse. Keep blocked + graceful refusal, or open a governed staged path | Product stance | S (decision) |
 | 10 | **MCP postgres/github** — currently placeholder images | Only if voice exposes DB/repo Q&A | L (defer) |
-| 11 | **Planner step execution** — template-only stub today | Only if voice surfaces runnable "plans" | L (defer) |
+| 11 | ✅ **Planner step execution** (`aaba2a9`) — `POST /plans/{id}/execute` runs steps in order through the governed per-step path, halt-on-failure, behind `PLAN_EXECUTION_ENABLED` | Only if voice surfaces runnable "plans" | L — **DONE** (`verify_plan_execution.py`) |
 
 ---
 
@@ -57,13 +57,16 @@ Ranking = leverage (for voice) × effort. Effort: **S** ≈ hours, **M** ≈ ~a 
 5. **#6 routing** + **#7 memory cleanup/disambiguation**.
 6. P2 as the voice layer firms up.
 
-## Status — pre-UI capability phase COMPLETE (2026-06-30)
-P0 (#1–3), P1 (#4–7), and the one buildable P2 item (#8) are all shipped + live on `main` @ `47e4481`.
-Remaining P2 is operator/deferred: **#9** email-send stance (policy call — still hard-disabled), **#10**
-MCP postgres/github (placeholder images), **#11** Planner step execution (template stub). Plus **n8n is
-not deployed**, which keeps FORGE a codebase/infra *inspector* rather than an n8n executor. **Next phase:
-the voice-first UI client itself** (mic → STT → `/chat` SSE stream → TTS → barge-in) — the backend now
-supports it end-to-end.
+## Status — pre-UI phase COMPLETE + voice UI v1 SHIPPED (2026-06-30, `main` @ `0294803`)
+P0 (#1–3), P1 (#4–7), and P2 #8 + #11 are shipped + live. **The voice-first UI v1 itself has shipped**
+(`0294803`): browser Web Speech — 🎤 mic STT, 🔈 spoken-reply toggle (`speakable:true`), barge-in — behind a
+SWAPPABLE wrapper (`apps/cora-ui/src/voice/speech.ts`). Remaining is operator-steered:
+- **Cloud STT/TTS swap** — browser engines are Chromium/Safari-only + variable quality; swap the wrapper
+  (needs a provider choice + keys).
+- **Voice v2 polish (buildable solo)** — sentence-chunked TTS (speak as it streams, not on `done`),
+  continuous/wake-word listening, full-screen voice mode, interim-transcript display.
+- **#9** email-send stance (policy call — still hard-disabled), **#10** MCP postgres/github (placeholder
+  images), **n8n not deployed** (keeps FORGE an inspector, not an n8n executor).
 
 ## Resolved decisions
 - **FORGE direction** → shipped as a **codebase/infra inspector** (live filesystem reads); the n8n-executor
