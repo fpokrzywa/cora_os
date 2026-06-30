@@ -37,7 +37,12 @@ from app.agents.chronos import (
 from app.agents.routing import select_subagent, semantic_route
 from app.agents.planner import create_plan, match_plan_intent
 from app.agents.registry import get_active_version, load_active_routing_keywords
-from app.memory import is_embedding_configured, semantic_search
+from app.memory import (
+    detect_ambiguous_recall,
+    disambiguation_instruction,
+    is_embedding_configured,
+    semantic_search,
+)
 from app import llm
 from app.runtime_traces import write_trace
 from app.screen_context import build_screen_context_block
@@ -334,6 +339,14 @@ def _format_memory_block(memories: list[dict]) -> str:
         if len(content) > MEMORY_CONTENT_CHARS:
             content = content[:MEMORY_CONTENT_CHARS].rstrip() + "…"
         lines.append(f"- [{m['title']}]{cite} {content}")
+    # Same-title / different-content recall is genuinely ambiguous (the user has
+    # two competing values for one fact). Append a one-line instruction so the
+    # assistant asks a single clarifying question instead of guessing — reads as a
+    # spoken "which one?" in voice mode. High-precision: fires only on a real
+    # collision, so it's a no-op for ordinary recall.
+    ambiguous = detect_ambiguous_recall(memories)
+    if ambiguous:
+        lines.append(disambiguation_instruction(ambiguous))
     return "\n".join(lines)
 
 
