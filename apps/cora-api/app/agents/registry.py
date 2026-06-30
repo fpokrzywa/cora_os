@@ -15,6 +15,7 @@ from app.agents.forge import (
     FORGE_ALLOWED_TOOLS,
     FORGE_ROUTING_KEYWORDS,
     FORGE_SYSTEM_PROMPT,
+    FORGE_TOOL_AWARE_MARKER,
 )
 from app.agents.pulse import (
     PULSE_ALLOWED_TOOLS,
@@ -174,6 +175,72 @@ async def seed_agents() -> None:
                     "agent seeded: name=%s v1 activated", name
                 )
     logger.info("Agent registry seed complete")
+
+
+async def ensure_forge_tool_aware_version() -> None:
+    """Lift FORGE off its original tool-suppressing seed prompt onto the tool-aware
+    one (it can read the live codebase via its filesystem tools). Idempotent and
+    no-clobber: acts ONLY when FORGE's active version is still the pristine seeded v1
+    (notes marker) whose prompt predates the rewrite; once the tool-aware version is
+    active — or if an operator has edited FORGE via the admin path — it does nothing.
+    Adds a NEW active version (preserving history), archiving the old one first to
+    respect the one-active-version-per-agent index. Best-effort: never raises."""
+    if clients.db_pool is None:
+        return
+    try:
+        async with clients.db_pool.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    """
+                    SELECT a.id AS agent_id, v.id AS version_id,
+                           v.system_prompt, v.notes
+                    FROM agents a
+                    JOIN agent_versions v ON v.id = a.current_version_id
+                    WHERE a.name = 'FORGE'
+                    FOR UPDATE OF v
+                    """
+                )
+                if row is None:
+                    return
+                # Already tool-aware (fresh installs seed the new prompt directly),
+                # or operator-customized -> leave untouched.
+                if FORGE_TOOL_AWARE_MARKER in (row["system_prompt"] or ""):
+                    return
+                if (row["notes"] or "") != "Seeded v1 from Python module":
+                    return
+                next_num = await conn.fetchval(
+                    "SELECT COALESCE(MAX(version_number), 0) + 1 "
+                    "FROM agent_versions WHERE agent_id = $1",
+                    row["agent_id"],
+                )
+                # Archive the current active version BEFORE inserting the new active
+                # one (a partial unique index allows only one active per agent).
+                await conn.execute(
+                    "UPDATE agent_versions SET status = 'archived', archived_at = NOW() "
+                    "WHERE id = $1",
+                    row["version_id"],
+                )
+                new_id = await conn.fetchval(
+                    """
+                    INSERT INTO agent_versions (
+                        agent_id, version_number, status, system_prompt,
+                        routing_keywords, allowed_tools, notes, activated_at
+                    )
+                    VALUES ($1, $2, 'active', $3, $4, $5,
+                            'Auto-migrated: tool-aware FORGE (filesystem inspector)', NOW())
+                    RETURNING id
+                    """,
+                    row["agent_id"], next_num, FORGE_SYSTEM_PROMPT,
+                    list(FORGE_ROUTING_KEYWORDS), list(FORGE_ALLOWED_TOOLS),
+                )
+                await conn.execute(
+                    "UPDATE agents SET current_version_id = $1, updated_at = NOW() "
+                    "WHERE id = $2",
+                    new_id, row["agent_id"],
+                )
+        logger.info("FORGE migrated to tool-aware version v%s", next_num)
+    except Exception:
+        logger.exception("ensure_forge_tool_aware_version failed (continuing)")
 
 
 async def load_active_routing_keywords() -> dict[str, list[str]]:

@@ -9,7 +9,7 @@ from app.auth import get_current_user, require_admin
 from app.clients import close_clients, init_clients
 from app.config import settings
 from app.logging_config import configure_logging
-from app.agents.registry import seed_agents
+from app.agents.registry import ensure_forge_tool_aware_version, seed_agents
 from app.mcp import seed_mcp_servers
 from app.routers import (
     admin,
@@ -66,6 +66,7 @@ async def lifespan(_app: FastAPI):
     await init_clients()
     await init_schema()
     await seed_agents()
+    await ensure_forge_tool_aware_version()
     await seed_mcp_servers()
     try:
         yield

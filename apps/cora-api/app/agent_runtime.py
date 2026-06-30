@@ -81,11 +81,22 @@ READ_ONLY_TOOLS: dict[str, dict] = {
         },
     },
     "filesystem_read_file": {
-        "description": "Read a single file via the filesystem MCP server. Read-only.",
+        "description": "Read a single file via the filesystem MCP server. Read-only. "
+        "For a large file, read a slice with line_start/line_end (1-indexed, "
+        "inclusive); the result reports total_lines and next_line so you can "
+        "continue. Don't re-read the same range expecting more.",
         "parameters": {
             "type": "object",
             "properties": {
                 "path": {"type": "string", "description": "File path to read."},
+                "line_start": {
+                    "type": "integer",
+                    "description": "1-indexed first line to return (optional; for large files).",
+                },
+                "line_end": {
+                    "type": "integer",
+                    "description": "Inclusive last line to return (optional). Pair with line_start.",
+                },
             },
             "required": ["path"],
         },
@@ -947,13 +958,20 @@ async def _build_catalog(
     return catalog
 
 
+# Per-tool observation budget fed back to the model. Large enough that a whole
+# config/Dockerfile/compose or a ~200-line source slice fits in one read (so the
+# model doesn't loop trying to paginate small files); large files page via
+# filesystem_read_file line ranges.
+_MAX_TOOL_RESULT_CHARS = 12000
+
+
 def _result_to_text(result: Any) -> str:
     if isinstance(result, str):
-        return result[:4000]
+        return result[:_MAX_TOOL_RESULT_CHARS]
     try:
-        return json.dumps(result, default=str)[:4000]
+        return json.dumps(result, default=str)[:_MAX_TOOL_RESULT_CHARS]
     except (TypeError, ValueError):
-        return str(result)[:4000]
+        return str(result)[:_MAX_TOOL_RESULT_CHARS]
 
 
 def _parse_args(raw: Any) -> dict:
@@ -1129,11 +1147,18 @@ async def _dispatch_read_only(
         )
         return _result_to_text(result)
 
+    # Forward only the arguments the tool advertises. Models sometimes invent extra
+    # params (e.g. a line_start/line_end the filesystem MCP read_file rejects), which
+    # would crash an otherwise valid call; unknown keys are dropped, not passed.
+    allowed_keys = set(
+        (READ_ONLY_TOOLS.get(name, {}).get("parameters", {}).get("properties", {})).keys()
+    )
+    safe_args = {k: v for k, v in args.items() if k in allowed_keys} if allowed_keys else dict(args)
     payload = {
         "session_id": session_id,
         "user_message": None,
-        "arguments": args,  # web_search runner reads payload['arguments']
-        "metadata": args,   # mcp_action runner reads payload['metadata']
+        "arguments": safe_args,  # web_search runner reads payload['arguments']
+        "metadata": safe_args,   # mcp_action runner reads payload['metadata']
     }
     started = time.perf_counter()
     try:

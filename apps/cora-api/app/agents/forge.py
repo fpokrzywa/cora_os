@@ -29,12 +29,21 @@ FORGE_SPECIALIZATIONS: list[str] = [
     "architecture reviews",
 ]
 
-# Tools FORGE is permitted to *recommend* invoking. Actual execution still
-# goes through the existing /tools/{name}/run endpoint — FORGE never calls
-# tools autonomously in v0.1.
+# Read-only tools FORGE owns in the agent runtime (governed via tools.allowed_agents
+# = ['FORGE']; this list is the advisory mirror surfaced in the agent admin). Both
+# hit the real filesystem MCP server over the project repo. n8n automation
+# (n8n_health_check / workflow triggers) is intentionally absent until an n8n service
+# is deployed — see VOICE_UI_READINESS.md.
 FORGE_ALLOWED_TOOLS: list[str] = [
-    "n8n_health_check",
+    "filesystem_list_project",
+    "filesystem_read_file",
 ]
+
+# Stable phrase guaranteed present in the tool-aware prompt below. The startup
+# migration (registry.ensure_forge_tool_aware_version) keys off it to lift FORGE
+# off its original tool-suppressing seed prompt exactly once, without clobbering an
+# operator-edited version. Keep it in sync with FORGE_SYSTEM_PROMPT.
+FORGE_TOOL_AWARE_MARKER = "ground your answers in the live codebase"
 
 FORGE_ROUTING_KEYWORDS: list[str] = [
     "code",
@@ -74,17 +83,27 @@ FORGE_SYSTEM_PROMPT = (
     "FORGE specializations: "
     + ", ".join(FORGE_SPECIALIZATIONS)
     + ".\n\n"
+    "You can inspect the live system. You have read-only filesystem tools — "
+    "filesystem_list_project (list a directory) and filesystem_read_file "
+    "(read a file) — over the actual project repository. Use them to "
+    "ground your answers in the live codebase and configuration rather than "
+    "guessing: when the question is about how something here is built, "
+    "configured, or wired (a Dockerfile, a compose service, a config key, a "
+    "route, an error in this project), LIST and READ the relevant files "
+    "first, then answer from what you actually found. Prefer one or two "
+    "targeted reads over broad listing.\n\n"
     "Operating principles:\n"
     "- Be concise and practical. Lead with the answer, not the preamble.\n"
-    "- Provide actionable engineering guidance: exact commands, file paths, "
-    "snippets, and config keys.\n"
-    "- Never claim to have run a tool, deployed code, or modified "
-    "infrastructure unless an actual tool call has returned a result in "
-    "this turn. Recommend the command or action and let the user execute "
-    "it.\n"
-    "- When you see an error, stack trace, or failure: state the root "
-    "cause in one or two sentences, give the immediate fix, then (only if "
-    "relevant) note a longer-term improvement.\n"
+    "- Ground claims in files you read this turn and cite the path. Never "
+    "invent file contents, config values, or line numbers — if you haven't "
+    "read it, read it or say you're inferring.\n"
+    "- You are READ-ONLY: you cannot edit files, deploy, run shell commands, "
+    "or change infrastructure. For any change, give the exact command or "
+    "edit and let the user run it. Never claim to have run or changed "
+    "anything unless a tool result in this turn shows it.\n"
+    "- On an error, stack trace, or failure: read the relevant file if it is "
+    "in this project, state the root cause in one or two sentences, give the "
+    "immediate fix, then (only if relevant) a longer-term improvement.\n"
     "- Recommend architecture improvements only when they're materially "
     "better. Don't propose rewrites for cosmetic issues.\n"
     "- Work within the existing Cora architecture: ATLAS orchestrates, "

@@ -63,11 +63,23 @@ TOOL_DEFS: list[dict] = [
         "name": "read_file",
         "description": (
             "Read a file from the workspace. Read-only. Capped at "
-            f"{MAX_READ_BYTES} bytes; truncation is reported in the response."
+            f"{MAX_READ_BYTES} bytes; truncation is reported in the response. "
+            "Pass line_start/line_end (1-indexed, inclusive) to read a slice of a "
+            "large file; the response reports total_lines and next_line to continue."
         ),
         "input_schema": {
             "type": "object",
-            "properties": {"path": {"type": "string"}},
+            "properties": {
+                "path": {"type": "string"},
+                "line_start": {
+                    "type": "integer",
+                    "description": "1-indexed first line to return (optional).",
+                },
+                "line_end": {
+                    "type": "integer",
+                    "description": "Inclusive last line to return (optional).",
+                },
+            },
             "required": ["path"],
         },
     },
@@ -106,7 +118,11 @@ def _list_directory(path: str = ".") -> dict:
     return {"path": rel, "count": len(entries), "entries": entries}
 
 
-def _read_file(path: str) -> dict:
+def _read_file(
+    path: str,
+    line_start: Optional[int] = None,
+    line_end: Optional[int] = None,
+) -> dict:
     if not path:
         raise HTTPException(status_code=400, detail="path is required")
     target = _safe_resolve(path)
@@ -115,7 +131,7 @@ def _read_file(path: str) -> dict:
     if not target.is_file():
         raise HTTPException(status_code=400, detail=f"not a regular file: {path}")
     size = target.stat().st_size
-    truncated = size > MAX_READ_BYTES
+    byte_truncated = size > MAX_READ_BYTES
     with target.open("rb") as fh:
         data = fh.read(MAX_READ_BYTES)
     try:
@@ -125,12 +141,35 @@ def _read_file(path: str) -> dict:
         text = data.decode("utf-8", errors="replace")
         binary = True
     rel = target.relative_to(WORKSPACE).as_posix()
+    lines = text.splitlines()
+    total_lines = len(lines)
+    next_line: Optional[int] = None
+    sliced = line_start is not None or line_end is not None
+    if sliced:
+        start = max(1, int(line_start) if line_start else 1)
+        end = int(line_end) if line_end else total_lines
+        if end < start:
+            end = start
+        content = "\n".join(lines[start - 1:end])
+        out_start = start if total_lines else 0
+        out_end = min(end, total_lines)
+        if out_end < total_lines:
+            next_line = out_end + 1
+    else:
+        content = text
+        out_start = 1 if total_lines else 0
+        out_end = total_lines
     return {
         "path": rel,
         "size_bytes": size,
-        "truncated": truncated,
+        "total_lines": total_lines,
+        "line_start": out_start,
+        "line_end": out_end,
+        "next_line": next_line,
+        "truncated": byte_truncated,
+        "sliced": sliced,
         "binary": binary,
-        "content": text,
+        "content": content,
     }
 
 
