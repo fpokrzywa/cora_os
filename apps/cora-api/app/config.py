@@ -179,5 +179,14 @@ class Settings(BaseSettings):
     # time. Requires the tzdata package for non-UTC names (in requirements.txt).
     cora_timezone: str = "UTC"
 
+    # Semantic routing fallback. When true AND deterministic keyword routing scores
+    # 0 (no specialist keyword and no explicit intent override matched), one cheap
+    # LLM classification call picks a specialist from the user's intent so phrasing
+    # the keyword lists don't anticipate ("dig up what people are saying about X")
+    # still reaches the right agent. Fail-open: any failure / unrecognized label
+    # leaves routing on the Cora persona — identical to today's behavior. Default
+    # false → the deterministic path is the only path until an operator opts in.
+    semantic_routing_enabled: bool = False
+
 
 settings = Settings()

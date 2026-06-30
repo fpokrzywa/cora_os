@@ -11,11 +11,14 @@ the order subagents are listed in `_CANDIDATES` (earlier = preferred). If no
 subagent matches, the Cora persona handles the message directly.
 """
 
+import logging
 import re
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 
 from app.agents import chronos, forge, pulse, signal
+
+logger = logging.getLogger(__name__)
 
 PERSONA_NAME = "Cora"
 
@@ -128,3 +131,114 @@ def diagnose_routing(
         tie_break_applied=tie_break_applied,
         matched_for_selected=sel_matched,
     )
+
+
+# --------------------------------------------------------------------------- #
+# Semantic routing fallback (LLM classifier)
+#
+# Keyword routing is exact and deterministic but blind to phrasing the keyword
+# lists don't anticipate ("dig up what people are saying about X" never hits any
+# of PULSE's literal keywords). When `select_subagent` scores 0 — and no explicit
+# intent override fired — a single cheap LLM classification picks a specialist
+# from the user's intent. This matters most for voice, where phrasing varies far
+# more than typed prompts.
+#
+# Embeddings were evaluated FIRST and rejected: against the live nomic-embed-text
+# model, unrelated chit-chat ("thanks, that was helpful") scores a HIGHER cosine
+# to the agent profiles (~0.48) than some correct routes (~0.47), and the top-2
+# margin doesn't separate real routes from noise either — so neither an absolute
+# floor nor a margin gate is reliable. A constrained classification call is.
+#
+# The whole path is opt-in (settings.semantic_routing_enabled) and fail-open: any
+# error, an empty reply, or an unrecognized label leaves routing on the Cora
+# persona — byte-for-byte today's behavior.
+# --------------------------------------------------------------------------- #
+
+# name -> one-line domain description shown to the classifier.
+_SEMANTIC_DESCRIPTIONS: list[tuple[str, str]] = [
+    (forge.NAME, "engineering and technical work: writing or debugging code, errors "
+                 "and stack traces, APIs, Docker, infrastructure, deployment, "
+                 "databases, system architecture"),
+    (pulse.NAME, "research and information gathering: investigating or comparing "
+                 "things, analysis, summaries, looking into a topic, news and "
+                 "current events, best practices"),
+    (signal.NAME, "communication and writing for people: drafting emails, messages, "
+                  "replies, announcements, status or stakeholder updates, notes, memos"),
+    (chronos.NAME, "time and planning: scheduling, calendars, meetings, deadlines, "
+                   "reminders, timelines, milestones, availability, planning a day "
+                   "or week"),
+]
+
+_CLASSIFIER_SYSTEM = (
+    "You are an intent router for an AI assistant. Read the user's message and "
+    "decide which ONE internal specialist should handle it, or NONE if it is "
+    "general conversation that needs no specialist. Reply with EXACTLY one word "
+    "and nothing else."
+)
+
+# The DGX serves a reasoning model (gpt-oss): it spends hidden reasoning tokens
+# before emitting the final-channel answer, so a tiny budget gets cut off mid-
+# reasoning and returns an empty string. 256 leaves comfortable room for the
+# reasoning plus the one-word label; the backend returns only the clean final
+# label, so parsing stays trivial. (Measured: empty at 8/32, clean at 128.)
+_CLASSIFIER_MAX_TOKENS = 256
+
+
+def _build_classifier_prompt(message: str) -> str:
+    lines = ["Specialists:"]
+    for name, desc in _SEMANTIC_DESCRIPTIONS:
+        lines.append(f"- {name}: {desc}")
+    lines.append("- NONE: general chat, greetings, or anything no specialist fits")
+    lines.append("")
+    lines.append(f'User message: "{message.strip()}"')
+    lines.append("")
+    lines.append(
+        "Answer with one of: "
+        + ", ".join(name for name, _ in _SEMANTIC_DESCRIPTIONS)
+        + ", NONE."
+    )
+    return "\n".join(lines)
+
+
+def _parse_classifier_choice(raw: Optional[str]) -> str:
+    """Map a raw classifier reply to an agent name, or PERSONA_NAME for NONE /
+    empty / unrecognized output. If several agent names appear, the earliest-
+    mentioned wins. Deterministic — no model call, so it is unit-testable."""
+    up = (raw or "").upper()
+    best_pos: Optional[int] = None
+    best_name = PERSONA_NAME
+    for name, _ in _SEMANTIC_DESCRIPTIONS:
+        i = up.find(name)
+        if i != -1 and (best_pos is None or i < best_pos):
+            best_pos, best_name = i, name
+    return best_name
+
+
+async def semantic_route(
+    message: str,
+    *,
+    generate: Optional[Callable[..., Awaitable[str]]] = None,
+) -> tuple[str, str]:
+    """LLM-classify `message` to a specialist when keyword routing found nothing.
+
+    Returns (agent_name, raw_reply). agent_name is PERSONA_NAME ('Cora') whenever
+    the classifier says NONE, returns nothing usable, or the call fails — so the
+    caller can treat 'stayed on Cora' as 'no fallback applied'. `generate` is
+    injectable for tests; defaults to app.llm.generate_text.
+    """
+    if not message or not message.strip():
+        return (PERSONA_NAME, "")
+    if generate is None:
+        from app.llm import generate_text as generate
+    prompt = _build_classifier_prompt(message)
+    try:
+        raw = await generate(
+            prompt,
+            system=_CLASSIFIER_SYSTEM,
+            max_tokens=_CLASSIFIER_MAX_TOKENS,
+            temperature=0.0,
+        )
+    except Exception:
+        logger.exception("semantic_route classification failed; staying on persona")
+        return (PERSONA_NAME, "")
+    return (_parse_classifier_choice(raw), (raw or "").strip())

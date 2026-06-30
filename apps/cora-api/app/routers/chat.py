@@ -34,7 +34,7 @@ from app.agents.chronos import (
     CHRONOS_SYSTEM_PROMPT,
     NAME as CHRONOS_NAME,
 )
-from app.agents.routing import select_subagent
+from app.agents.routing import select_subagent, semantic_route
 from app.agents.planner import create_plan, match_plan_intent
 from app.agents.registry import get_active_version, load_active_routing_keywords
 from app.memory import is_embedding_configured, semantic_search
@@ -2606,6 +2606,22 @@ async def chat(
         selected_agent = CHRONOS_NAME
         if not matched_keywords:
             matched_keywords = ["save proposal"]
+    # Semantic routing fallback: keyword routing AND every explicit intent override
+    # found nothing (selected_agent is still the Cora persona), so the message used
+    # phrasing the keyword lists don't cover. When enabled, one cheap LLM
+    # classification picks a specialist; fail-open — it can only move OFF Cora, never
+    # override a deterministic match. (Verified vs embeddings, which were unreliable.)
+    if selected_agent == PERSONA_NAME and settings.semantic_routing_enabled:
+        sem_agent, sem_raw = await semantic_route(request.message)
+        if sem_agent != PERSONA_NAME:
+            logger.info(
+                "semantic routing fallback: session=%s selected_agent=%s raw=%r",
+                session_id,
+                sem_agent,
+                sem_raw,
+            )
+            selected_agent = sem_agent
+            matched_keywords = ["(semantic)"]
     logger.info(
         "agent routing: session=%s user_id=%s selected_agent=%s "
         "matched_keywords=%s web_search=%s",
