@@ -132,8 +132,9 @@ Older still-open candidates (pre-agent-runtime, if preferred): the governed emai
 ## 13. Suggested First Message for the New Session
 
 > **The canonical, current first message now lives in [`next_session_prompt.md`](./next_session_prompt.md)**
-> (kept current; updated 2026-06-30 — `main` @ `d2adc0e`, all inference on vLLM/gpt-oss-120b, 27 verify
-> scripts incl. `verify_agent_runtime.py` = 78 assertions). Read that first, then this brief's §9-backed
+> (kept current; updated 2026-06-30 — `main` @ `831cbf8`, all inference on vLLM/gpt-oss-120b, 33 verify
+> scripts incl. `verify_agent_runtime.py` = 78 assertions; the voice-first UI readiness push shipped 6
+> capabilities, P1 #6/#7 remain). Read that first, then this brief's §9-backed
 > What's Completed + §10 backlog for detail. **The paragraphs below are retained for reference but predate
 > the 2026-06-28→29 vLLM/agent-runtime work — trust `next_session_prompt.md` + What's Completed over them.**
 >

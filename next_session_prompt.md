@@ -10,11 +10,11 @@ and the auto-memories `agent_runtime_build` + `dgx_inference_backends` + `projec
 (do NOT re-summarize or rebuild shipped work).
 
 ## Git / deploy state (verify first)
-- **Everything is on `main` — local `main` == `origin/main` @ `aebc510`** (pushed at session end; the
-  `feat/voice-readiness` branch was FF-merged + deleted). The 8 commits, newest first: `aebc510` docs ·
-  `5386f31` speakable · `548d382` PULSE · `bd029d9` FORGE · `ad0466f` spoken confirm · `7beb656`
-  VOICE_UI_READINESS.md · `8993ff5` calendar read · `a2721d8` SSE streaming. No feature branches remain.
-  Quick check: `git log --oneline -10`, `docker compose ps`.
+- **Everything is on `main` — local `main` == `origin/main` @ `831cbf8`** (pushed at session end; the
+  `feat/voice-readiness` branch was FF-merged + deleted). This session's commits, newest first: `831cbf8`
+  docs-state fix · `aebc510` docs · `5386f31` speakable · `548d382` PULSE · `bd029d9` FORGE · `ad0466f`
+  spoken confirm · `7beb656` VOICE_UI_READINESS.md · `8993ff5` calendar read · `a2721d8` SSE streaming.
+  No feature branches remain. Quick check: `git log --oneline -10`, `docker compose ps`.
 - **The deployed stack runs this code** (each item was `docker compose build` + `up -d`), so **live == `main`**.
   Stack up + healthy: `cora-api`, `cora-worker`, `cora-ui`, `cora-postgres`, MCPs (incl. the rebuilt
   `mcp-filesystem`), `cora-searxng`.
