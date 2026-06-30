@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import re
@@ -3649,6 +3650,47 @@ async def chat(
         await _emit_chat_trace("ok", llm_duration_ms)
         return assistant_response, completed_at
 
+    async def _finalize_cancelled(partial_text: str, duration_ms: int) -> None:
+        """Finalize a stream cut short by a client disconnect (voice barge-in):
+        the user started talking, navigated away, or dropped, so the model task is
+        being cancelled. We skip the draft/proposal hooks (the turn was interrupted)
+        and instead record a `cancelled` trace and persist whatever was produced, so
+        a spoken follow-up keeps context. Note: `partial_text` is what the SERVER
+        streamed, which can be slightly ahead of what the client actually played.
+        Best-effort — every step is guarded so cleanup never masks the disconnect."""
+        completed_at = datetime.now(timezone.utc)
+        if routing_delegation_id is not None:
+            try:
+                await fail_delegation(
+                    routing_delegation_id,
+                    error_message="client disconnected (barge-in)",
+                    user_id=current.id,
+                )
+            except Exception:
+                logger.exception("routing delegation cancel-update failed")
+        if partial_text:
+            try:
+                await _persist_exchange(
+                    session_uuid=session_uuid,
+                    scope_type=scope_type,
+                    scope_id=scope_id,
+                    user_message=request.message,
+                    assistant_response=partial_text,
+                    model_name=llm.active_chat_model(),
+                    placeholder=False,
+                    started_at=started_at,
+                    completed_at=completed_at,
+                    agent_name=selected_agent,
+                    workspace_id=workspace_uuid,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to persist interrupted exchange session=%s", session_id
+                )
+        await _emit_chat_trace(
+            "cancelled", duration_ms, "client disconnected (barge-in)"
+        )
+
     # Streaming reply path (opt-in via request.stream): same prompt + finalization,
     # but the model's text is forwarded token-by-token as Server-Sent Events. The
     # `done` event carries the authoritative full response (including any appended
@@ -3688,6 +3730,24 @@ async def chat(
                     {"type": "error", "detail": f"Chat model request failed: {exc}"}
                 )
                 return
+            except asyncio.CancelledError:
+                # Barge-in: the client closed the connection mid-stream (user spoke
+                # over the reply, navigated away, or dropped). Unwinding here tears
+                # down llm.stream_text's httpx stream, which closes the upstream
+                # connection and aborts generation on the model server — freeing the
+                # GPU instead of generating tokens nobody will hear. Shield the
+                # cleanup so the trace + partial persist complete even though this
+                # task is being cancelled, then re-raise to finish the teardown.
+                duration_ms = int((time.perf_counter() - stream_started) * 1000)
+                logger.info(
+                    "chat stream cancelled (barge-in) session=%s streamed_chars=%s",
+                    session_id,
+                    sum(len(p) for p in parts),
+                )
+                await asyncio.shield(
+                    _finalize_cancelled("".join(parts).strip(), duration_ms)
+                )
+                raise
             duration_ms = int((time.perf_counter() - stream_started) * 1000)
             final_response, completed_at = await _finalize(
                 "".join(parts).strip(), duration_ms
