@@ -21,6 +21,7 @@ from app.agents.pulse import (
     PULSE_ALLOWED_TOOLS,
     PULSE_ROUTING_KEYWORDS,
     PULSE_SYSTEM_PROMPT,
+    PULSE_WEB_AWARE_MARKER,
 )
 from app.agents.signal import (
     SIGNAL_ALLOWED_TOOLS,
@@ -177,14 +178,22 @@ async def seed_agents() -> None:
     logger.info("Agent registry seed complete")
 
 
-async def ensure_forge_tool_aware_version() -> None:
-    """Lift FORGE off its original tool-suppressing seed prompt onto the tool-aware
-    one (it can read the live codebase via its filesystem tools). Idempotent and
-    no-clobber: acts ONLY when FORGE's active version is still the pristine seeded v1
-    (notes marker) whose prompt predates the rewrite; once the tool-aware version is
-    active — or if an operator has edited FORGE via the admin path — it does nothing.
-    Adds a NEW active version (preserving history), archiving the old one first to
-    respect the one-active-version-per-agent index. Best-effort: never raises."""
+async def _ensure_prompt_revision(
+    agent_name: str, new_prompt: str, marker: str, notes: str,
+    *, allowed_tools: list[str], stale_phrase: str,
+) -> None:
+    """Replace an agent's active system prompt with `new_prompt` as a NEW active
+    version (preserving history + the active version's routing keywords). Fixes a
+    known-stale prompt without clobbering operator intent.
+
+    Acts ONLY when the active prompt lacks `marker` (so it's idempotent — once the
+    revision is active, or a fresh install seeded it directly, this no-ops) AND the
+    active version is EITHER the pristine seed (notes='Seeded v1 from Python module')
+    OR still carries `stale_phrase` (the specific false claim being corrected — even
+    across operator edits that merely inherited it). An operator who has deliberately
+    rewritten the prompt away from both is left untouched. Archives the old active
+    version before inserting the new one (partial unique index: one active per agent).
+    Best-effort: never raises."""
     if clients.db_pool is None:
         return
     try:
@@ -193,28 +202,28 @@ async def ensure_forge_tool_aware_version() -> None:
                 row = await conn.fetchrow(
                     """
                     SELECT a.id AS agent_id, v.id AS version_id,
-                           v.system_prompt, v.notes
+                           v.system_prompt, v.notes, v.routing_keywords
                     FROM agents a
                     JOIN agent_versions v ON v.id = a.current_version_id
-                    WHERE a.name = 'FORGE'
+                    WHERE a.name = $1
                     FOR UPDATE OF v
-                    """
+                    """,
+                    agent_name,
                 )
                 if row is None:
                     return
-                # Already tool-aware (fresh installs seed the new prompt directly),
-                # or operator-customized -> leave untouched.
-                if FORGE_TOOL_AWARE_MARKER in (row["system_prompt"] or ""):
-                    return
-                if (row["notes"] or "") != "Seeded v1 from Python module":
-                    return
+                prompt = row["system_prompt"] or ""
+                if marker in prompt:
+                    return  # already revised
+                is_pristine = (row["notes"] or "") == "Seeded v1 from Python module"
+                is_stale = bool(stale_phrase) and stale_phrase in prompt
+                if not (is_pristine or is_stale):
+                    return  # operator rewrote it away from the known-stale text
                 next_num = await conn.fetchval(
                     "SELECT COALESCE(MAX(version_number), 0) + 1 "
                     "FROM agent_versions WHERE agent_id = $1",
                     row["agent_id"],
                 )
-                # Archive the current active version BEFORE inserting the new active
-                # one (a partial unique index allows only one active per agent).
                 await conn.execute(
                     "UPDATE agent_versions SET status = 'archived', archived_at = NOW() "
                     "WHERE id = $1",
@@ -226,21 +235,42 @@ async def ensure_forge_tool_aware_version() -> None:
                         agent_id, version_number, status, system_prompt,
                         routing_keywords, allowed_tools, notes, activated_at
                     )
-                    VALUES ($1, $2, 'active', $3, $4, $5,
-                            'Auto-migrated: tool-aware FORGE (filesystem inspector)', NOW())
+                    VALUES ($1, $2, 'active', $3, $4, $5, $6, NOW())
                     RETURNING id
                     """,
-                    row["agent_id"], next_num, FORGE_SYSTEM_PROMPT,
-                    list(FORGE_ROUTING_KEYWORDS), list(FORGE_ALLOWED_TOOLS),
+                    row["agent_id"], next_num, new_prompt,
+                    list(row["routing_keywords"] or []), list(allowed_tools), notes,
                 )
                 await conn.execute(
                     "UPDATE agents SET current_version_id = $1, updated_at = NOW() "
                     "WHERE id = $2",
                     new_id, row["agent_id"],
                 )
-        logger.info("FORGE migrated to tool-aware version v%s", next_num)
+        logger.info("%s migrated to revised prompt version v%s", agent_name, next_num)
     except Exception:
-        logger.exception("ensure_forge_tool_aware_version failed (continuing)")
+        logger.exception("_ensure_prompt_revision(%s) failed (continuing)", agent_name)
+
+
+async def ensure_forge_tool_aware_version() -> None:
+    """FORGE: lift off the tool-suppressing seed prompt onto the tool-aware one (it can
+    read the live codebase via its filesystem tools). See _ensure_prompt_revision."""
+    await _ensure_prompt_revision(
+        "FORGE", FORGE_SYSTEM_PROMPT, FORGE_TOOL_AWARE_MARKER,
+        "Auto-migrated: tool-aware FORGE (filesystem inspector)",
+        allowed_tools=list(FORGE_ALLOWED_TOOLS),
+        stale_phrase="let the user execute it",
+    )
+
+
+async def ensure_pulse_web_aware_version() -> None:
+    """PULSE: lift off the 'no live web access' seed prompt onto the web-aware one (it
+    has the governed web_search tool + injected live results). See _ensure_prompt_revision."""
+    await _ensure_prompt_revision(
+        "PULSE", PULSE_SYSTEM_PROMPT, PULSE_WEB_AWARE_MARKER,
+        "Auto-migrated: web-aware PULSE (governed web_search)",
+        allowed_tools=list(PULSE_ALLOWED_TOOLS),
+        stale_phrase="no live web access",
+    )
 
 
 async def load_active_routing_keywords() -> dict[str, list[str]]:

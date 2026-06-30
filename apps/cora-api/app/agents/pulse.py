@@ -3,12 +3,14 @@
 PULSE is a prompt/persona layer routed to by ATLAS when the user's message is
 research-shaped (gather information, compare options, summarize, investigate a
 topic). It runs inside the same FastAPI process, shares Cora's memory + knowledge
-infrastructure, and does NOT browse the web, spawn containers, run autonomous
+infrastructure, and CAN search the live web through Cora's governed web_search
+tool (SearXNG) — in the agent runtime it calls the tool; in the plain chat path
+results are injected on recency cues. It does NOT spawn containers, run autonomous
 loops, or maintain an independent memory system.
 
-PULSE grounds its answers in the memory + ingested knowledge that ATLAS injects
-into the prompt. The user always sees responses framed as Cora; PULSE is an
-internal mode.
+PULSE grounds its answers in the memory + ingested knowledge ATLAS injects into the
+prompt, plus any live web results available. The user always sees responses framed
+as Cora; PULSE is an internal mode.
 """
 
 NAME = "PULSE"
@@ -24,9 +26,18 @@ PULSE_SPECIALIZATIONS: list[str] = [
     "Background and landscape overviews",
 ]
 
-# Tools PULSE is permitted to *recommend* invoking. Empty in v0.1 — PULSE
-# synthesizes from injected memory/knowledge and never calls tools autonomously.
-PULSE_ALLOWED_TOOLS: list[str] = []
+# Read-only tools PULSE owns in the agent runtime (governed via tools.allowed_agents
+# = ['PULSE']; advisory mirror surfaced in the agent admin). web_search hits the
+# internal SearXNG engine. In the plain chat path live results are also injected
+# deterministically on recency cues.
+PULSE_ALLOWED_TOOLS: list[str] = [
+    "web_search",
+]
+
+# Stable phrase guaranteed present in the web-aware prompt below; the startup
+# migration (registry.ensure_pulse_web_aware_version) keys off it to lift PULSE off
+# its original "no live web access" seed prompt exactly once. Keep in sync.
+PULSE_WEB_AWARE_MARKER = "returned by your web_search tool"
 
 PULSE_ROUTING_KEYWORDS: list[str] = [
     "research",
@@ -91,12 +102,14 @@ PULSE_SYSTEM_PROMPT = (
     "own general knowledge. When the knowledge base and the available news "
     "sources are silent on the question, say so plainly and recommend ingesting "
     "or refreshing a relevant source rather than guessing.\n"
-    "- Never fabricate sources, headlines, citations, statistics, dates, or "
-    "claim to have browsed the web. PULSE has no live web access — you reason "
-    "only over the news and knowledge content already ingested into Cora's "
-    "database and supplied in this prompt. If the news source the user is "
-    "asking about isn't in the provided context, say it hasn't been ingested "
-    "rather than inventing coverage.\n"
+    "- Never fabricate sources, headlines, citations, statistics, or dates. When "
+    "live web results are available — provided in this prompt (injected on recency "
+    "cues), or returned by your web_search tool when you are running with it — "
+    "ground current-events answers in those results and cite the source. Otherwise "
+    "reason over the ingested news and knowledge already in Cora's database. Never "
+    "claim to have searched the web unless a tool result this turn shows it; if a "
+    "source the user asks about is available neither way, say it hasn't been "
+    "ingested rather than inventing coverage.\n"
     "- Structure findings for fast reading: a one or two sentence summary "
     "first, then key points as bullets, each tied to its source. For "
     "comparisons, use a compact table and stay balanced — give the tradeoffs of "
