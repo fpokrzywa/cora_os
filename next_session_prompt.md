@@ -10,16 +10,14 @@ and the auto-memories `agent_runtime_build` + `dgx_inference_backends` + `projec
 (do NOT re-summarize or rebuild shipped work).
 
 ## Git / deploy state (verify first)
-- **Local `main` == `origin/main` @ `aee83f5`** (UNCHANGED this session). All this session's work is on the
-  **unpushed branch `feat/voice-readiness`** — 7 commits ahead of `main`:
-  `a2721d8` SSE streaming · `8993ff5` calendar read · `7beb656` VOICE_UI_READINESS.md ·
-  `ad0466f` spoken confirm · `bd029d9` FORGE · `548d382` PULSE · `5386f31` speakable
-  (+ a pending docs commit for the handoff updates). **On the operator's "push": FF `main` + push +
-  delete the branch** (`git checkout main && git merge --ff-only feat/voice-readiness && git push origin
-  main && git branch -d feat/voice-readiness`). Quick check: `git log --oneline -10`, `git branch -vv`.
-- **The deployed stack already runs this branch's code** (each item was `docker compose build` + `up -d`),
-  so **live == `feat/voice-readiness`**, NOT `main`. Stack up + healthy: `cora-api`, `cora-worker`,
-  `cora-ui`, `cora-postgres`, MCPs (incl. the rebuilt `mcp-filesystem`), `cora-searxng`.
+- **Everything is on `main` — local `main` == `origin/main` @ `aebc510`** (pushed at session end; the
+  `feat/voice-readiness` branch was FF-merged + deleted). The 8 commits, newest first: `aebc510` docs ·
+  `5386f31` speakable · `548d382` PULSE · `bd029d9` FORGE · `ad0466f` spoken confirm · `7beb656`
+  VOICE_UI_READINESS.md · `8993ff5` calendar read · `a2721d8` SSE streaming. No feature branches remain.
+  Quick check: `git log --oneline -10`, `docker compose ps`.
+- **The deployed stack runs this code** (each item was `docker compose build` + `up -d`), so **live == `main`**.
+  Stack up + healthy: `cora-api`, `cora-worker`, `cora-ui`, `cora-postgres`, MCPs (incl. the rebuilt
+  `mcp-filesystem`), `cora-searxng`.
 - `gh` is NOT installed (no `GH_TOKEN`); use plain `git`. `.env` is gitignored (secrets + flags — never
   commit/echo it); it lives at the repo root `/home/owner/cora-ai-os/.env`.
 - Working tree carries pre-existing handoff-doc items to LEAVE: a staged deletion of
@@ -43,7 +41,7 @@ and the auto-memories `agent_runtime_build` + `dgx_inference_backends` + `projec
 - **New opt-in request flags (default OFF — text UI unchanged):** `ChatRequest.stream` (SSE) and
   `ChatRequest.speakable` (TTS-friendly reply). The voice/UI layer sets these per turn.
 
-## What shipped this session — DON'T rebuild (all on `feat/voice-readiness`)
+## What shipped this session — DON'T rebuild (all on `main` @ `aebc510`)
 Reference, don't re-derive. Each built → `py_compile`/tsc → `compose build`+`up -d` → in-container `verify_*`
 → live-confirmed → committed.
 1. **`/chat` SSE streaming** (`a2721d8`) — opt-in `ChatRequest.stream` returns a `StreamingResponse` of
@@ -97,7 +95,6 @@ Reference, don't re-derive. Each built → `py_compile`/tsc → `compose build`+
 - **The Planner is a template-only stub** (creates plans, never executes steps).
 
 ## Operator-only loose ends (surface, don't do)
-- **PUSH the branch** — `feat/voice-readiness` (7 commits + docs) is unpushed; FF `main` on the operator's word.
 - **Memory-scoping data cleanup (still awaiting operator decision):** (a) 3 personal facts mis-scoped to
   `global` (visible to ALL accounts): `family` "Dorothy Pokrzywa" (wife), `family` "Family Dog" (Linda/"Bean"),
   `note` "Our family dog". RE-SCOPE to the owner — account ambiguous between `freddie@3cpublish.com`
