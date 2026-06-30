@@ -41,6 +41,7 @@ from app.memory import is_embedding_configured, semantic_search
 from app import llm
 from app.runtime_traces import write_trace
 from app.screen_context import build_screen_context_block
+from app.speakable import SPEAKABLE_STYLE, to_speakable
 from app import schema as schema_state
 from app.agents.scribe import (
     create_chat_memory,
@@ -1166,6 +1167,11 @@ class ChatRequest(BaseModel):
         default=False,
         description="When true, the reply is streamed back as Server-Sent Events "
         "(meta/delta/done/error) instead of a single ChatResponse JSON body.",
+    )
+    speakable: bool = Field(
+        default=False,
+        description="Voice mode: instruct the model to answer in short, spoken, "
+        "markdown-free sentences, and normalize the reply for text-to-speech.",
     )
 
 
@@ -2946,6 +2952,10 @@ async def chat(
     system_prompt, prompt_source, _active_version = await resolve_agent_prompt(
         selected_agent
     )
+    # Voice mode: ask the model to answer in short, spoken, markdown-free sentences.
+    # The response is also normalized post-hoc in _finalize as a backstop.
+    if request.speakable:
+        system_prompt = f"{system_prompt}\n\n{SPEAKABLE_STYLE}"
     # The current date/time is injected NEXT TO the user turn (via _build_prompt's
     # datetime_line), not prepended to the system prompt — keeping it out of the
     # cached prompt prefix so per-minute changes don't force a cold prefill every
@@ -3571,6 +3581,10 @@ async def chat(
             )
         if draft_suffix:
             assistant_response = f"{assistant_response}{draft_suffix}"
+        # Voice mode: strip any markdown the model still emitted so TTS doesn't read
+        # it literally. Applies to the returned + persisted + streamed-done text.
+        if request.speakable:
+            assistant_response = to_speakable(assistant_response)
 
         completed_at = datetime.now(timezone.utc)
         if routing_delegation_id is not None:
