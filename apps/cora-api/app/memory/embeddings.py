@@ -257,6 +257,10 @@ async def semantic_search(
     scope_clause = (
         " (m.scope_type = 'global' OR (m.scope_type = 'user' "
         "AND (m.scope_id = $2 OR m.scope_id IS NULL)))"
+        # Global news_article entries are a news-briefing artifact, not chat recall
+        # material — exclude them so they don't drown out real memories. Mirrors
+        # scribe.search_memory; a user's OWN saved news memory still recalls.
+        " AND NOT (m.scope_type = 'global' AND m.type = 'news_article')"
     )
 
     # 1) Chunk search: best chunk per parent that HAS chunk embeddings.

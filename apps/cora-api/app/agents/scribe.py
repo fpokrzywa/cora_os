@@ -192,6 +192,12 @@ async def search_memory(
                       AND (scope_id = $3 OR scope_id IS NULL)
                   )
               )
+          -- Global news_article entries are a news-briefing pipeline artifact
+          -- (the briefing reads them by type from knowledge_sources), not chat
+          -- recall material — keep them out of personal recall (they dominate the
+          -- global pool and drown out real memories). A user's OWN saved news
+          -- memory still recalls.
+          AND NOT (scope_type = 'global' AND type = 'news_article')
           {workspace_filter}
           AND (
                   title ILIKE ANY($1)
