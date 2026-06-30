@@ -35,14 +35,14 @@ Ranking = leverage (for voice) × effort. Effort: **S** ≈ hours, **M** ≈ ~a 
 |---|------|--------------------|-------|--------|-----------|
 | 4 | **Speakable-response discipline** | TTS reads markdown tables/links/`**` literally; long replies feel slow | all/chat | S–M | System prompt + light output normalization yield concise, link/table-free spoken text; streaming breaks on sentence boundaries |
 | 5 | **PULSE prompt/capability fix** | Prompt says "no live web access" while `web_search` is wired — confuses the model and any UI copy | PULSE | S | Prompt matches reality; recency questions reliably use the governed tool |
-| 6 | **Semantic routing fallback** | Keyword routing misses spoken synonyms/disfluencies | ATLAS | M | When keyword score is 0/ambiguous, an embedding (or small-LLM) fallback picks the specialist; deterministic path unchanged when it matches |
-| 7 | **Memory cleanup + spoken disambiguation** | Mis-scoped global facts leak across accounts; voice can't show a 5-option list | SCRIBE | S + M | 3 personal facts re-scoped (needs target account), test-junk globals removed; ambiguous recall asks one spoken "which…?" |
+| 6 | ✅ **Semantic routing fallback** (`f5c9676`) | Keyword routing misses spoken synonyms/disfluencies | ATLAS | M | **DONE** — keyword score 0 + no intent override → one LLM classification (`routing.semantic_route`) picks the specialist; opt-in `SEMANTIC_ROUTING_ENABLED`, fail-open, deterministic path unchanged. Embeddings measured + rejected (flat baseline). `verify_semantic_routing.py` |
+| 7 | ✅ **Memory cleanup + spoken disambiguation** (`8c704f0`) | Mis-scoped global facts leak across accounts; voice can't show a 5-option list | SCRIBE | S + M | **DONE** — 3 personal facts re-scoped `global → user` under `freddie@3cpublish.com`; all 15 test-junk globals deleted; same-title/different-content recall asks one spoken "which?" (`app/memory/disambiguation.py`). `verify_memory_disambiguation.py` |
 
 ## P2 — important, can trail the first voice cut
 
 | # | Item | Why | Effort |
 |---|------|-----|--------|
-| 8 | **Generation cancellation / barge-in** — verify backend stops vLLM generation on client disconnect/abort | Barge-in (user talks over Cora) needs a real stop | S–M |
+| 8 | ✅ **Generation cancellation / barge-in** (`47e4481`) — mid-stream disconnect aborts the upstream vLLM gen (httpx teardown) + records a `cancelled` trace + persists the partial | Barge-in (user talks over Cora) needs a real stop | S–M — **DONE** (`verify_chat_cancel.py`) |
 | 9 | **Decide email-send stance for voice** — send is architecturally absent; "email Bob" will always refuse. Keep blocked + graceful refusal, or open a governed staged path | Product stance | S (decision) |
 | 10 | **MCP postgres/github** — currently placeholder images | Only if voice exposes DB/repo Q&A | L (defer) |
 | 11 | **Planner step execution** — template-only stub today | Only if voice surfaces runnable "plans" | L (defer) |
@@ -57,6 +57,16 @@ Ranking = leverage (for voice) × effort. Effort: **S** ≈ hours, **M** ≈ ~a 
 5. **#6 routing** + **#7 memory cleanup/disambiguation**.
 6. P2 as the voice layer firms up.
 
-## Open decision (defaulting unless redirected)
-- **FORGE direction** → defaulting to **automation/infra executor** (governed n8n trigger + health/status). Alternatives: code/repo agent (needs the github MCP built) or keep persona-only. Say the word to change.
-- **Memory re-scoping target account** → `freddie@3cpublish.com` (holds the 19 memories) vs `fpokrzywa@gmail.com` (matches "Pokrzywa"). Needed before #7's cleanup half.
+## Status — pre-UI capability phase COMPLETE (2026-06-30)
+P0 (#1–3), P1 (#4–7), and the one buildable P2 item (#8) are all shipped + live on `main` @ `47e4481`.
+Remaining P2 is operator/deferred: **#9** email-send stance (policy call — still hard-disabled), **#10**
+MCP postgres/github (placeholder images), **#11** Planner step execution (template stub). Plus **n8n is
+not deployed**, which keeps FORGE a codebase/infra *inspector* rather than an n8n executor. **Next phase:
+the voice-first UI client itself** (mic → STT → `/chat` SSE stream → TTS → barge-in) — the backend now
+supports it end-to-end.
+
+## Resolved decisions
+- **FORGE direction** → shipped as a **codebase/infra inspector** (live filesystem reads); the n8n-executor
+  direction stays deferred until n8n is deployed (operator).
+- **Memory re-scoping target account** → **`freddie@3cpublish.com`** (the account holding all 19 memories);
+  the 3 personal facts were re-scoped there and #7's cleanup is done.
