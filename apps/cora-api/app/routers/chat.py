@@ -1394,6 +1394,37 @@ async def chat_agent_decide(
     return run
 
 
+class AgentConfirmRequest(BaseModel):
+    session_id: str
+    message: str = Field(..., min_length=1)
+    # Override an evaluator 'fail' gate on approve (also triggered by saying "override").
+    override: bool = False
+
+
+@router.post(
+    "/chat/agent/confirm",
+    summary="Resolve a session's pending agent confirmation from a natural-language yes/no",
+)
+async def chat_agent_confirm(
+    request: AgentConfirmRequest,
+    current: Annotated[CurrentUser, Depends(get_current_user)],
+) -> dict:
+    """Spoken confirm-as-interrupt: when this conversation has a run paused at
+    waiting_user, resolve it from the user's own words ('yes' / 'no' / 'override')
+    instead of a run_id + an InterruptCard click — the primitive a voice layer needs.
+    Always 200: no pending run is just {"pending": false}; an unclear utterance asks
+    again; the evaluator gate + execution gate still apply inside resolve_interrupt.
+    The `spoken` field is the line to read back to the user."""
+    if not settings.agent_runtime_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="agent runtime is disabled",
+        )
+    return await agent_runtime.resolve_pending_for_session(
+        request.session_id, current.id, request.message, override=request.override,
+    )
+
+
 class AgentConfigResponse(BaseModel):
     runtime_enabled: bool
     delegation_enabled: bool

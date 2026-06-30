@@ -24,6 +24,7 @@ the tools table, and httpx against the DGX endpoint.
 import asyncio
 import json
 import logging
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -492,6 +493,88 @@ def _collect_staged(steps: list["AgentStep"]) -> list[dict]:
     return out
 
 
+def _provider_label(provider: Optional[str]) -> str:
+    p = (provider or "").lower()
+    if p.startswith("google"):
+        return "Google"
+    if p.startswith("outlook") or p.startswith("microsoft"):
+        return "Outlook"
+    return "your"
+
+
+def _staged_phrase(item: dict) -> str:
+    """A short, speakable phrase for ONE staged action (no ids, no markdown)."""
+    kind = item.get("type")
+    fields = item.get("fields") or {}
+    title = (fields.get("title") or "").strip()
+    label = _provider_label(item.get("provider"))
+    if kind == "calendar_create":
+        base = f'add "{title}" to your {label} calendar' if title else f"add an event to your {label} calendar"
+        when = (fields.get("start_time") or "").strip()
+        return f"{base} on {when}" if when else base
+    if kind == "calendar_update":
+        changed = [k for k in ("title", "start_time", "end_time", "location") if fields.get(k)]
+        what = " and ".join({"start_time": "time", "end_time": "time"}.get(c, c) for c in changed)
+        return f'update your {label} calendar event ({what})' if what else f"update your {label} calendar event"
+    if kind == "calendar_delete":
+        return f"cancel an event on your {label} calendar"
+    if kind == "email_draft":
+        return "save an email draft for you to review"
+    return "save a review-only proposal"
+
+
+def _speakable_confirmation(staged: list[dict]) -> str:
+    """One natural-language line asking the user to confirm the staged action(s).
+    Spoken by the voice/chat layer when a run pauses; a structured backstop to the
+    model's own narration. Empty when nothing fireable is staged."""
+    actionable = [s for s in staged if s.get("type") in
+                  ("calendar_create", "calendar_update", "calendar_delete", "email_draft")]
+    if not actionable:
+        return ""
+    phrases = [_staged_phrase(s) for s in actionable]
+    if len(phrases) == 1:
+        joined = phrases[0]
+    else:
+        joined = "; ".join(phrases[:-1]) + f"; and {phrases[-1]}"
+    return f"I'm about to {joined}. Want me to go ahead?"
+
+
+# Natural-language yes/no for spoken confirm-as-interrupt. Deterministic, anchored
+# at the start so a flat "no" or "yes, do it" classifies but a sentence that merely
+# contains the word elsewhere does not over-trigger.
+_AFFIRM_RE = re.compile(
+    r"^\s*(yes|yep|yeah|yup|ya|sure|ok|okay|do it|go ahead|go for it|please do|"
+    r"confirm(ed)?|approve(d)?|sounds good|that'?s right|correct|affirmative|"
+    r"absolutely|definitely)\b",
+    re.IGNORECASE,
+)
+_DENY_RE = re.compile(
+    r"^\s*(no|nope|nah|don'?t|do not|cancel(\s+that)?|stop|reject|never\s*mind|"
+    r"forget it|abort|hold off|not now|negative|leave it)\b",
+    re.IGNORECASE,
+)
+_OVERRIDE_RE = re.compile(
+    r"\b(override|anyway|do it anyway|proceed anyway|i'?m sure|yes really)\b",
+    re.IGNORECASE,
+)
+
+
+def classify_confirmation(text: str) -> Optional[str]:
+    """Map a short utterance to 'approve' / 'reject' / None (unclear). An explicit
+    override phrase ('do it anyway') counts as approve. Deny is checked before
+    affirm so 'no, don't' never reads as a yes."""
+    t = (text or "").strip()
+    if not t:
+        return None
+    if _OVERRIDE_RE.search(t):
+        return "approve"
+    if _DENY_RE.match(t):
+        return "reject"
+    if _AFFIRM_RE.match(t):
+        return "approve"
+    return None
+
+
 async def _pause_run(
     run_id: Optional[uuid.UUID], *, answer, stopped, tool_calls, step_count,
     messages, steps, evaluation, interrupt,
@@ -657,6 +740,94 @@ async def resolve_interrupt(
             interrupt["executed"] = executed
             await _record_executed(run_id, interrupt)
     return await get_run(run_id, user_id=user_id)
+
+
+async def find_waiting_run_for_session(session_id, user_id) -> Optional[dict]:
+    """The most recent run paused at 'waiting_user' for this conversation (owner-
+    scoped; legacy NULL owner allowed). None when nothing is pending."""
+    if clients.db_pool is None:
+        return None
+    sid = _as_uuid(session_id)
+    if sid is None:
+        return None
+    async with clients.db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT id, session_id, user_id, status, interrupt, evaluation
+            FROM agent_runtime_runs
+            WHERE session_id = $1 AND (user_id = $2 OR user_id IS NULL)
+              AND status = 'waiting_user'
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            sid, _as_uuid(user_id),
+        )
+    return dict(row) if row else None
+
+
+def _speakable_outcome(run: dict, decision: str) -> str:
+    """Speakable result line after a spoken confirm resolves a run."""
+    if decision == "reject":
+        return "Okay — I won't do that."
+    interrupt = dict(run.get("interrupt") or {})
+    executed = interrupt.get("executed") or []
+    if not executed:
+        # Approved, but the outward execution gate (agent_execution_enabled) is off.
+        return ("Approved. Outward execution is currently turned off, so nothing was "
+                "actually changed or sent.")
+    oks = [e for e in executed if e.get("ok")]
+    fails = [e for e in executed if not e.get("ok")]
+    if oks and not fails:
+        return ("Done — I've taken care of it." if len(oks) == 1
+                else f"Done — all {len(oks)} actions are complete.")
+    if oks and fails:
+        return (f"Partly done: {len(oks)} completed, but {len(fails)} couldn't be — "
+                f"{fails[0].get('reason') or 'it was blocked'}.")
+    return f"I couldn't complete it — {fails[0].get('reason') or 'it was blocked'}."
+
+
+async def resolve_pending_for_session(
+    session_id, user_id, text: str, *, override: bool = False,
+) -> dict:
+    """Spoken confirm-as-interrupt: find the run this conversation has paused for
+    approval and resolve it from a natural-language yes/no, so a voice/chat layer
+    never has to track run_ids or map words to a decision. Returns a dict carrying a
+    `spoken` line to read back. Never raises; all the existing gates (eval-gate,
+    agent_execution_enabled) still apply inside resolve_interrupt.
+
+    - No pending run    -> {"pending": False, ...}
+    - Utterance unclear -> {"pending": True, "needs_confirmation": True, ...}
+    - Eval-gate blocks  -> {"pending": True, "blocked": True, ...}
+    - Resolved          -> {"pending": True, "resolved": True, "decision", "run", ...}
+    """
+    run = await find_waiting_run_for_session(session_id, user_id)
+    if run is None:
+        return {"pending": False, "resolved": False,
+                "spoken": "There's nothing waiting for your confirmation right now."}
+    rid = run["id"]
+    interrupt = dict(run.get("interrupt") or {})
+    prompt = interrupt.get("confirmation_prompt") or "Want me to go ahead?"
+    decision = classify_confirmation(text)
+    if decision is None:
+        return {"pending": True, "resolved": False, "needs_confirmation": True,
+                "run_id": str(rid), "confirmation_prompt": prompt,
+                "spoken": f"Sorry — was that a yes or a no? {prompt}"}
+    want_override = override or bool(_OVERRIDE_RE.search(text or ""))
+    resolved = await resolve_interrupt(
+        rid, user_id=user_id, decision=decision, note="spoken confirmation",
+        override=want_override,
+    )
+    if resolved is None:
+        return {"pending": False, "resolved": False,
+                "spoken": "That request is no longer waiting for confirmation."}
+    if resolved.get("blocked"):
+        return {"pending": True, "resolved": False, "blocked": True,
+                "run_id": str(rid), "verdict": resolved.get("verdict"),
+                "spoken": ("I'd hold off — my safety check flagged a concern about that. "
+                           "Say \"override\" if you want me to proceed anyway.")}
+    return {"pending": True, "resolved": True, "decision": decision,
+            "run_id": str(rid), "run": resolved,
+            "spoken": _speakable_outcome(resolved, decision)}
 
 
 async def get_run(run_id: uuid.UUID, *, user_id) -> Optional[dict]:
@@ -1531,7 +1702,12 @@ async def run_agent(
     )
     staged = _collect_staged(steps) if (_depth == 0 and stopped != "error") else []
     if interrupt_on and staged:
-        interrupt = {"staged": staged, "decision": None, "note": None}
+        interrupt = {
+            "staged": staged,
+            "decision": None,
+            "note": None,
+            "confirmation_prompt": _speakable_confirmation(staged),
+        }
         final_status = "waiting_user"
         await _pause_run(
             run_id, answer=answer, stopped=stopped, tool_calls=tool_calls,
