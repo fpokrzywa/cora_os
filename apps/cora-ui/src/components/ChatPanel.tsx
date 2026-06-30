@@ -3,6 +3,12 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { ChatMessage } from "../types";
 import { captureScreenFrame } from "../screenCapture";
+import {
+  createRecognizer,
+  sttSupported,
+  ttsSupported,
+  type Recognizer,
+} from "../voice/speech";
 
 interface Props {
   messages: ChatMessage[];
@@ -13,6 +19,10 @@ interface Props {
   error: string | null;
   selectedAgent: string | null;
   workspaceName: string | null;
+  voiceMode: boolean;
+  onToggleVoice: () => void;
+  speaking: boolean;
+  onBargeIn: () => void;
 }
 
 export function ChatPanel({
@@ -24,11 +34,48 @@ export function ChatPanel({
   error,
   selectedAgent,
   workspaceName,
+  voiceMode,
+  onToggleVoice,
+  speaking,
+  onBargeIn,
 }: Props) {
   const [input, setInput] = useState("");
   const [screenImage, setScreenImage] = useState<string | null>(null);
   const [capturing, setCapturing] = useState(false);
+  const [listening, setListening] = useState(false);
+  const recognizerRef = useRef<Recognizer | null>(null);
   const listRef = useRef<HTMLDivElement>(null);
+
+  const micAvailable = sttSupported();
+  const ttsAvailable = ttsSupported();
+
+  // Tap-to-talk: transcribe one utterance and send it. Tapping while Cora is
+  // streaming or speaking barges in first (aborts the reply), then listens.
+  const toggleMic = () => {
+    if (listening) {
+      recognizerRef.current?.stop();
+      return;
+    }
+    if (!micAvailable) return;
+    if (sending || speaking) onBargeIn();
+    const rec = createRecognizer({
+      onFinal: (text) => onSend(text),
+      onEnd: () => {
+        setListening(false);
+        recognizerRef.current = null;
+      },
+      onError: () => {
+        setListening(false);
+        recognizerRef.current = null;
+      },
+    });
+    if (!rec) return;
+    recognizerRef.current = rec;
+    setListening(true);
+    rec.start();
+  };
+
+  useEffect(() => () => recognizerRef.current?.stop(), []);
 
   useEffect(() => {
     if (listRef.current) {
@@ -151,7 +198,37 @@ export function ChatPanel({
         </div>
       )}
 
+      {(listening || speaking) && (
+        <div className="chat__voice-status">
+          {listening ? "● Listening…" : "🔊 Cora is speaking — tap the mic to interrupt"}
+        </div>
+      )}
+
       <div className="chat__composer">
+        {ttsAvailable && (
+          <button
+            className={`btn composer__voice${voiceMode ? " composer__voice--on" : ""}`}
+            onClick={onToggleVoice}
+            title={
+              voiceMode
+                ? "Voice replies on — Cora speaks her answers"
+                : "Turn on spoken replies (TTS-clean, read aloud)"
+            }
+          >
+            {voiceMode ? "🔊 Voice on" : "🔈 Voice"}
+          </button>
+        )}
+        {micAvailable && (
+          <button
+            className={`btn composer__mic${listening ? " composer__mic--active" : ""}`}
+            onClick={toggleMic}
+            disabled={capturing}
+            title={listening ? "Stop listening" : "Tap to talk"}
+            aria-label={listening ? "Stop listening" : "Speak to Cora"}
+          >
+            {listening ? "● Stop" : "🎤"}
+          </button>
+        )}
         <button
           className="btn composer__share"
           onClick={shareScreen}

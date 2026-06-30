@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { speak, cancelSpeech, ttsSupported } from "./voice/speech";
 import { Sidebar, type SidebarTab } from "./components/Sidebar";
 import { ChatPanel } from "./components/ChatPanel";
 import { MemoryViewer } from "./components/MemoryViewer";
@@ -43,6 +44,11 @@ export function App() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
   const [sending, setSending] = useState(false);
+  // Voice mode: spoken replies (TTS) + ask the backend for speakable text.
+  const [voiceMode, setVoiceMode] = useState(false);
+  const [speaking, setSpeaking] = useState(false);
+  // Tracks the in-flight stream so a barge-in can abort it mid-reply.
+  const streamAbortRef = useRef<AbortController | null>(null);
   const [loadingConvo, setLoadingConvo] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [sidebarError, setSidebarError] = useState<string | null>(null);
@@ -224,6 +230,11 @@ export function App() {
         content: screenImage ? `${message}\n\n_(shared a screenshot)_` : message,
         created_at: new Date().toISOString(),
       };
+      // A new turn supersedes any reply Cora is still speaking.
+      cancelSpeech();
+      setSpeaking(false);
+      const controller = new AbortController();
+      streamAbortRef.current = controller;
       setMessages((prev) => [...prev, optimisticUser]);
       // Append/extend the trailing assistant bubble as deltas stream in; the
       // bubble is created on the first delta so the typing indicator can show
@@ -259,17 +270,30 @@ export function App() {
             setSelectedAgent(res.selected_agent);
             appendAssistant(res.response, true);
             refreshConversations();
+            if (voiceMode && ttsSupported()) {
+              setSpeaking(true);
+              speak(res.response, { onEnd: () => setSpeaking(false) });
+            }
           },
           onError: (msg) => setError(msg),
-        });
+        }, { speakable: voiceMode, signal: controller.signal });
       } catch (err) {
         setError(err instanceof Error ? err.message : "Request failed");
       } finally {
         setSending(false);
+        streamAbortRef.current = null;
       }
     },
-    [sessionId, sending, currentWorkspaceId, refreshConversations],
+    [sessionId, sending, currentWorkspaceId, refreshConversations, voiceMode],
   );
+
+  // Barge-in: stop whatever Cora is doing (streaming reply + speech) so the user
+  // can talk over her. The backend cleans up the aborted stream.
+  const handleBargeIn = useCallback(() => {
+    streamAbortRef.current?.abort();
+    cancelSpeech();
+    setSpeaking(false);
+  }, []);
 
   const handleSelectConversation = useCallback(async (id: string) => {
     setError(null);
@@ -429,6 +453,10 @@ export function App() {
           workspaceName={
             workspaces.find((w) => w.id === currentWorkspaceId)?.name ?? null
           }
+          voiceMode={voiceMode}
+          onToggleVoice={() => setVoiceMode((v) => !v)}
+          speaking={speaking}
+          onBargeIn={handleBargeIn}
         />
       )}
       {selectedMemoryId && (

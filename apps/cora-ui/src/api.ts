@@ -240,12 +240,21 @@ export interface ChatStreamHandlers {
 // (meta/delta/done/error) the backend emits, invoking the matching handler per
 // event. Tokens arrive via onDelta; onDone carries the authoritative full reply
 // (including any draft/proposal suffix the deltas did not include).
+export interface ChatStreamOptions {
+  // Voice mode: ask the backend for TTS-clean (markdown-free, concise) text.
+  speakable?: boolean;
+  // Barge-in: aborting this signal cancels the in-flight stream; the backend
+  // tears down generation and records a `cancelled` turn.
+  signal?: AbortSignal;
+}
+
 export async function sendChatStream(
   message: string,
   sessionId: string | null,
   workspaceId: string | null | undefined,
   screenImage: string | null | undefined,
   handlers: ChatStreamHandlers,
+  opts?: ChatStreamOptions,
 ): Promise<void> {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
@@ -264,7 +273,9 @@ export async function sendChatStream(
       screen_context: getScreenContext(),
       screen_image: screenImage ?? undefined,
       stream: true,
+      speakable: opts?.speakable ? true : undefined,
     }),
+    signal: opts?.signal,
   });
 
   if (res.status === 401) {
@@ -285,32 +296,41 @@ export async function sendChatStream(
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buf = "";
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buf += decoder.decode(value, { stream: true });
-    // SSE frames are separated by a blank line.
-    let sep: number;
-    while ((sep = buf.indexOf("\n\n")) !== -1) {
-      const frame = buf.slice(0, sep);
-      buf = buf.slice(sep + 2);
-      const dataLine = frame
-        .split("\n")
-        .find((l) => l.startsWith("data:"));
-      if (!dataLine) continue;
-      const raw = dataLine.slice(5).trim();
-      if (!raw) continue;
-      let evt: ChatStreamEvent;
-      try {
-        evt = JSON.parse(raw) as ChatStreamEvent;
-      } catch {
-        continue;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      // SSE frames are separated by a blank line.
+      let sep: number;
+      while ((sep = buf.indexOf("\n\n")) !== -1) {
+        const frame = buf.slice(0, sep);
+        buf = buf.slice(sep + 2);
+        const dataLine = frame
+          .split("\n")
+          .find((l) => l.startsWith("data:"));
+        if (!dataLine) continue;
+        const raw = dataLine.slice(5).trim();
+        if (!raw) continue;
+        let evt: ChatStreamEvent;
+        try {
+          evt = JSON.parse(raw) as ChatStreamEvent;
+        } catch {
+          continue;
+        }
+        if (evt.type === "meta") handlers.onMeta?.(evt.session_id, evt.selected_agent);
+        else if (evt.type === "delta") handlers.onDelta(evt.text);
+        else if (evt.type === "done") handlers.onDone(evt);
+        else if (evt.type === "error") handlers.onError(evt.detail);
       }
-      if (evt.type === "meta") handlers.onMeta?.(evt.session_id, evt.selected_agent);
-      else if (evt.type === "delta") handlers.onDelta(evt.text);
-      else if (evt.type === "done") handlers.onDone(evt);
-      else if (evt.type === "error") handlers.onError(evt.detail);
     }
+  } catch (err) {
+    // Barge-in / navigation aborts the fetch — the backend tears down the
+    // generation and records a cancelled turn; swallow the AbortError quietly.
+    if (opts?.signal?.aborted || (err instanceof DOMException && err.name === "AbortError")) {
+      return;
+    }
+    throw err;
   }
 }
 
