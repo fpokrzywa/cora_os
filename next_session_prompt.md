@@ -8,7 +8,7 @@ bugs. This doc is the entry point; deeper detail lives in code docstrings, the c
 `dgx_inference_backends` (do NOT re-summarize or rebuild shipped work).
 
 ## Git / deploy state (verify first)
-- **Everything is on `main`** — local `main` == `origin/main` @ **`0ff4f44`**. No feature branches remain
+- **Everything is on `main`** — local `main` == `origin/main` @ **`d2adc0e`**. No feature branches remain
   (each item this session FF-merged to `main` + pruned its branch). Quick check: `git log --oneline -8`,
   `docker compose ps`.
 - Stack up + healthy: `cora-api`, `cora-worker`, `cora-ui`, `cora-postgres`, MCPs, `cora-searxng` — built
@@ -41,6 +41,13 @@ bugs. This doc is the entry point; deeper detail lives in code docstrings, the c
 
 ## What shipped recently — DON'T rebuild (newest first)
 Reference, don't re-derive. All on `main`.
+- **Global news_article out of chat recall** (`d2adc0e`) — the news-briefing pipeline stores every article as
+  a `scope_type='global'` memory; **743 of 774 globals (96%) were `news_article`**, burying real memories past
+  the 5-memory injection cap. Both recall paths now exclude `global AND type='news_article'`
+  (`scribe.search_memory` keyword + `memory.embeddings.semantic_search` vector, shared `scope_clause`). Curated
+  globals (`global_architecture_doc`, `workspace_knowledge`) + a user's OWN saved news still recall; the
+  briefing is unaffected (reads articles by type from `knowledge_sources`). New `verify_memory_recall_scoping.py`
+  (keyword deterministic + semantic on live pgvector). Backlog item "global-memory recall noise" DONE.
 - **Calendar UPDATE/DELETE firing + live-confirmed CREATE/UPDATE/DELETE** (`0ff4f44`) — the agent could only
   fire a calendar CREATE; it now stages + fires UPDATE and CANCEL too, under the same gates. Two review-only
   staging tools (`chronos_update_calendar_event`, `chronos_cancel_calendar_event`, seeded internal_action/
@@ -95,13 +102,11 @@ Reference, don't re-derive. All on `main`.
 - Don't recreate the postgres volume. Don't edit `cora-stack/docker-compose.yml` unless asked.
 
 ## 🛠️ Build backlog (operator picks)
-*(Items 1 + 2 — live calendar firing and calendar update/delete firing — are DONE and live-confirmed; see
-the top of "What shipped recently".)*
-1. **Global-memory recall noise** — some demo/global memories rank into a user's personal recall; a scoping/cleanup
-   pass would sharpen day-to-day chat. Small, safe, code-only.
-2. **`/chat` SSE streaming** — frontend + backend, for snappier perceived latency.
-3. **App-config-screen relocation under Cora Configuration** ("option 2") — UI polish.
-4. **Agent calendar READ tool** — the agent has no calendar read tool, so today it can only update/delete an
+*(DONE + live-confirmed this session: live calendar firing, calendar update/delete firing, and global-memory
+recall noise — see the top of "What shipped recently".)*
+1. **`/chat` SSE streaming** — frontend + backend, for snappier perceived latency.
+2. **App-config-screen relocation under Cora Configuration** ("option 2") — UI polish.
+3. **Agent calendar READ tool** — the agent has no calendar read tool, so today it can only update/delete an
    event whose `event_id` is already in the conversation (e.g. one the user pastes). A governed
    `chronos_list_calendar_events` read tool would let it discover targets autonomously (NL "cancel my 3pm").
 
@@ -112,6 +117,14 @@ the top of "What shipped recently".)*
   (gpt-oss-120b is ungated, so it doesn't affect the running server).
 - n8n `cora-health` webhook still uncreated (`n8n_health_check` 404s until it exists); optional `DROP TABLE
   news_sources` (dead since v2.6, destructive — confirm first).
+- **Memory-scoping data cleanup (surfaced 2026-06-30, awaiting operator decision — NOT done):** (a) THREE
+  personal facts are mis-scoped to `global` (so visible to ALL accounts): `family` "Dorothy Pokrzywa" (wife),
+  `family` "Family Dog" (Linda/"Bean"), `note` "Our family dog". Right fix is RE-SCOPING to the owner (not
+  delete), but ownership is ambiguous — memories live under `freddie@3cpublish.com` (`d4f9c421`, 19 mems) while
+  the facts say "Pokrzywa" → `fpokrzywa@gmail.com` (`b87bac82`, 0 mems). Need the operator to pick the target
+  account. (b) test-junk `workspace_knowledge` globals (Example Domain ×6, Chunk Test Doc, "manual note refresh
+  test"/"hello world") are deletable demo noise (destructive — confirm exact list). The `d2adc0e` code fix only
+  excluded global NEWS from recall; these are a separate data pass.
 
 ## Working rules (saved feedback)
 - **No clarifying/direction-choosing questions** (incl. `AskUserQuestion` option menus) — proceed autonomously
@@ -124,8 +137,9 @@ the top of "What shipped recently".)*
   (`docker cp …:/tmp/v.py && docker exec -e PYTHONPATH=/app cora-api python /tmp/v.py`) + a route smoke when it
   touches a route → commit on a `feat/`/`fix/` branch → report with concrete in-app test steps → on **"push"**,
   FF `main` + push + delete the branch.
-- **26 `scripts/verify_*.py`** cover the suite (deterministic, in-container; `verify_agent_runtime.py` = 78
-  assertions Parts A–M). Behavioral `/chat` testing needs an operator JWT (browser DevTools → any API call's
+- **27 `scripts/verify_*.py`** cover the suite (deterministic, in-container; `verify_agent_runtime.py` = 78
+  assertions Parts A–M; `verify_memory_recall_scoping.py` is DB-backed — keyword deterministic + semantic on
+  live pgvector). Behavioral `/chat` testing needs an operator JWT (browser DevTools → any API call's
   `Authorization: Bearer …`); `/auth/register` is admin-locked.
 - Keep `HANDOFF_SESSION.md` + these memories current as work lands (update, don't just append):
   `agent_runtime_build`, `dgx_inference_backends`.
