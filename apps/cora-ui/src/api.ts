@@ -223,22 +223,95 @@ export function me() {
 
 // ---------- Chat ----------
 
-export function sendChat(
+type ChatStreamEvent =
+  | { type: "meta"; session_id: string; selected_agent: string }
+  | { type: "delta"; text: string }
+  | ({ type: "done" } & ChatResponse)
+  | { type: "error"; detail: string };
+
+export interface ChatStreamHandlers {
+  onMeta?: (sessionId: string, selectedAgent: string) => void;
+  onDelta: (text: string) => void;
+  onDone: (res: ChatResponse) => void;
+  onError: (message: string) => void;
+}
+
+// Streamed chat: POSTs with stream:true and consumes the Server-Sent Events
+// (meta/delta/done/error) the backend emits, invoking the matching handler per
+// event. Tokens arrive via onDelta; onDone carries the authoritative full reply
+// (including any draft/proposal suffix the deltas did not include).
+export async function sendChatStream(
   message: string,
   sessionId: string | null,
-  workspaceId?: string | null,
-  screenImage?: string | null,
-) {
-  return request<ChatResponse>("/chat", {
+  workspaceId: string | null | undefined,
+  screenImage: string | null | undefined,
+  handlers: ChatStreamHandlers,
+): Promise<void> {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    Accept: "text/event-stream",
+  };
+  const token = getToken();
+  if (token) headers["Authorization"] = `Bearer ${token}`;
+
+  const res = await fetch(`${API_BASE}/chat`, {
     method: "POST",
+    headers,
     body: JSON.stringify({
       message,
       session_id: sessionId ?? undefined,
       workspace_id: workspaceId ?? undefined,
       screen_context: getScreenContext(),
       screen_image: screenImage ?? undefined,
+      stream: true,
     }),
   });
+
+  if (res.status === 401) {
+    clearToken();
+    window.dispatchEvent(new CustomEvent(UNAUTHORIZED_EVENT));
+  }
+  if (!res.ok || !res.body) {
+    let detail = res.statusText;
+    try {
+      const body = await res.json();
+      if (body?.detail) detail = body.detail;
+    } catch {
+      // ignore parse errors
+    }
+    throw new Error(`${res.status} ${detail}`);
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    // SSE frames are separated by a blank line.
+    let sep: number;
+    while ((sep = buf.indexOf("\n\n")) !== -1) {
+      const frame = buf.slice(0, sep);
+      buf = buf.slice(sep + 2);
+      const dataLine = frame
+        .split("\n")
+        .find((l) => l.startsWith("data:"));
+      if (!dataLine) continue;
+      const raw = dataLine.slice(5).trim();
+      if (!raw) continue;
+      let evt: ChatStreamEvent;
+      try {
+        evt = JSON.parse(raw) as ChatStreamEvent;
+      } catch {
+        continue;
+      }
+      if (evt.type === "meta") handlers.onMeta?.(evt.session_id, evt.selected_agent);
+      else if (evt.type === "delta") handlers.onDelta(evt.text);
+      else if (evt.type === "done") handlers.onDone(evt);
+      else if (evt.type === "error") handlers.onError(evt.detail);
+    }
+  }
 }
 
 export function listConversations() {

@@ -21,7 +21,7 @@ import {
   listConversations,
   me,
   popAdminToken,
-  sendChat,
+  sendChatStream,
   setToken,
   stashAdminToken,
   updateConversation,
@@ -225,19 +225,43 @@ export function App() {
         created_at: new Date().toISOString(),
       };
       setMessages((prev) => [...prev, optimisticUser]);
+      // Append/extend the trailing assistant bubble as deltas stream in; the
+      // bubble is created on the first delta so the typing indicator can show
+      // until then.
+      const appendAssistant = (text: string, replace: boolean) => {
+        setMessages((prev) => {
+          const next = prev.slice();
+          const last = next[next.length - 1];
+          if (last && last.role === "assistant") {
+            next[next.length - 1] = {
+              ...last,
+              content: replace ? text : last.content + text,
+            };
+          } else {
+            next.push({
+              role: "assistant",
+              content: text,
+              created_at: new Date().toISOString(),
+            });
+          }
+          return next;
+        });
+      };
       try {
-        const res = await sendChat(message, sessionId, currentWorkspaceId, screenImage);
-        setSessionId(res.session_id);
-        setSelectedAgent(res.selected_agent);
-        setMessages((prev) => [
-          ...prev,
-          {
-            role: "assistant",
-            content: res.response,
-            created_at: res.created_at,
+        await sendChatStream(message, sessionId, currentWorkspaceId, screenImage, {
+          onMeta: (sid, agent) => {
+            setSessionId(sid);
+            setSelectedAgent(agent);
           },
-        ]);
-        refreshConversations();
+          onDelta: (text) => appendAssistant(text, false),
+          onDone: (res) => {
+            setSessionId(res.session_id);
+            setSelectedAgent(res.selected_agent);
+            appendAssistant(res.response, true);
+            refreshConversations();
+          },
+          onError: (msg) => setError(msg),
+        });
       } catch (err) {
         setError(err instanceof Error ? err.message : "Request failed");
       } finally {

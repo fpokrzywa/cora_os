@@ -9,8 +9,9 @@ Selected by settings.dgx_chat_backend; default "ollama" so nothing changes until
 is flipped via .env (DGX_CHAT_BACKEND=openai). Embeddings, vision, and the
 agent-runtime tool-calling loop are NOT routed here — they stay on Ollama.
 """
+import json
 import logging
-from typing import Optional
+from typing import AsyncIterator, Optional
 
 import httpx
 
@@ -103,3 +104,89 @@ async def generate_text(
         resp.raise_for_status()
         data = resp.json()
     return (data.get("response") or "").strip()
+
+
+async def stream_text(
+    prompt: str,
+    *,
+    system: Optional[str] = None,
+    max_tokens: int = 512,
+    temperature: float = 0.7,
+    timeout: float = 120.0,
+) -> AsyncIterator[str]:
+    """Streaming counterpart of generate_text: yields text deltas as the active
+    backend produces them. Same backend selection and request shape as
+    generate_text; only `stream` is flipped on. Raises httpx.HTTPError on a
+    transport/HTTP failure (status checked before any delta is yielded) so callers
+    can keep their `except httpx.HTTPError` handling. Deltas are yielded raw (not
+    stripped); the caller accumulates and strips the final text.
+    """
+    if chat_backend() == "openai":
+        base = (settings.dgx_openai_endpoint or "").rstrip("/")
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+        headers = {"Content-Type": "application/json"}
+        if settings.dgx_openai_api_key:
+            headers["Authorization"] = f"Bearer {settings.dgx_openai_api_key}"
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            async with client.stream(
+                "POST",
+                f"{base}/chat/completions",
+                json={
+                    "model": settings.dgx_openai_model,
+                    "messages": messages,
+                    "max_tokens": max_tokens,
+                    "temperature": temperature,
+                    "stream": True,
+                },
+                headers=headers,
+            ) as resp:
+                if resp.status_code >= 400:
+                    await resp.aread()
+                resp.raise_for_status()
+                async for line in resp.aiter_lines():
+                    if not line or not line.startswith("data:"):
+                        continue
+                    payload = line[len("data:"):].strip()
+                    if payload == "[DONE]":
+                        break
+                    try:
+                        delta = json.loads(payload)["choices"][0]["delta"].get("content")
+                    except (json.JSONDecodeError, KeyError, IndexError, TypeError):
+                        continue
+                    if delta:
+                        yield delta
+        return
+
+    # default backend: ollama native /api/generate (NDJSON stream)
+    base = (settings.dgx_model_endpoint or "").rstrip("/")
+    full = f"{system}\n\n{prompt}" if system else prompt
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        async with client.stream(
+            "POST",
+            f"{base}/api/generate",
+            json={
+                "model": settings.dgx_model_name,
+                "prompt": full,
+                "stream": True,
+                "keep_alive": settings.dgx_keep_alive,
+                "options": {"num_predict": max_tokens, "temperature": temperature},
+            },
+        ) as resp:
+            if resp.status_code >= 400:
+                await resp.aread()
+            resp.raise_for_status()
+            async for line in resp.aiter_lines():
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                chunk = obj.get("response")
+                if chunk:
+                    yield chunk
+                if obj.get("done"):
+                    break

@@ -8,8 +8,9 @@ from typing import Optional
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from typing import Annotated
+from typing import Annotated, AsyncIterator
 
 from app.agents.delegations import (
     DelegationError,
@@ -1161,6 +1162,11 @@ class ChatRequest(BaseModel):
         description="Optional user-shared screenshot (data URL or base64) for "
         "Tier-2 screen vision. Fail-closed; see app.screen_vision.",
     )
+    stream: bool = Field(
+        default=False,
+        description="When true, the reply is streamed back as Server-Sent Events "
+        "(meta/delta/done/error) instead of a single ChatResponse JSON body.",
+    )
 
 
 class ChatResponse(BaseModel):
@@ -1172,6 +1178,11 @@ class ChatResponse(BaseModel):
     response: str
     placeholder: bool
     created_at: str
+
+
+def _sse_event(payload: dict) -> bytes:
+    """Encode one Server-Sent Events frame: a single JSON `data:` line."""
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode("utf-8")
 
 
 class AgentRunRequest(BaseModel):
@@ -1605,7 +1616,7 @@ async def chat_debug_history(
 async def chat(
     request: ChatRequest,
     current: Annotated[CurrentUser, Depends(get_current_user)],
-) -> ChatResponse:
+) -> ChatResponse | StreamingResponse:
     if not request.message.strip():
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -3410,34 +3421,25 @@ async def chat(
                     exc,
                 )
 
-    llm_started = time.perf_counter()
-    try:
-        assistant_response = await llm.generate_text(prompt, timeout=120.0)
-    except httpx.HTTPError as exc:
-        llm_duration_ms = int((time.perf_counter() - llm_started) * 1000)
-        logger.exception("chat model request failed session=%s", session_id)
-        if routing_delegation_id is not None:
-            try:
-                await fail_delegation(
-                    routing_delegation_id,
-                    error_message=str(exc),
-                    user_id=current.id,
-                )
-            except Exception:
-                logger.exception("routing delegation fail-update failed")
+    # ---- finalization shared by the JSON and streaming reply paths ----
+    # write_trace's tool_result + metadata are identical across the ok/error/stream
+    # sites; centralize them so the three trace calls cannot drift apart.
+    async def _emit_chat_trace(
+        status_: str, duration_ms: int, error_message: Optional[str] = None
+    ) -> None:
         await write_trace(
             session_id=session_uuid,
             user_id=current.id,
             trace_type="llm_chat",
-            status="error",
+            status=status_,
             selected_agent=selected_agent,
             user_message=request.message,
             memory_count=len(memories_for_prompt),
             memory_ids=memory_ids_in_prompt,
             model_name=llm.active_chat_model(),
             model_endpoint=llm.active_chat_endpoint(),
-            duration_ms=llm_duration_ms,
-            error_message=str(exc),
+            duration_ms=duration_ms,
+            error_message=error_message,
             workspace_id=workspace_uuid,
             tool_name="llm_chat",
             tool_result={
@@ -3454,149 +3456,212 @@ async def chat(
             },
             metadata=_workspace_trace_metadata(),
         )
+
+    async def _finalize(
+        assistant_response: str, llm_duration_ms: int
+    ) -> tuple[str, datetime]:
+        """Post-LLM work (draft/proposal suffix, delegation close, persist, trace)
+        run once the full reply text is known. Returns the final response (with any
+        appended suffix) and its completion timestamp."""
+        # Chat-to-draft (v0.2): when a routed SIGNAL/CHRONOS turn explicitly asks to
+        # SAVE a draft/proposal, persist it as an internal, review-only record via the
+        # governed tool layer. Explicit intent only — plain "draft me an email" does
+        # not create a record. Appends a confirmation (or denial/failure note) to the
+        # answer; never sends email or writes a calendar.
+        draft_suffix: Optional[str] = None
+        is_admin = current.role == "admin"
+        # External-action requests ("send an email", "create a calendar event") are
+        # detected first: the external execution is governance-blocked (logged +
+        # traced) and a safe internal artifact is created in its place. Checked
+        # before the internal draft/propose gates because their verbs differ.
+        if _match_external_email_send_intent(request.message):
+            block_msg = await enforce_external_action_block(
+                tool_name="send_email",
+                agent_name=SIGNAL_NAME,
+                session_id=session_uuid,
+                user_id=current.id,
+                scope_type=scope_type,
+                workspace_id=workspace_uuid,
+            )
+            artifact_suffix = await maybe_create_signal_draft_from_chat(
+                user_message=request.message,
+                response=assistant_response,
+                session_uuid=session_uuid,
+                user_id=current.id,
+                workspace_uuid=workspace_uuid,
+                scope_type=scope_type,
+                is_admin=is_admin,
+            )
+            draft_suffix = _compose_external_block_suffix(block_msg, artifact_suffix)
+        elif _match_external_calendar_create_intent(request.message):
+            block_msg = await enforce_external_action_block(
+                tool_name="create_calendar_event",
+                agent_name=CHRONOS_NAME,
+                session_id=session_uuid,
+                user_id=current.id,
+                scope_type=scope_type,
+                workspace_id=workspace_uuid,
+            )
+            artifact_suffix = await maybe_create_chronos_proposal_from_chat(
+                user_message=request.message,
+                response=assistant_response,
+                session_uuid=session_uuid,
+                user_id=current.id,
+                workspace_uuid=workspace_uuid,
+                scope_type=scope_type,
+                is_admin=is_admin,
+            )
+            draft_suffix = _compose_external_block_suffix(block_msg, artifact_suffix)
+        elif selected_agent == SIGNAL_NAME and (
+            _match_signal_save_intent(request.message)
+            or _match_signal_draft_intent(request.message)
+        ):
+            draft_suffix = await maybe_create_signal_draft_from_chat(
+                user_message=request.message,
+                response=assistant_response,
+                session_uuid=session_uuid,
+                user_id=current.id,
+                workspace_uuid=workspace_uuid,
+                scope_type=scope_type,
+                is_admin=is_admin,
+            )
+        elif selected_agent == CHRONOS_NAME and (
+            _match_chronos_save_intent(request.message)
+            or _match_chronos_propose_intent(request.message)
+        ):
+            draft_suffix = await maybe_create_chronos_proposal_from_chat(
+                user_message=request.message,
+                response=assistant_response,
+                session_uuid=session_uuid,
+                user_id=current.id,
+                workspace_uuid=workspace_uuid,
+                scope_type=scope_type,
+                is_admin=is_admin,
+            )
+        if draft_suffix:
+            assistant_response = f"{assistant_response}{draft_suffix}"
+
+        completed_at = datetime.now(timezone.utc)
+        if routing_delegation_id is not None:
+            try:
+                await complete_delegation(
+                    routing_delegation_id,
+                    output_payload={
+                        "response_chars": len(assistant_response),
+                        "duration_ms": llm_duration_ms,
+                    },
+                    user_id=current.id,
+                )
+            except Exception:
+                logger.exception("routing delegation complete-update failed")
+
+        try:
+            await _persist_exchange(
+                session_uuid=session_uuid,
+                scope_type=scope_type,
+                scope_id=scope_id,
+                user_message=request.message,
+                assistant_response=assistant_response,
+                model_name=llm.active_chat_model(),
+                placeholder=False,
+                started_at=started_at,
+                completed_at=completed_at,
+                agent_name=selected_agent,
+                workspace_id=workspace_uuid,
+            )
+        except Exception:
+            logger.exception("Failed to persist chat exchange session=%s", session_id)
+
+        await _emit_chat_trace("ok", llm_duration_ms)
+        return assistant_response, completed_at
+
+    # Streaming reply path (opt-in via request.stream): same prompt + finalization,
+    # but the model's text is forwarded token-by-token as Server-Sent Events. The
+    # `done` event carries the authoritative full response (including any appended
+    # draft/proposal suffix, which is NOT part of the streamed deltas).
+    if request.stream:
+
+        async def _event_stream() -> AsyncIterator[bytes]:
+            yield _sse_event(
+                {
+                    "type": "meta",
+                    "session_id": session_id,
+                    "selected_agent": selected_agent,
+                }
+            )
+            stream_started = time.perf_counter()
+            parts: list[str] = []
+            try:
+                async for delta in llm.stream_text(prompt, timeout=120.0):
+                    parts.append(delta)
+                    yield _sse_event({"type": "delta", "text": delta})
+            except httpx.HTTPError as exc:
+                duration_ms = int((time.perf_counter() - stream_started) * 1000)
+                logger.exception(
+                    "chat stream model request failed session=%s", session_id
+                )
+                if routing_delegation_id is not None:
+                    try:
+                        await fail_delegation(
+                            routing_delegation_id,
+                            error_message=str(exc),
+                            user_id=current.id,
+                        )
+                    except Exception:
+                        logger.exception("routing delegation fail-update failed")
+                await _emit_chat_trace("error", duration_ms, str(exc))
+                yield _sse_event(
+                    {"type": "error", "detail": f"Chat model request failed: {exc}"}
+                )
+                return
+            duration_ms = int((time.perf_counter() - stream_started) * 1000)
+            final_response, completed_at = await _finalize(
+                "".join(parts).strip(), duration_ms
+            )
+            yield _sse_event(
+                {
+                    "type": "done",
+                    "session_id": session_id,
+                    "agent": PERSONA_NAME,
+                    "selected_agent": selected_agent,
+                    "routing_matched_keywords": matched_keywords,
+                    "model_endpoint": llm.active_chat_endpoint(),
+                    "response": final_response,
+                    "placeholder": False,
+                    "created_at": completed_at.isoformat(),
+                }
+            )
+
+        return StreamingResponse(
+            _event_stream(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    llm_started = time.perf_counter()
+    try:
+        assistant_response = await llm.generate_text(prompt, timeout=120.0)
+    except httpx.HTTPError as exc:
+        llm_duration_ms = int((time.perf_counter() - llm_started) * 1000)
+        logger.exception("chat model request failed session=%s", session_id)
+        if routing_delegation_id is not None:
+            try:
+                await fail_delegation(
+                    routing_delegation_id,
+                    error_message=str(exc),
+                    user_id=current.id,
+                )
+            except Exception:
+                logger.exception("routing delegation fail-update failed")
+        await _emit_chat_trace("error", llm_duration_ms, str(exc))
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"Chat model request failed: {exc}",
         ) from exc
 
     llm_duration_ms = int((time.perf_counter() - llm_started) * 1000)
-
-    # Chat-to-draft (v0.2): when a routed SIGNAL/CHRONOS turn explicitly asks to
-    # SAVE a draft/proposal, persist it as an internal, review-only record via the
-    # governed tool layer. Explicit intent only — plain "draft me an email" does
-    # not create a record. Appends a confirmation (or denial/failure note) to the
-    # answer; never sends email or writes a calendar.
-    draft_suffix: Optional[str] = None
-    is_admin = current.role == "admin"
-    # External-action requests ("send an email", "create a calendar event") are
-    # detected first: the external execution is governance-blocked (logged +
-    # traced) and a safe internal artifact is created in its place. Checked
-    # before the internal draft/propose gates because their verbs differ.
-    if _match_external_email_send_intent(request.message):
-        block_msg = await enforce_external_action_block(
-            tool_name="send_email",
-            agent_name=SIGNAL_NAME,
-            session_id=session_uuid,
-            user_id=current.id,
-            scope_type=scope_type,
-            workspace_id=workspace_uuid,
-        )
-        artifact_suffix = await maybe_create_signal_draft_from_chat(
-            user_message=request.message,
-            response=assistant_response,
-            session_uuid=session_uuid,
-            user_id=current.id,
-            workspace_uuid=workspace_uuid,
-            scope_type=scope_type,
-            is_admin=is_admin,
-        )
-        draft_suffix = _compose_external_block_suffix(block_msg, artifact_suffix)
-    elif _match_external_calendar_create_intent(request.message):
-        block_msg = await enforce_external_action_block(
-            tool_name="create_calendar_event",
-            agent_name=CHRONOS_NAME,
-            session_id=session_uuid,
-            user_id=current.id,
-            scope_type=scope_type,
-            workspace_id=workspace_uuid,
-        )
-        artifact_suffix = await maybe_create_chronos_proposal_from_chat(
-            user_message=request.message,
-            response=assistant_response,
-            session_uuid=session_uuid,
-            user_id=current.id,
-            workspace_uuid=workspace_uuid,
-            scope_type=scope_type,
-            is_admin=is_admin,
-        )
-        draft_suffix = _compose_external_block_suffix(block_msg, artifact_suffix)
-    elif selected_agent == SIGNAL_NAME and (
-        _match_signal_save_intent(request.message)
-        or _match_signal_draft_intent(request.message)
-    ):
-        draft_suffix = await maybe_create_signal_draft_from_chat(
-            user_message=request.message,
-            response=assistant_response,
-            session_uuid=session_uuid,
-            user_id=current.id,
-            workspace_uuid=workspace_uuid,
-            scope_type=scope_type,
-            is_admin=is_admin,
-        )
-    elif selected_agent == CHRONOS_NAME and (
-        _match_chronos_save_intent(request.message)
-        or _match_chronos_propose_intent(request.message)
-    ):
-        draft_suffix = await maybe_create_chronos_proposal_from_chat(
-            user_message=request.message,
-            response=assistant_response,
-            session_uuid=session_uuid,
-            user_id=current.id,
-            workspace_uuid=workspace_uuid,
-            scope_type=scope_type,
-            is_admin=is_admin,
-        )
-    if draft_suffix:
-        assistant_response = f"{assistant_response}{draft_suffix}"
-
-    completed_at = datetime.now(timezone.utc)
-    if routing_delegation_id is not None:
-        try:
-            await complete_delegation(
-                routing_delegation_id,
-                output_payload={
-                    "response_chars": len(assistant_response),
-                    "duration_ms": llm_duration_ms,
-                },
-                user_id=current.id,
-            )
-        except Exception:
-            logger.exception("routing delegation complete-update failed")
-
-    try:
-        await _persist_exchange(
-            session_uuid=session_uuid,
-            scope_type=scope_type,
-            scope_id=scope_id,
-            user_message=request.message,
-            assistant_response=assistant_response,
-            model_name=llm.active_chat_model(),
-            placeholder=False,
-            started_at=started_at,
-            completed_at=completed_at,
-            agent_name=selected_agent,
-            workspace_id=workspace_uuid,
-        )
-    except Exception:
-        logger.exception("Failed to persist chat exchange session=%s", session_id)
-
-    await write_trace(
-        session_id=session_uuid,
-        user_id=current.id,
-        trace_type="llm_chat",
-        status="ok",
-        selected_agent=selected_agent,
-        user_message=request.message,
-        memory_count=len(memories_for_prompt),
-        memory_ids=memory_ids_in_prompt,
-        model_name=llm.active_chat_model(),
-        model_endpoint=llm.active_chat_endpoint(),
-        duration_ms=llm_duration_ms,
-        workspace_id=workspace_uuid,
-        tool_name="llm_chat",
-        tool_result={
-            "workspace_context_injected": workspace_context_text is not None,
-            "workspace_id": str(workspace_uuid) if workspace_uuid else None,
-            "workspace_name": (
-                workspace_context_meta.get("workspace_name")
-                if workspace_context_meta
-                else None
-            ),
-            "workspace_context_chars": prompt_stats.get(
-                "workspace_context_chars", 0
-            ),
-        },
-        metadata=_workspace_trace_metadata(),
+    assistant_response, completed_at = await _finalize(
+        assistant_response, llm_duration_ms
     )
 
     return ChatResponse(

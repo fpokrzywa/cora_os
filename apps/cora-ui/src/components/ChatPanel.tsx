@@ -124,7 +124,7 @@ export function ChatPanel({
             )}
           </div>
         ))}
-        {sending && (
+        {sending && messages[messages.length - 1]?.role !== "assistant" && (
           <div className="msg msg--assistant">
             <div className="msg__role">Cora</div>
             <div className="msg__bubble msg__bubble--typing">
