@@ -89,6 +89,34 @@ READ_ONLY_TOOLS: dict[str, dict] = {
             "required": ["path"],
         },
     },
+    "chronos_list_calendar_events": {
+        "description": "List upcoming events from the user's connected calendar(s) so "
+        "you can find the event to update or cancel. Read-only — changes nothing. Each "
+        "returned event includes its provider + event_id; pass those to "
+        "chronos_update_calendar_event / chronos_cancel_calendar_event. Use this before "
+        "staging an update/cancel when you only know the event by time or title "
+        "(e.g. \"cancel my 3pm\").",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "window": {
+                    "type": "string",
+                    "description": "Natural-language time range: 'today', 'tomorrow', "
+                    "'this week', 'next week', a weekday name, or a YYYY-MM-DD date. "
+                    "Defaults to the next 2 weeks.",
+                },
+                "query": {
+                    "type": "string",
+                    "description": "Optional: only return events whose title contains this text.",
+                },
+                "provider": {
+                    "type": "string",
+                    "enum": ["google_calendar", "outlook_calendar"],
+                    "description": "Optional: which connected calendar to read; default all connected.",
+                },
+            },
+        },
+    },
 }
 
 # Curated STAGING catalog (Phase 5). REVIEW-ONLY internal_action tools: they
@@ -916,6 +944,19 @@ async def _dispatch_read_only(
     )
     if not decision.allowed:
         return f"error: tool {name!r} denied by governance ({decision.reason})."
+
+    # Calendar read needs the caller's OAuth + the calendar_read gate, which the
+    # generic dispatch_tool runners don't carry — run it directly (governance has
+    # already passed above). Stays fully read-only + audited inside the helper.
+    if name == "chronos_list_calendar_events":
+        result = await chat_calendar.agent_list_calendar_events(
+            user_id=user_id,
+            session_id=session_id,
+            window=args.get("window"),
+            query=args.get("query"),
+            provider=args.get("provider"),
+        )
+        return _result_to_text(result)
 
     payload = {
         "session_id": session_id,

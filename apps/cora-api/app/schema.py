@@ -1232,6 +1232,23 @@ VALUES (
 ON CONFLICT (name) DO NOTHING
 """
 
+# Read-only calendar LIST tool (agent calendar-read, P0). Lets the agent discover an
+# event_id from natural language ("cancel my 3pm") instead of needing one pasted.
+# requires_confirmation=FALSE + risk_level='low' so it clears the agent read-only
+# floor; dispatched directly via chat_calendar.agent_list_calendar_events (gated by
+# the calendar_read feature flag, NOT the calendar write/execution switch).
+SEED_CHRONOS_LIST_EVENTS_TOOL_SQL = """
+INSERT INTO tools (name, description, type,
+                   enabled, requires_confirmation, risk_level, allowed_agents)
+VALUES (
+    'chronos_list_calendar_events',
+    'Reads (lists) events from the user''s connected calendar(s) so the agent can find an event to update or cancel. Read-only; governed by the calendar_read gate. Changes nothing.',
+    'internal_read',
+    TRUE, FALSE, 'low', ARRAY['CHRONOS']
+)
+ON CONFLICT (name) DO NOTHING
+"""
+
 SEED_CHRONOS_REVIEW_TOOL_SQL = """
 INSERT INTO tools (name, description, type,
                    enabled, requires_confirmation, risk_level, allowed_agents)
@@ -1676,6 +1693,7 @@ async def init_schema() -> None:
         await conn.execute(SEED_CHRONOS_PROPOSAL_TOOL_SQL)
         await conn.execute(SEED_CHRONOS_UPDATE_EVENT_TOOL_SQL)
         await conn.execute(SEED_CHRONOS_CANCEL_EVENT_TOOL_SQL)
+        await conn.execute(SEED_CHRONOS_LIST_EVENTS_TOOL_SQL)
         await conn.execute(SEED_CHRONOS_REVIEW_TOOL_SQL)
         await conn.execute(SEED_CHRONOS_APPROVE_TOOL_SQL)
         await conn.execute(SEED_CHRONOS_ARCHIVE_TOOL_SQL)

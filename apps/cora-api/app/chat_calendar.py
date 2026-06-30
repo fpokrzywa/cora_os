@@ -1766,6 +1766,76 @@ async def agent_fire_calendar_delete(*, provider, user_id, workspace_id, event_i
         return {"ok": False, "reason": f"unexpected error: {exc}", "event_id": None}
 
 
+async def agent_list_calendar_events(*, user_id, window: Optional[str] = None,
+                                     query: Optional[str] = None,
+                                     provider: Optional[str] = None,
+                                     session_id=None, workspace_id=None,
+                                     limit: int = 20) -> dict:
+    """Read-only calendar LIST for the agent loop (Phase 1 read tool). Resolves the
+    connected provider(s), gate-checks each via _read_gate, brokers the token, lists
+    events in `window` (NL like 'today'/'this week'/'2026-07-01', via the same
+    resolve_read_window the chat read uses), optional case-insensitive title filter.
+    Returns {"ok","events","providers","reason","window"} and NEVER raises; every
+    provider read is audited to calendar_access_events. No write, no staging — pure
+    discovery so the agent can target an event_id for an update/cancel. The exposed
+    event_id is exactly what chronos_update_calendar_event / chronos_cancel_calendar_event
+    expect. Gated by calendar_read only (NOT calendar_execution); reads need no master
+    write switch."""
+    try:
+        uid = user_id if isinstance(user_id, uuid.UUID) else uuid.UUID(str(user_id))
+    except (ValueError, TypeError):
+        return {"ok": False, "events": [], "providers": [], "reason": "invalid user id"}
+    session_uuid = session_id if isinstance(session_id, uuid.UUID) else None
+    if session_uuid is None and session_id:
+        try:
+            session_uuid = uuid.UUID(str(session_id))
+        except (ValueError, TypeError):
+            session_uuid = None
+    try:
+        providers = [provider] if provider else await _resolve_read_providers("", uid)
+        if not providers:
+            return {"ok": False, "events": [], "providers": [],
+                    "reason": "no connected calendar to read"}
+        time_min, time_max, label = resolve_read_window(window or "")
+        merged, oks, skipped = [], [], []
+        for p in providers:
+            evs, info = await _read_one_calendar(
+                p, time_min, time_max, session_uuid=session_uuid,
+                user_id=uid, workspace_uuid=workspace_id)
+            if evs is not None:
+                merged.extend(evs)
+                oks.append(p)
+            else:
+                skipped.append(info)
+        if not oks:
+            notes = "; ".join(f"{_short(s['provider'])}: {s['reason']}" for s in skipped)
+            return {"ok": False, "events": [], "providers": [],
+                    "reason": f"no calendar readable ({notes})"}
+        if query:
+            ql = query.strip().lower()
+            merged = [e for e in merged if ql in (e.get("title") or "").lower()]
+        merged.sort(key=lambda e: e.get("start") or "")
+        merged = _dedupe_series(merged)[: max(1, min(limit, 50))]
+        events = [
+            {
+                "event_id": e.get("id"),
+                "provider": e.get("provider"),
+                "title": e.get("title"),
+                "when": _fmt_event_when(e),
+                "start": e.get("start"),
+                "end": e.get("end"),
+                "location": e.get("location"),
+            }
+            for e in merged
+        ]
+        return {"ok": True, "events": events, "providers": oks, "window": label,
+                "reason": f"{len(events)} event(s) in {label}"}
+    except Exception as exc:  # defensive: read tool must never crash the agent loop
+        logger.exception("agent_list_calendar_events failed user=%s", uid)
+        return {"ok": False, "events": [], "providers": [],
+                "reason": f"unexpected error: {exc}"}
+
+
 async def _create_proposal_fallback(fields, message, *, session_uuid, user_id, workspace_uuid) -> Optional[str]:
     try:
         row = await chronos_tools.create_schedule_proposal(
