@@ -20,6 +20,7 @@ from app.agents.planner import (
 )
 from app.agents.delegations import list_delegations
 from app.auth import CurrentUser, get_current_user
+from app.config import settings
 from app.jobs import JobError, create_job
 from app.runtime_traces import write_trace
 from app.routers.delegations import DelegationOut, _row_to_out as _delegation_row_to_out
@@ -91,6 +92,15 @@ class QueueStepResponse(BaseModel):
     step_id: str
     status: str
     job_type: str
+    created_at: datetime
+
+
+class ExecutePlanResponse(BaseModel):
+    job_id: str
+    plan_id: str
+    status: str
+    job_type: str
+    steps_pending: int
     created_at: datetime
 
 
@@ -549,6 +559,86 @@ async def queue_step_endpoint(
         step_id=str(sid),
         status=job["status"],
         job_type=job["job_type"],
+        created_at=job["created_at"],
+    )
+
+
+@router.post(
+    "/{plan_id}/execute",
+    response_model=ExecutePlanResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Run a whole plan sequentially via one governed orchestrator job. "
+    "Behind PLAN_EXECUTION_ENABLED.",
+)
+async def execute_plan_endpoint(
+    plan_id: str,
+    current: Annotated[CurrentUser, Depends(get_current_user)],
+) -> ExecutePlanResponse:
+    # Fail-closed: whole-plan auto-execution is operator opt-in. Per-step tool
+    # governance still applies regardless (this only gates the auto-sequencing).
+    if not settings.plan_execution_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="whole-plan execution is disabled (set PLAN_EXECUTION_ENABLED)",
+        )
+    pid = _parse_plan_id(plan_id)
+    plan = await get_plan(pid, user_id=current.id, is_admin=(current.role == "admin"))
+    if plan is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="plan not found"
+        )
+    if plan["status"] in ("completed", "cancelled"):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"plan is {plan['status']}; cannot execute",
+        )
+    pending = [s for s in plan["steps"] if s["status"] in ("pending", "running")]
+    if not pending:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="plan has no runnable steps",
+        )
+    try:
+        job = await create_job(
+            user_id=current.id,
+            session_id=plan["session_id"],
+            plan_id=pid,
+            job_type="execution_plan",
+            payload={"plan_id": str(pid)},
+            workspace_id=plan.get("workspace_id"),
+        )
+    except JobError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
+        ) from exc
+
+    await write_trace(
+        session_id=plan["session_id"],
+        user_id=current.id,
+        trace_type="job_created",
+        status="ok",
+        selected_agent="ATLAS",
+        tool_name="job_create",
+        tool_result={
+            "job_id": str(job["id"]),
+            "job_type": "execution_plan",
+            "plan_id": str(pid),
+            "steps_pending": len(pending),
+        },
+    )
+    logger.info(
+        "queued whole-plan execution: user=%s plan=%s job=%s steps_pending=%s",
+        current.id,
+        pid,
+        job["id"],
+        len(pending),
+    )
+    return ExecutePlanResponse(
+        job_id=str(job["id"]),
+        plan_id=str(pid),
+        status=job["status"],
+        job_type="execution_plan",
+        steps_pending=len(pending),
         created_at=job["created_at"],
     )
 

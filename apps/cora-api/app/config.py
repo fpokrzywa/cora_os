@@ -179,6 +179,14 @@ class Settings(BaseSettings):
     # time. Requires the tzdata package for non-UTC names (in requirements.txt).
     cora_timezone: str = "UTC"
 
+    # Whole-plan execution. When true, POST /plans/{id}/execute enqueues a single
+    # orchestrator job that runs the plan's steps sequentially through the EXISTING
+    # governed per-step worker path (check_permission + dispatch_tool; outward tools
+    # still blocked by their own gates). Default false → plans can be built + edited
+    # + run a single step, but a whole-plan run is operator opt-in. Per-step tool
+    # governance is unchanged either way; this only gates the auto-sequencing.
+    plan_execution_enabled: bool = False
+
     # Semantic routing fallback. When true AND deterministic keyword routing scores
     # 0 (no specialist keyword and no explicit intent override matched), one cheap
     # LLM classification call picks a specialist from the user's intent so phrasing

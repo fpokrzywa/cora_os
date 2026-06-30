@@ -28,7 +28,7 @@ from app.agents.delegations import (
     create_delegation,
     fail_delegation,
 )
-from app.agents.planner import PlanError, update_step
+from app.agents.planner import PlanError, fail_step, update_plan, update_step
 from app.clients import clients, close_clients, init_clients
 from app.logging_config import configure_logging
 from app.runtime_traces import write_trace
@@ -348,6 +348,108 @@ async def execute_plan_step(job: dict) -> dict:
     return result_payload
 
 
+async def execute_plan(job: dict) -> dict:
+    """execution_plan handler (whole-plan orchestrator). Runs a plan's steps
+    SEQUENTIALLY through the existing governed per-step path (execute_plan_step →
+    check_permission + dispatch_tool; a tool-less step simulates), halting on the
+    first permanent failure. Behind PLAN_EXECUTION_ENABLED (checked at enqueue).
+    Idempotent + resumable: already-terminal steps skip, so a transient failure that
+    retries the whole job picks up where it left off rather than re-running work."""
+    plan_id = job["plan_id"]
+    if plan_id is None:
+        raise PermanentError("execution_plan job missing plan_id")
+    user_id = job["user_id"]
+    session_id = job["session_id"]
+    workspace_id = job.get("workspace_id")
+    admin_uid = user_id or uuid.uuid4()  # worker has elevated rights over the plan
+
+    async with clients.db_pool.acquire() as conn:
+        plan = await conn.fetchrow(
+            "SELECT id, status FROM execution_plans WHERE id = $1", plan_id
+        )
+        if plan is None:
+            raise PermanentError("plan no longer exists")
+        step_rows = await conn.fetch(
+            """
+            SELECT id, step_number, status
+            FROM execution_plan_steps
+            WHERE plan_id = $1
+            ORDER BY step_number ASC
+            """,
+            plan_id,
+        )
+    if plan["status"] in ("completed", "cancelled"):
+        return {"skipped": True, "reason": f"plan already {plan['status']!r}"}
+
+    # planned → running (running → running is allowed, so a retry is a no-op flip).
+    try:
+        await update_plan(
+            plan_id, user_id=admin_uid, is_admin=True, status_value="running"
+        )
+    except PlanError as exc:
+        return {"skipped": True, "reason": f"cannot start plan: {exc}"}
+
+    steps_ran = 0
+    for srow in step_rows:
+        if srow["status"] in ("completed", "skipped"):
+            continue
+        step_job = {
+            "id": job["id"],
+            "plan_id": plan_id,
+            "step_id": srow["id"],
+            "session_id": session_id,
+            "user_id": user_id,
+            "workspace_id": workspace_id,
+        }
+        try:
+            await execute_plan_step(step_job)
+        except TransientError:
+            # Let the whole job retry; already-completed steps skip on the next pass.
+            raise
+        except PermanentError as exc:
+            try:
+                await fail_step(
+                    plan_id, srow["id"], user_id=admin_uid, is_admin=True,
+                    error_message=str(exc),
+                )
+            except PlanError:
+                logger.exception(
+                    "plan-fail: could not mark step failed plan=%s step=%s",
+                    plan_id, srow["id"],
+                )
+            await update_plan(
+                plan_id, user_id=admin_uid, is_admin=True, status_value="failed"
+            )
+            await write_trace(
+                session_id=session_id, user_id=user_id,
+                trace_type="plan_execution", status="error",
+                selected_agent="ATLAS", tool_name="execution_plan",
+                error_message=str(exc),
+                tool_result={
+                    "plan_id": str(plan_id),
+                    "failed_step": srow["step_number"],
+                    "steps_ran": steps_ran,
+                },
+            )
+            return {
+                "plan_id": str(plan_id), "status": "failed",
+                "failed_step": srow["step_number"], "steps_ran": steps_ran,
+            }
+        steps_ran += 1
+
+    await update_plan(
+        plan_id, user_id=admin_uid, is_admin=True, status_value="completed"
+    )
+    await write_trace(
+        session_id=session_id, user_id=user_id, trace_type="plan_execution",
+        status="ok", selected_agent="ATLAS", tool_name="execution_plan",
+        tool_result={
+            "plan_id": str(plan_id), "status": "completed", "steps_ran": steps_ran,
+        },
+    )
+    return {"plan_id": str(plan_id), "status": "completed", "steps_ran": steps_ran}
+
+
 async def refresh_news_feed(job: dict) -> dict:
     """news_feed_refresh handler (unified knowledge path). Payload carries
     source_id; settings come from the feed's metadata. Reuses the same refresh
@@ -399,6 +501,7 @@ async def run_agent_job(job: dict) -> dict:
 HANDLERS = {
     "execution_plan_step": execute_plan_step,
     "plan_step": execute_plan_step,  # backwards-compat
+    "execution_plan": execute_plan,
     "news_feed_refresh": refresh_news_feed,
     "agent_run": run_agent_job,
 }
