@@ -10,10 +10,9 @@ settings, and conversation-aware voice auto-close. Deep detail lives in the comm
 `agent_runtime_build` (do NOT re-summarize or rebuild shipped work).
 
 ## Git / deploy state (verify first)
-- ⚠️ **13 commits sit on branch `feat/cora-ui2-voice-shell` @ `6d56e24` — NOT pushed, NOT on `main`.**
-  `main` @ `7e1cc91` == `origin/main`. **The deployed stack RUNS THE BRANCH** (every item was
-  compose-built + `up -d`). On the operator's **"push"**: FF `main`, push, delete the branch.
-  Commits newest-first: `6d56e24` barge-in follow-up fix · `bbb564c` prefix-cache-stable workspace line ·
+- **Everything is on `main` — local `main` == `origin/main` @ `c85ab2f`** (pushed 2026-07-02; the
+  feature branch is deleted). **Live == `main`** (every item was compose-built + `up -d`).
+  This session's commits newest-first: `c85ab2f` docs · `6d56e24` barge-in follow-up fix · `bbb564c` prefix-cache-stable workspace line ·
   `ae120f3` latency tranche 1 · `a103ba1` 4B voice rewrite + mailbox detection · `fbcdfba` spoken-prose
   rewrite · `bf91cc3` handler-reply stream fix (all 3 consumers) · `243f63a` script nit · `76f2a48`
   brain-swap kit · `8a0b93b` voice idle guard · `1b80349` ui-prefs settings sync · `0ae1f07`/`058c049`
@@ -64,22 +63,21 @@ settings, and conversation-aware voice auto-close. Deep detail lives in the comm
   needed once — `docker exec nginx-proxy-manager nginx -s reload` if a new host serves the default page).
 
 ## 🛠️ Open work (operator-steered, in rough value order)
-1. **Push decision** — 13 branch commits await "push" (FF main + push + delete branch).
-2. **Inbox drill-down** (designed, offered): "tell me more about the one from Sarah" — stash listed
+1. **Inbox drill-down** (designed, offered): "tell me more about the one from Sarah" — stash listed
    messages as session context (mirror `chat_calendar._stash_list_context`), add follow-up detection,
    governed single-message/thread read, spoken via the existing rewrite. Read-only, same gates.
-3. **History-order bug (correctness, awaiting greenlight)** — `chat.py` `_load_recent_history` returns
+2. **History-order bug (correctness, awaiting greenlight)** — `chat.py` `_load_recent_history` returns
    the OLDEST 10 messages (`ORDER BY created_at ASC LIMIT`); long chats feed the model their opening
    turns. Fix = DESC + reverse. Changes behavior on every long session — operator must approve.
-4. **Speech-overlap tranche** (the "in the room" move): start memory recall/routing/prefill on interim
+3. **Speech-overlap tranche** (the "in the room" move): start memory recall/routing/prefill on interim
    transcripts while the user is still speaking; spoken acknowledgments for slow handler turns need a
    data-channel "turn in flight" signal so auto-close cooperates. Pipecat supports the pattern.
-5. **VAD 0.3** — now just `CORA_VAD_STOP_SECS=0.3` on the DGX + restart; watch for utterance-splitting.
-6. **Whisper quality watch** — if she mishears more than Deepgram did: re-enable cleanup
+4. **VAD 0.3** — now just `CORA_VAD_STOP_SECS=0.3` on the DGX + restart; watch for utterance-splitting.
+5. **Whisper quality watch** — if she mishears more than Deepgram did: re-enable cleanup
    (`CORA_CLEANUP_ENABLED=1`, +~200ms) or flip back (`CORA_STT_PROVIDER=deepgram`).
-7. **NPM-443 cleanup** (port-free `https://cora.tail343b33.ts.net`) — requires editing
+6. **NPM-443 cleanup** (port-free `https://cora.tail343b33.ts.net`) — requires editing
    `cora-stack/docker-compose.yml` (LAN-restrict/remove NPM's 443 bind) — explicit approval required.
-8. Standing operator items: email-send stance (hard-disabled), n8n deploy, real mcp-postgres/github.
+7. Standing operator items: email-send stance (hard-disabled), n8n deploy, real mcp-postgres/github.
 
 ## Do-not-break (adds to the standing invariants — see AIOS §9 + prior prompt for the full list)
 - **Fail-closed flags unchanged**: `AGENT_EXECUTION_ENABLED`/`EXTERNAL_EXECUTION_ENABLED` off; email
@@ -112,5 +110,5 @@ settings, and conversation-aware voice auto-close. Deep detail lives in the comm
 ## Suggested skills
 - `/verify` — confirm changes by real behavior (route smokes, in-container scripts).
 - `/run` — launch/drive the app when a change needs eyes on it.
-- `/code-review` — review the branch diff before the operator's push (13 commits; `ultra` for depth).
+- `/code-review` — review the diff of new work before it lands (`ultra` for a deep cloud pass).
 - `/handoff` — regenerate this document as the work continues.
