@@ -199,6 +199,31 @@ services:
       retries: 5
       start_period: 20s
 
+  # Secondary UI: the Cora_2 voice-shell (orb + glass UI) served static and
+  # rewired to cora-api by its adapter.js. Runs ALONGSIDE cora-ui; which one
+  # is the default is decided at the proxy (NPM host -> cora-ui or cora-ui2).
+  cora-ui2:
+    build:
+      context: ./apps/cora-ui2
+      dockerfile: Dockerfile
+    image: cora-ui2:latest
+    container_name: cora-ui2
+    restart: unless-stopped
+    environment:
+      CORA_API_URL: ${CORA_API_URL:-http://api.cora.local.arpa}
+    networks:
+      cora-proxy:
+        aliases:
+          - cora-ui2
+    expose:
+      - "80"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/ >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
   mcp-filesystem:
     build:
       context: ./apps/mcp-filesystem

@@ -92,6 +92,7 @@ app.add_middleware(
     allow_origins=[
         "http://cora.local.arpa",
         "http://api.cora.local.arpa",
+        "http://ui2.cora.local.arpa",
         "http://localhost:5173",
         "http://localhost:3000",
     ],

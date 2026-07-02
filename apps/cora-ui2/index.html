@@ -1,0 +1,914 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Cora - Personal Assistant</title>
+  <link rel="icon" href="./image/favicon.ico">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+  <script>
+    // Apply persisted theme before first paint to avoid a flash.
+    (function () {
+      try {
+        var t = localStorage.getItem('cora-theme');
+        if (t === 'light') document.documentElement.dataset.theme = 'light';
+      } catch (_) {}
+    })();
+    // Apply persisted orb settings (colour + idle transparency) so
+    // the overlay renders in the saved appearance from the first frame.
+    (function () {
+      try {
+        var raw = localStorage.getItem('cora-orb-settings');
+        if (!raw) return;
+        var s = JSON.parse(raw);
+        if (s && typeof s.color === 'string' && /^#[0-9A-Fa-f]{6}$/.test(s.color)) {
+          var r = parseInt(s.color.slice(1, 3), 16);
+          var g = parseInt(s.color.slice(3, 5), 16);
+          var b = parseInt(s.color.slice(5, 7), 16);
+          document.documentElement.style.setProperty('--orb-rgb', r + ', ' + g + ', ' + b);
+        }
+        if (typeof s.alpha === 'number' && s.alpha >= 0 && s.alpha <= 1) {
+          document.documentElement.style.setProperty('--orb-alpha', String(s.alpha));
+        }
+        if (typeof s.activeAlpha === 'number' && s.activeAlpha >= 0 && s.activeAlpha <= 1) {
+          document.documentElement.style.setProperty('--orb-active-alpha', String(s.activeAlpha));
+        }
+        if (typeof s.size === 'number' && s.size >= 10 && s.size <= 200) {
+          document.documentElement.style.setProperty('--orb-size', s.size + 'vmin');
+        }
+        if (s.center === 'plexus') {
+          document.documentElement.dataset.orbCenter = 'plexus';
+        }
+        if (typeof s.plexusSize === 'number' && s.plexusSize >= 30 && s.plexusSize <= 84) {
+          var inset = (100 - s.plexusSize) / 2;
+          document.documentElement.style.setProperty('--plexus-inset', inset + '%');
+        }
+        if (typeof s.plexusOrganic === 'number' && s.plexusOrganic >= 0 && s.plexusOrganic <= 100) {
+          window.__plexusDisp = 16 * (s.plexusOrganic / 100);
+        }
+        // Voice reactivity: 0..200 slider → 0..2.0 multiplier on the
+        // live audio amplitude that drives orb morph + plexus DISP.
+        if (typeof s.voiceReactivity === 'number' && s.voiceReactivity >= 0 && s.voiceReactivity <= 200) {
+          window.__voiceReactivity = s.voiceReactivity / 100;
+        }
+        if (s.ringOuter === false) document.documentElement.dataset.ringOuter = 'off';
+        if (s.ringInner === false) document.documentElement.dataset.ringInner = 'off';
+      } catch (_) {}
+    })();
+    // Apply persisted main (background) settings before first paint.
+    // We can't touch document.body yet, so inject a <style> rule that
+    // takes effect as soon as the body is parsed.
+    (function () {
+      try {
+        var raw = localStorage.getItem('cora-main-settings');
+        if (!raw) return;
+        var s = JSON.parse(raw);
+        if (!s) return;
+        var css = '';
+        if (s.type === 'image' && typeof s.image === 'string' && s.image) {
+          var safe = s.image.replace(/"/g, '\\"');
+          css = 'body {'
+              + ' background-image: url("' + safe + '");'
+              + ' background-size: cover;'
+              + ' background-position: center center;'
+              + ' background-repeat: no-repeat;'
+              + ' background-attachment: fixed;'
+              + ' }';
+        } else if (s.type === 'color' && typeof s.color === 'string'
+                && /^#[0-9A-Fa-f]{6}$/.test(s.color)) {
+          css = 'body { background-color: ' + s.color + '; }';
+        }
+        if (css) {
+          var style = document.createElement('style');
+          style.id = 'cora-main-settings-style';
+          style.textContent = css;
+          document.head.appendChild(style);
+          // Hide the WebGL canvas so the chosen bg isn't buried by it.
+          document.documentElement.style.setProperty('--canvas-opacity', '0');
+        }
+      } catch (_) {}
+    })();
+    // Default the IDLE/LISTENING/PROCESSING indicator to OFF unless the
+    // user has explicitly enabled it via the main settings modal.
+    (function () {
+      try {
+        var raw = localStorage.getItem('cora-main-settings');
+        var s = raw ? JSON.parse(raw) : null;
+        if (!s || s.showStatusIndicator !== true) {
+          document.documentElement.dataset.statusIndicator = 'off';
+        }
+      } catch (_) {
+        document.documentElement.dataset.statusIndicator = 'off';
+      }
+    })();
+  </script>
+</head>
+<body>
+  <canvas id="scene"></canvas>
+
+  <!-- ==================================================================
+       Glass shell overlay — header, activity panel, response cards.
+       The outer .shell has pointer-events: none so the canvas stays
+       interactive; each interactive child re-enables pointer events.
+       ================================================================== -->
+  <div class="shell" aria-label="Cora interface">
+
+    <!-- Header ------------------------------------------------------- -->
+    <header class="shell-header">
+      <div class="wordmark">
+        <span class="wordmark-dot" aria-hidden="true"></span>
+        Cora
+      </div>
+
+      <div class="header-right">
+        <button class="icon-btn" title="Neural map" aria-label="Neural map">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="5.5" cy="7" r="2"/>
+            <circle cx="18.5" cy="7" r="2"/>
+            <circle cx="12" cy="17" r="2"/>
+            <circle cx="12" cy="4" r="1"/>
+            <path d="M7.5 7h9"/>
+            <path d="M6.8 8.7l4.2 6.4"/>
+            <path d="M17.2 8.7l-4.2 6.4"/>
+            <path d="M12 5v1"/>
+          </svg>
+        </button>
+
+        <button class="icon-btn" title="Alerts" aria-label="Alerts">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M6 9a6 6 0 0 1 12 0c0 6 2.5 6 2.5 8.5h-17C3.5 15 6 15 6 9z"/>
+            <path d="M10.3 20.5a1.94 1.94 0 0 0 3.4 0"/>
+          </svg>
+          <span class="badge">3</span>
+        </button>
+
+        <button class="icon-btn" id="refreshBtn" title="Refresh data" aria-label="Refresh data">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M3 12a9 9 0 0 1 15.5-6.36L21 8"/>
+            <path d="M21 3v5h-5"/>
+            <path d="M21 12a9 9 0 0 1-15.5 6.36L3 16"/>
+            <path d="M3 21v-5h5"/>
+          </svg>
+        </button>
+
+        <button class="icon-btn" id="settingsBtn" title="Settings" aria-label="Settings">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="3"/>
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09A1.65 1.65 0 0 0 15 4.6a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9c.36.36.58.85.6 1.37V12a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+          </svg>
+        </button>
+
+        <div class="view-switcher">
+          <button class="icon-btn view-toggle" id="viewToggle" title="Change view" aria-label="Change view" aria-haspopup="menu" aria-expanded="false">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="7.5" cy="7.5" r="2.5"/>
+              <rect x="13" y="5" width="7" height="5.5" rx="1.2"/>
+              <rect x="4" y="13.5" width="7" height="5.5" rx="1.2"/>
+              <circle cx="16.5" cy="16.5" r="2.5"/>
+            </svg>
+          </button>
+          <div class="view-menu" id="viewMenu" role="menu" aria-labelledby="viewToggle">
+            <button class="view-option" type="button" role="menuitemradio" data-view-mode="cards" aria-checked="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <rect x="4" y="5" width="16" height="6" rx="1.4"/>
+                <rect x="4" y="13" width="16" height="6" rx="1.4"/>
+              </svg>
+              <span class="option-label">Cards</span>
+            </button>
+            <button class="view-option" type="button" role="menuitemradio" data-view-mode="bubbles" aria-checked="false">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <circle cx="8" cy="9" r="3.6"/>
+                <circle cx="16" cy="12" r="2.6"/>
+                <circle cx="10" cy="17" r="2.2"/>
+              </svg>
+              <span class="option-label">Bubbles</span>
+            </button>
+            <button class="view-option" type="button" role="menuitemradio" data-view-mode="both" aria-checked="false">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <rect x="4" y="6" width="9" height="5" rx="1.2"/>
+                <circle cx="17" cy="8.5" r="2.5"/>
+                <circle cx="8" cy="16.5" r="2.5"/>
+                <rect x="12" y="14" width="8" height="5" rx="1.2"/>
+              </svg>
+              <span class="option-label">Both</span>
+            </button>
+            <button class="view-option" type="button" role="menuitemradio" data-view-mode="none" aria-checked="false">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <rect x="4" y="5" width="16" height="14" rx="2" stroke-dasharray="3 3"/>
+                <line x1="6" y1="6" x2="18" y2="18"/>
+              </svg>
+              <span class="option-label">Clean</span>
+            </button>
+          </div>
+        </div>
+
+        <button class="icon-btn theme-toggle" id="themeToggle" title="Toggle theme" aria-label="Toggle theme" aria-pressed="false">
+          <svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+          </svg>
+          <svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="4"/>
+            <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/>
+          </svg>
+        </button>
+
+        <div class="header-status" title="Assistant state">
+          <span>Listening</span>
+          <span class="status-dot" id="statusDot" data-state="listening" aria-live="polite"></span>
+        </div>
+      </div>
+    </header>
+
+    <!-- Floating response cards. Populated by bootstrap.js from /api/cards.
+         Empty here so first paint shows the WebGL background only — cards
+         materialise once the fetch resolves. -->
+    <div class="card-layer"></div>
+
+    <!-- Agent island: persistent tabs across the top of the page, one per
+         canonical agent identity (CORA / ATLAS / SCRIBE / FORGE / PULSE /
+         SIGNAL / CHRONOS). Tabs hang from the top edge with rounded bottom
+         corners. Click a tab to slide the popover down beneath it. -->
+    <aside class="agent-island" id="agentIsland" aria-label="Active agents">
+      <div class="agent-island-chips" id="agentIslandChips"></div>
+      <div class="agent-island-popover" id="agentIslandPopover" aria-hidden="true"></div>
+    </aside>
+
+    <!-- Skills panel (left side) ----------------------------------- -->
+    <!-- Mirrors .activity-panel but anchored to the left. Each skill row is
+         a clickable button; click POSTs /api/skills/{slug}/invoke and the
+         invocation lands in Cora's chat context for the next turn.
+         Defaults to .collapsed (closed). bootstrap.js opens it on init if
+         localStorage['cora-skills-panel-open'] === 'true'. -->
+    <aside class="skills-panel collapsed" id="skillsPanel" aria-label="Skills">
+      <button class="panel-toggle skills-panel-toggle" id="skillsPanelToggle" aria-label="Toggle skills panel">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <polyline points="11 6 5 12 11 18"/>
+          <polyline points="18 6 12 12 18 18"/>
+        </svg>
+      </button>
+      <h2 class="panel-heading">SKILLS</h2>
+      <div class="panel-scroll" id="skillsPanelScroll"></div>
+    </aside>
+
+    <!-- Activity panel (right side) -------------------------------- -->
+    <aside class="activity-panel" id="activityPanel" aria-label="Activity">
+      <button class="panel-toggle" id="panelToggle" aria-label="Toggle activity panel">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <polyline points="13 6 19 12 13 18"/>
+          <polyline points="6 6 12 12 6 18"/>
+        </svg>
+      </button>
+      <h2 class="panel-heading">ACTIVITY</h2>
+
+      <!-- Activity sections populated by bootstrap.js from /api/activity?grouped=true. -->
+      <div class="panel-scroll"></div>
+    </aside>
+
+    <!-- Chat surface (populated by shell.js when the user sends a message) -->
+    <div class="chat-surface" id="chatSurface" aria-live="polite" hidden></div>
+
+    <!-- Bottom mic control bar -------------------------------------- -->
+    <div class="mic-bar" role="group" aria-label="Voice input">
+      <div class="mic-controls">
+        <button class="mic-btn" id="micBtn" type="button"
+                aria-pressed="false" aria-label="Start listening">
+          <span class="icon icon-mic" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="9" y="3" width="6" height="12" rx="3"/>
+              <path d="M5 11a7 7 0 0 0 14 0"/>
+              <path d="M12 18v3"/>
+            </svg>
+          </span>
+          <span class="icon icon-stop" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="currentColor">
+              <rect x="5" y="5" width="14" height="14" rx="2"/>
+            </svg>
+          </span>
+        </button>
+        <button class="chat-btn" id="chatBtn" type="button"
+                aria-pressed="false" aria-label="Show chat input"
+                aria-controls="chatForm" title="Chat">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+               stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M4 5h16v11H8l-4 4V5z"/>
+            <path d="M8 10h8M8 13h5"/>
+          </svg>
+        </button>
+      </div>
+      <!-- File attachment chips (drag-and-drop or paperclip). Hidden until
+           the user attaches at least one file; populated by setupChat. -->
+      <div class="chat-attachments" id="chatAttachments" hidden></div>
+      <form class="chat-form" id="chatForm" autocomplete="off">
+        <button type="button" class="chat-attach" id="chatAttachBtn"
+                aria-label="Attach file" title="Attach file (or drag onto chat)">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+               stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
+          </svg>
+        </button>
+        <input type="file" id="chatAttachInput" multiple style="display:none"/>
+        <input class="chat-input" id="chatInput" type="text"
+               placeholder="Ask Cora… (use @path to include a file from the project)"
+               aria-label="Message Cora" />
+        <button class="chat-send" id="chatSend" type="submit"
+                aria-label="Send message" title="Send">
+          <span class="icon icon-send" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                 stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M5 12h14"/><path d="M13 6l6 6-6 6"/>
+            </svg>
+          </span>
+          <span class="icon icon-stop" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="currentColor">
+              <rect x="6" y="6" width="12" height="12" rx="1.5"/>
+            </svg>
+          </span>
+        </button>
+      </form>
+      <div class="mic-hint" id="micHint">Tap or say &lsquo;Hey Cora&rsquo; / &lsquo;Hi Cora&rsquo; / &lsquo;Good morning Cora&rsquo;…</div>
+    </div>
+
+  </div>
+
+  <!-- SVG filters used by the speech overlay to give the orb an
+       organic, rippling silhouette instead of a smooth circle. -->
+  <svg class="speech-filters" width="0" height="0" aria-hidden="true">
+    <defs>
+      <filter id="orbTurbulence" x="-20%" y="-20%" width="140%" height="140%">
+        <feTurbulence type="fractalNoise" baseFrequency="0.008" numOctaves="2" seed="5" result="noise">
+          <animate attributeName="baseFrequency" dur="26s"
+                   values="0.006;0.012;0.009;0.006" repeatCount="indefinite"/>
+        </feTurbulence>
+        <feDisplacementMap in="SourceGraphic" in2="noise" scale="42"/>
+      </filter>
+      <filter id="orbTurbulenceInner" x="-20%" y="-20%" width="140%" height="140%">
+        <feTurbulence type="fractalNoise" baseFrequency="0.012" numOctaves="2" seed="17" result="noise">
+          <animate attributeName="baseFrequency" dur="19s"
+                   values="0.009;0.018;0.012;0.009" repeatCount="indefinite"/>
+        </feTurbulence>
+        <feDisplacementMap in="SourceGraphic" in2="noise" scale="28"/>
+      </filter>
+    </defs>
+  </svg>
+
+  <!-- Speech overlay: a dedicated layer just above the scene canvas
+       that shows a prominent green morphing orb when the mic is
+       active. Background canvas (nebula, stars, orb) stays intact. -->
+  <div class="speech-overlay" id="speechOverlay" aria-hidden="true">
+    <div class="speech-halo"></div>
+    <div class="speech-orb" id="speechOrb">
+      <div class="speech-orb-strand"></div>
+      <div class="speech-orb-core"></div>
+      <div class="speech-orb-plexus" id="speechOrbPlexus" aria-hidden="true">
+        <canvas></canvas>
+      </div>
+    </div>
+  </div>
+
+  <!-- Floating-bubbles view. Populated by JS when the view toggle
+       switches to bubble mode. Each bubble is sourced from one of
+       the .card-shell entries above. -->
+  <div class="bubble-layer" id="bubbleLayer" aria-hidden="true"></div>
+
+  <!-- Expanded-detail modal. Populated by JS on demand; FLIPs from
+       the source card's on-screen rect to this dialog and back. -->
+  <div class="modal-root" id="modalRoot" hidden>
+    <div class="modal-backdrop" data-modal-close aria-hidden="true"></div>
+    <div class="modal-dialog" id="modalDialog" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+      <button class="modal-close" data-modal-close aria-label="Close details">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M6 6l12 12M18 6l-12 12"/>
+        </svg>
+      </button>
+      <div class="modal-body" id="modalBody"></div>
+    </div>
+  </div>
+
+  <!-- Settings modal: adjusts the speech-overlay orb's colour and
+       idle transparency. Live-previews via CSS vars; commits on
+       Save; closing without Save reverts. -->
+  <!-- Main settings modal: app background (color or image). Live
+       preview while editing; Save persists, Default reverts to the
+       app's original background (no override). -->
+  <div class="settings-modal" id="mainSettingsModal" hidden>
+    <div class="settings-backdrop" data-main-settings-close aria-hidden="true"></div>
+    <div class="settings-dialog" role="dialog" aria-modal="true" aria-labelledby="mainSettingsTitle">
+      <button class="settings-close" data-main-settings-close aria-label="Close settings">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M6 6l12 12M18 6l-12 12"/>
+        </svg>
+      </button>
+      <h2 class="settings-title" id="mainSettingsTitle">Main settings</h2>
+
+      <!-- Tab strip. The active tab class drives both the button styling
+           and the .settings-tab-panel[data-tab=...] visibility via CSS. -->
+      <div class="settings-tabs" role="tablist">
+        <button type="button" class="settings-tab active" role="tab" aria-selected="true" data-tab="background">Background</button>
+        <button type="button" class="settings-tab" role="tab" aria-selected="false" data-tab="display">Display</button>
+        <button type="button" class="settings-tab" role="tab" aria-selected="false" data-tab="orb">Orb</button>
+        <button type="button" class="settings-tab" role="tab" aria-selected="false" data-tab="voice">Voice</button>
+        <button type="button" class="settings-tab" role="tab" aria-selected="false" data-tab="agents">Agents</button>
+      </div>
+
+      <div class="settings-tab-body">
+        <!-- ===== Background tab ===== -->
+        <section class="settings-tab-panel active" data-tab="background" role="tabpanel">
+          <div class="settings-section">
+            <label>Background type</label>
+            <div class="settings-control segment-control" role="radiogroup" aria-label="Background type">
+              <label class="segment-option">
+                <input type="radio" name="bgType" value="color" checked/>
+                <span>Color</span>
+              </label>
+              <label class="segment-option">
+                <input type="radio" name="bgType" value="image"/>
+                <span>Image</span>
+              </label>
+            </div>
+          </div>
+
+          <div class="settings-section" id="bgColorSection">
+            <label for="bgColorInput">Background color</label>
+            <div class="settings-control">
+              <input type="color" id="bgColorInput" value="#0E0F13"/>
+              <span class="color-value" id="bgColorValue">#0E0F13</span>
+            </div>
+          </div>
+
+          <div class="settings-section" id="bgImageSection" hidden>
+            <label for="bgImageUrlInput">Image URL</label>
+            <div class="settings-control">
+              <input type="url" id="bgImageUrlInput" class="text-input" placeholder="https://example.com/image.jpg" autocomplete="off" spellcheck="false"/>
+            </div>
+            <div class="settings-control">
+              <label class="file-input-label" for="bgImageFileInput">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M12 16V4"/>
+                  <path d="M7 9l5-5 5 5"/>
+                  <path d="M5 20h14"/>
+                </svg>
+                <span>Upload image</span>
+                <input type="file" id="bgImageFileInput" accept="image/*"/>
+              </label>
+              <span class="file-input-hint" id="bgImageFileHint">No file chosen</span>
+            </div>
+            <div class="bg-image-preview" id="bgImagePreview" aria-hidden="true">
+              <span class="bg-image-preview-empty">Preview</span>
+            </div>
+          </div>
+        </section>
+
+        <!-- ===== Display tab ===== -->
+        <section class="settings-tab-panel" data-tab="display" role="tabpanel" hidden>
+          <div class="settings-section" id="refreshIntervalSection">
+            <label for="refreshIntervalInput">Auto refresh (seconds, 0 = off)</label>
+            <div class="settings-control">
+              <input type="number" id="refreshIntervalInput" class="text-input" min="0" max="86400" step="1" value="0" inputmode="numeric"/>
+            </div>
+          </div>
+
+          <div class="settings-section">
+            <label>Header indicator</label>
+            <div class="settings-control settings-toggles">
+              <label class="toggle-option">
+                <input type="checkbox" id="statusIndicatorInput"/>
+                <span class="toggle-pip"></span>
+                <span class="toggle-label">Show Idle / Listening / Processing</span>
+              </label>
+            </div>
+          </div>
+        </section>
+
+        <!-- ===== Orb tab ===== -->
+        <section class="settings-tab-panel" data-tab="orb" role="tabpanel" hidden>
+          <div class="settings-section">
+            <label for="orbColorInput">Colour</label>
+            <div class="settings-control">
+              <input type="color" id="orbColorInput" value="#35AE7D"/>
+              <span class="color-value" id="orbColorValue">#35AE7D</span>
+            </div>
+          </div>
+
+          <div class="settings-section">
+            <label for="orbAlphaInput">Idle transparency</label>
+            <div class="settings-control">
+              <input type="range" id="orbAlphaInput" min="0" max="100" step="1" value="55"/>
+              <span class="slider-value" id="orbAlphaValue">55%</span>
+            </div>
+          </div>
+
+          <div class="settings-section">
+            <label for="orbActiveAlphaInput">Active transparency</label>
+            <div class="settings-control">
+              <input type="range" id="orbActiveAlphaInput" min="0" max="100" step="1" value="100"/>
+              <span class="slider-value" id="orbActiveAlphaValue">100%</span>
+            </div>
+          </div>
+
+          <div class="settings-section">
+            <label for="orbSizeInput">Size</label>
+            <div class="settings-control">
+              <input type="range" id="orbSizeInput" min="30" max="140" step="1" value="88"/>
+              <span class="slider-value" id="orbSizeValue">88%</span>
+            </div>
+          </div>
+
+          <div class="settings-section">
+            <label for="orbRingOrganicInput">Ring organic</label>
+            <div class="settings-control">
+              <input type="range" id="orbRingOrganicInput" min="0" max="100" step="1" value="55"/>
+              <span class="slider-value" id="orbRingOrganicValue">55%</span>
+            </div>
+          </div>
+
+          <div class="settings-section">
+            <label>Rings</label>
+            <div class="settings-control settings-toggles">
+              <label class="toggle-option">
+                <input type="checkbox" id="orbRingOuterInput" checked/>
+                <span class="toggle-pip"></span>
+                <span class="toggle-label">Outer</span>
+              </label>
+              <label class="toggle-option">
+                <input type="checkbox" id="orbRingInnerInput" checked/>
+                <span class="toggle-pip"></span>
+                <span class="toggle-label">Inner</span>
+              </label>
+            </div>
+          </div>
+
+          <div class="settings-section">
+            <label>Center style</label>
+            <div class="settings-control segment-control" role="radiogroup" aria-label="Orb center style">
+              <label class="segment-option">
+                <input type="radio" name="orbCenter" value="default" checked/>
+                <span>Default</span>
+              </label>
+              <label class="segment-option">
+                <input type="radio" name="orbCenter" value="plexus"/>
+                <span>Plexus</span>
+              </label>
+            </div>
+          </div>
+
+          <div class="settings-section">
+            <label for="orbPlexusSizeInput">Plexus size</label>
+            <div class="settings-control">
+              <input type="range" id="orbPlexusSizeInput" min="30" max="84" step="1" value="60"/>
+              <span class="slider-value" id="orbPlexusSizeValue">60%</span>
+            </div>
+          </div>
+
+          <div class="settings-section">
+            <label for="orbPlexusOrganicInput">Plexus organic</label>
+            <div class="settings-control">
+              <input type="range" id="orbPlexusOrganicInput" min="0" max="100" step="1" value="44"/>
+              <span class="slider-value" id="orbPlexusOrganicValue">44%</span>
+            </div>
+          </div>
+
+          <div class="settings-section">
+            <label for="orbVoiceReactivityInput">Voice reactivity</label>
+            <div class="settings-control">
+              <input type="range" id="orbVoiceReactivityInput" min="0" max="200" step="5" value="150"/>
+              <span class="slider-value" id="orbVoiceReactivityValue">150%</span>
+            </div>
+          </div>
+
+          <!-- Per-tab actions: Save persists orb tweaks; Default resets to
+               the original orb config without persisting until Save. The
+               main modal's bottom Default/Save row stays for Background. -->
+          <div class="settings-actions" style="margin-top: 14px;">
+            <button type="button" class="settings-btn settings-btn-ghost" id="orbDefaultBtn">Default</button>
+            <button type="button" class="settings-btn settings-btn-primary" id="orbSaveBtn">Save</button>
+          </div>
+        </section>
+
+        <!-- ===== Voice tab ===== -->
+        <section class="settings-tab-panel" data-tab="voice" role="tabpanel" hidden>
+          <div class="settings-section">
+            <label class="toggle-option">
+              <input type="checkbox" id="wakeWordEnabledInput"/>
+              <span class="toggle-pip"></span>
+              <span class="toggle-label">Wake word</span>
+            </label>
+            <p style="margin: 4px 0 0; font-size: 11px; color: var(--text-mid);">
+              When on, Cora listens in the background for any of: &ldquo;hey Cora&rdquo;,
+              &ldquo;hi Cora&rdquo;, &ldquo;hello Cora&rdquo;, &ldquo;good morning / afternoon / evening Cora&rdquo;.
+              Uses the browser's built-in speech recogniser — Chrome / Edge only;
+              audio is sent to Google for transcription. Mic permission required.
+            </p>
+            <p id="wakeWordStatus" style="margin: 4px 0 0; font-size: 11px; color: var(--text-mid);"></p>
+          </div>
+
+          <div class="settings-section">
+            <label for="voiceAutoCloseInput">Auto-close after (seconds)</label>
+            <div class="settings-control">
+              <input type="number" id="voiceAutoCloseInput" class="text-input"
+                     min="0" max="60" step="1" style="max-width: 120px;" />
+            </div>
+            <p style="margin: 4px 0 0; font-size: 11px; color: var(--text-mid);">
+              How many seconds of silence after Cora finishes speaking before
+              the voice session auto-closes. You'll need to wake her again
+              ("hey Cora", "hi Cora", etc.) to continue. Set to <strong>0</strong>
+              to disable auto-close (manual mic toggle only).
+            </p>
+          </div>
+
+          <div class="settings-section">
+            <label for="voicePickerSelect">Cora's voice</label>
+            <div class="settings-control">
+              <select id="voicePickerSelect" class="text-input" style="min-width: 100%;">
+                <option value="">Loading voices...</option>
+              </select>
+            </div>
+            <p class="voice-picker-desc" id="voicePickerDesc" style="margin: 0; font-size: 12px; color: var(--text-mid);"></p>
+          </div>
+
+          <div class="settings-section">
+            <label for="voicePickerTestText">Test it</label>
+            <div class="settings-control">
+              <input type="text" id="voicePickerTestText" class="text-input" maxlength="400"
+                     value="Hi, I'm Cora. Pretty good vibe, right?" autocomplete="off"/>
+            </div>
+            <div class="settings-control" style="display: flex; gap: 10px; align-items: center;">
+              <button type="button" class="settings-btn settings-btn-primary" id="voicePickerTestBtn">
+                <span id="voicePickerTestBtnLabel">Play sample</span>
+              </button>
+              <span class="voice-picker-status" id="voicePickerStatus" style="font-size: 12px; color: var(--text-mid);"></span>
+            </div>
+            <audio id="voicePickerPreviewAudio" preload="auto"></audio>
+          </div>
+        </section>
+
+        <!-- ===== Agents tab ===== -->
+        <section class="settings-tab-panel" data-tab="agents" role="tabpanel" hidden>
+          <h3 class="settings-subhead">Visible tabs</h3>
+          <p style="margin: 0 0 8px; font-size: 12px; color: var(--text-mid);">
+            Toggle which agent tabs appear at the top of the page.
+          </p>
+          <div id="agentVisibilityList" class="agents-visibility-list"></div>
+
+          <div class="settings-section" style="margin-top: 14px;">
+            <label for="agentPopoverTimeoutInput">Auto-close popover (seconds)</label>
+            <div class="settings-control">
+              <input type="number" id="agentPopoverTimeoutInput" class="text-input" min="0" max="300" step="1" value="10" inputmode="numeric"/>
+            </div>
+            <p style="margin: 4px 0 0; font-size: 11px; color: var(--text-mid);">
+              Tab popover auto-closes after this many seconds. Pauses while you hover. Set to 0 to keep it open until you click again.
+            </p>
+          </div>
+
+          <hr class="agents-hr" style="margin: 16px 0; border: none; border-top: 1px solid var(--hairline);"/>
+
+          <h3 class="settings-subhead">SIGNAL — Gmail connection</h3>
+          <p style="margin: 0 0 8px; font-size: 12px; color: var(--text-mid);">
+            Authorise Cora to read your inbox + draft replies. Phase 1 is
+            read + draft only — Cora never auto-sends. Tokens are stored
+            locally in the cora_v2 database.
+          </p>
+          <div id="signalAuthBox" class="signal-auth-box">
+            <div id="signalAuthStatus" style="font-size: 12px; color: var(--text-mid); margin-bottom: 8px;">
+              Checking connection…
+            </div>
+            <div class="settings-actions" style="margin: 0;">
+              <button type="button" class="settings-btn settings-btn-primary" id="signalConnectBtn" hidden>Connect Gmail</button>
+              <button type="button" class="settings-btn settings-btn-ghost"   id="signalDisconnectBtn" hidden>Disconnect</button>
+            </div>
+            <p id="signalAuthHint" style="margin: 8px 0 0; font-size: 11px; color: var(--text-mid);" hidden></p>
+          </div>
+
+          <hr class="agents-hr" style="margin: 16px 0; border: none; border-top: 1px solid var(--hairline);"/>
+
+          <h3 class="settings-subhead">Cora's remembered preferences</h3>
+          <p style="margin: 0 0 8px; font-size: 12px; color: var(--text-mid);">
+            One-line preferences Cora has saved when you asked her to remember
+            something ("be more concise", "use British spelling"). They're
+            included in her chat context every turn. Click &times; to remove,
+            or wipe all with the button below.
+          </p>
+          <div id="personaNotesList" class="persona-notes-list"></div>
+          <div class="settings-actions" style="margin-top: 8px;">
+            <button type="button" class="settings-btn settings-btn-ghost" id="personaClearBtn">Clear all preferences</button>
+          </div>
+          <p id="personaStatus" style="margin: 6px 0 0; font-size: 11px; color: var(--text-mid);"></p>
+
+          <hr class="agents-hr" style="margin: 16px 0; border: none; border-top: 1px solid var(--hairline);"/>
+
+          <h3 class="settings-subhead">PULSE &mdash; AI News Scout</h3>
+          <div class="settings-section">
+            <label class="toggle-option">
+              <input type="checkbox" id="pulseEnabledInput"/>
+              <span class="toggle-pip"></span>
+              <span class="toggle-label">Enable PULSE</span>
+            </label>
+          </div>
+
+          <div class="settings-section">
+            <label for="pulsePollIntervalInput">Poll every (minutes)</label>
+            <div class="settings-control">
+              <input type="number" id="pulsePollIntervalInput" class="text-input" min="5" max="360" step="1" value="30" inputmode="numeric"/>
+            </div>
+          </div>
+
+          <div class="settings-section">
+            <label for="pulseNewsWindowInput">News window (hours)</label>
+            <div class="settings-control">
+              <input type="number" id="pulseNewsWindowInput" class="text-input" min="1" max="720" step="1" value="24" inputmode="numeric"/>
+            </div>
+            <p style="margin: 4px 0 0; font-size: 11px; color: var(--text-mid);">
+              Drop items older than this from the poll. Default 24 = "last day's news only".
+            </p>
+          </div>
+
+          <div class="settings-section">
+            <label for="pulseMaxItemsInput">Max items per source</label>
+            <div class="settings-control">
+              <input type="number" id="pulseMaxItemsInput" class="text-input" min="1" max="500" step="1" value="25" inputmode="numeric"/>
+            </div>
+            <p style="margin: 4px 0 0; font-size: 11px; color: var(--text-mid);">
+              Cap on items kept per source per poll (newest first). Default 25 keeps arxiv-style daily-dump feeds from drowning the table.
+            </p>
+          </div>
+
+          <div class="settings-section">
+            <label class="toggle-option">
+              <input type="checkbox" id="pulseDigestEnabledInput"/>
+              <span class="toggle-pip"></span>
+              <span class="toggle-label">Daily digest</span>
+            </label>
+          </div>
+
+          <div class="settings-section">
+            <label for="pulseDigestTimeInput">Digest time (local, HH:MM)</label>
+            <div class="settings-control">
+              <input type="time" id="pulseDigestTimeInput" class="text-input"/>
+            </div>
+          </div>
+
+          <div class="settings-section">
+            <label for="pulseFeaturedCountInput">Featured count</label>
+            <div class="settings-control">
+              <input type="number" id="pulseFeaturedCountInput" class="text-input" min="3" max="15" step="1" value="8" inputmode="numeric"/>
+            </div>
+          </div>
+
+          <div class="settings-section">
+            <label for="pulseRateLimitInput">Summarizer rate limit (per minute)</label>
+            <div class="settings-control">
+              <input type="number" id="pulseRateLimitInput" class="text-input" min="1" max="60" step="1" value="5" inputmode="numeric"/>
+            </div>
+          </div>
+
+          <div class="settings-actions" style="margin-top: 6px;">
+            <button type="button" class="settings-btn settings-btn-ghost" id="pulsePollNowBtn">Poll now</button>
+            <button type="button" class="settings-btn settings-btn-ghost" id="pulseDigestNowBtn">Force digest</button>
+            <button type="button" class="settings-btn settings-btn-primary" id="pulseSaveBtn">Save PULSE settings</button>
+          </div>
+          <p class="agents-status" id="pulseStatusText" style="margin: 8px 0 0; font-size: 12px; color: var(--text-mid);"></p>
+
+          <hr class="agents-hr" style="margin: 16px 0; border: none; border-top: 1px solid var(--hairline);"/>
+
+          <h3 class="settings-subhead">Agent configs</h3>
+          <p style="margin: 0 0 8px; font-size: 12px; color: var(--text-mid);">
+            Each agent runs the active version of its config. Editing fields and saving mints a new version &mdash; the old one is preserved as audit trail.
+          </p>
+
+          <div class="settings-section">
+            <label for="agentConfigPickerSelect">Agent</label>
+            <div class="settings-control">
+              <select id="agentConfigPickerSelect" class="text-input" style="min-width: 100%;">
+                <option value="">Loading...</option>
+              </select>
+            </div>
+          </div>
+
+          <div id="agentConfigPanel" hidden>
+            <div class="settings-section">
+              <label>Active version</label>
+              <span id="agentConfigActiveLabel" style="font-size: 13px; color: var(--text-mid);">&mdash;</span>
+            </div>
+
+            <div class="settings-section">
+              <label>Provider</label>
+              <div class="settings-control segment-control" id="agentConfigProvider" role="radiogroup" aria-label="Provider"></div>
+            </div>
+
+            <div class="settings-section">
+              <label for="agentConfigModelInput">Model</label>
+              <div class="settings-control">
+                <input type="text" id="agentConfigModelInput" class="text-input" placeholder="cora-qwen3:4b"/>
+              </div>
+            </div>
+
+            <div class="settings-section">
+              <label for="agentConfigEndpointInput">Endpoint (optional override)</label>
+              <div class="settings-control">
+                <input type="text" id="agentConfigEndpointInput" class="text-input" placeholder="leave blank for provider default"/>
+              </div>
+            </div>
+
+            <div class="settings-section">
+              <label for="agentConfigKeyEnvInput">API key env var</label>
+              <div class="settings-control">
+                <input type="text" id="agentConfigKeyEnvInput" class="text-input" placeholder="e.g. ANTHROPIC_API_KEY (cloud only)"/>
+              </div>
+            </div>
+
+            <div class="agents-config-row" style="display: flex; gap: 10px;">
+              <div class="settings-section" style="flex: 1;">
+                <label for="agentConfigMaxTokensInput">Max tokens</label>
+                <div class="settings-control">
+                  <input type="number" id="agentConfigMaxTokensInput" class="text-input" min="1" max="128000" step="1" value="1024" inputmode="numeric"/>
+                </div>
+              </div>
+              <div class="settings-section" style="flex: 1;">
+                <label for="agentConfigNumCtxInput">Num ctx</label>
+                <div class="settings-control">
+                  <input type="number" id="agentConfigNumCtxInput" class="text-input" min="0" step="1" inputmode="numeric" placeholder="(local only)"/>
+                </div>
+              </div>
+              <div class="settings-section" style="flex: 1;">
+                <label for="agentConfigTemperatureInput">Temperature</label>
+                <div class="settings-control">
+                  <input type="number" id="agentConfigTemperatureInput" class="text-input" min="0" max="2" step="0.1" value="0.7"/>
+                </div>
+              </div>
+            </div>
+
+            <div class="settings-section">
+              <label for="agentConfigPromptTextarea">System prompt</label>
+              <div class="settings-control">
+                <textarea id="agentConfigPromptTextarea" class="text-input" rows="10" style="font-family: ui-monospace, 'Cascadia Code', Menlo, monospace; font-size: 12px; line-height: 1.5; min-width: 100%; resize: vertical;"></textarea>
+              </div>
+            </div>
+
+            <div class="settings-section">
+              <label for="agentConfigDescriptionInput">Version description</label>
+              <div class="settings-control">
+                <input type="text" id="agentConfigDescriptionInput" class="text-input" placeholder="What changed in this version?"/>
+              </div>
+            </div>
+
+            <div class="settings-actions" style="margin-top: 6px;">
+              <button type="button" class="settings-btn settings-btn-ghost" id="agentConfigSaveBtn">Save as new version</button>
+              <button type="button" class="settings-btn settings-btn-primary" id="agentConfigSaveActivateBtn">Save &amp; activate</button>
+            </div>
+            <p class="agents-status" id="agentConfigStatusText" style="margin: 8px 0 0; font-size: 12px; color: var(--text-mid);"></p>
+
+            <div class="settings-section" style="margin-top: 16px;">
+              <label for="agentConfigVersionsSelect">All versions</label>
+              <div class="settings-control">
+                <select id="agentConfigVersionsSelect" class="text-input" style="min-width: 100%;"></select>
+              </div>
+              <div class="settings-actions">
+                <button type="button" class="settings-btn settings-btn-ghost" id="agentConfigActivateBtn">Activate selected version</button>
+              </div>
+            </div>
+          </div>
+        </section>
+      </div>
+
+      <div class="settings-actions">
+        <button type="button" class="settings-btn settings-btn-ghost" id="mainDefaultBtn">Default</button>
+        <button type="button" class="settings-btn settings-btn-primary" id="mainSaveBtn">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Hidden audio sink for the voice path. shell.js's voice module wires
+       a WebRTC peer connection to the Spark voice service and sets this
+       element's srcObject to the inbound audio stream. autoplay+playsinline
+       so it works on iOS without further interaction. -->
+  <audio id="cora-voice-audio" autoplay playsinline style="display:none"></audio>
+
+  <!-- Markdown renderer for assistant chat replies. Loaded synchronously
+       so window.marked exists by the time shell.js wires up the chat. -->
+  <script src="https://unpkg.com/marked@14.1.4/marked.min.js"></script>
+
+  <!-- cora-ui2: config.js (generated at container start) sets the cora-api
+       base URL; adapter.js rewires every /api/* call the shell makes onto
+       the Cora AI OS backend. MUST load before bootstrap.js. -->
+  <script src="config.js"></script>
+  <script src="adapter.js"></script>
+
+  <!-- Bootstrap: fetches /api/cards and /api/activity, renders them into
+       the empty .card-layer / .panel-scroll containers above, then
+       dynamically loads shell.js (which queries those rendered elements). -->
+  <script src="bootstrap.js"></script>
+
+  <!-- Three.js scene: nebula, starfield, orb, bloom. -->
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+    }
+  }
+  </script>
+  <script type="module" src="scene.js"></script>
+</body>
+</html>
