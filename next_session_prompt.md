@@ -1,145 +1,116 @@
 # Next Session — First Message
 
-Continuing the **Cora AI OS** build. The pre-UI capability phase is **complete**, the **voice-first UI
-v1 has shipped** — talk to Cora and hear her answer, with barge-in (browser Web Speech API) — and the
-**voice v2 polish has shipped too** (2026-07-01, `d201f55`): sentence-chunked TTS that speaks AS the
-reply streams (`createSpeechStream` in `apps/cora-ui/src/voice/speech.ts`) + a live interim transcript
-while listening. Earlier capabilities on `main`: semantic routing fallback, memory cleanup + spoken
-disambiguation, barge-in cancellation, whole-plan execution, and the voice UI v1. Deeper detail lives in
-code docstrings, the commits, `AIOS_CORE_ARCHITECTURE.md` §9 (entries "Voice UI v2" + "Whole-plan
-execution + voice-first UI v1" + "Voice-readiness close-out" + "Voice-first UI readiness"),
-`HANDOFF_SESSION.md`, `VOICE_UI_READINESS.md`, and the auto-memories `agent_runtime_build` +
-`dgx_inference_backends` + `project_voice_ui_readiness` (do NOT re-summarize or rebuild shipped work).
+Continuing the **Cora AI OS** build. This session shipped the **Cora_2 voice shell as a second UI
+(`cora-ui2`)**, the **voice brain-swap** (her voice now runs the REAL cora-api pipeline via a new
+OpenAI-compatible façade — it had been answering from cloud Claude Haiku), a **22-finding latency
+overhaul** (session start ~10s→1-2s, local Whisper STT, parallel provider reads), account-backed UI
+settings, and conversation-aware voice auto-close. Deep detail lives in the commit messages,
+`AIOS_CORE_ARCHITECTURE.md` §9 (entry "Cora_2 voice shell + brain swap + latency overhaul"),
+`infra/dgx-voice/README.md`, and the auto-memories `cora_ui2_voice_shell` + `dgx_inference_backends` +
+`agent_runtime_build` (do NOT re-summarize or rebuild shipped work).
 
 ## Git / deploy state (verify first)
-- **Everything is on `main` — local `main` == `origin/main`.** HEAD is **`d201f55`** (voice UI v2 —
-  streaming TTS + interim transcript, 2026-07-01; a docs-refresh commit may sit one ahead). Before it,
-  newest first: `5b26cb3` docs · `0294803` voice UI v1 · `aaba2a9` whole-plan execution · `a5cefb6` docs ·
-  `47e4481` barge-in cancellation · `8c704f0` memory disambiguation · `f5c9676` semantic routing. Prior
-  session (also on main): `aebc510` … `a2721d8` (the 6 voice-readiness capabilities). No feature branches
-  remain. Quick check: `git log --oneline -12`, `docker compose ps`.
-- **The deployed stack runs this code** (each item was `docker compose build` + `up -d`), so **live == `main`**.
-  Stack up + healthy: `cora-api`, `cora-worker`, `cora-ui`, `cora-postgres`, MCPs (`mcp-filesystem` real,
-  `mcp-postgres`/`mcp-github` placeholders), `cora-searxng`.
-- `gh` is NOT installed (no `GH_TOKEN`); use plain `git`. `.env` is gitignored (secrets + flags — never
-  commit/echo it); it lives at the repo root `/home/owner/cora-ai-os/.env`.
-- Working tree carries pre-existing handoff-doc items to LEAVE: a staged deletion of
-  `HANDOFF_CALENDAR_INBOX_SESSION.md` + untracked `HANDOFF_CHAT_VLLM_SESSION.md`.
-- **DGX SSH:** the orchestration host reaches the DGX (`spark-a84c`, Tailscale node = 100.114.254.113)
-  over **Tailscale SSH** (`ssh -o IdentitiesOnly=yes -o StrictHostKeyChecking=no fpokrzywa@spark-a84c '<cmd>'`,
-  key `/home/owner/.ssh/id_dgx_spark`). `docker` on the DGX needs no sudo. (Not used this session.)
+- ⚠️ **13 commits sit on branch `feat/cora-ui2-voice-shell` @ `6d56e24` — NOT pushed, NOT on `main`.**
+  `main` @ `7e1cc91` == `origin/main`. **The deployed stack RUNS THE BRANCH** (every item was
+  compose-built + `up -d`). On the operator's **"push"**: FF `main`, push, delete the branch.
+  Commits newest-first: `6d56e24` barge-in follow-up fix · `bbb564c` prefix-cache-stable workspace line ·
+  `ae120f3` latency tranche 1 · `a103ba1` 4B voice rewrite + mailbox detection · `fbcdfba` spoken-prose
+  rewrite · `bf91cc3` handler-reply stream fix (all 3 consumers) · `243f63a` script nit · `76f2a48`
+  brain-swap kit · `8a0b93b` voice idle guard · `1b80349` ui-prefs settings sync · `0ae1f07`/`058c049`
+  HTTPS serving · `5f74c84` cora-ui2 port. Quick check: `git log --oneline -15`, `docker compose ps`.
+- Stack healthy: `cora-api`, `cora-worker`, `cora-ui` (classic, untouched default), **`cora-ui2`** (new),
+  `cora-postgres`, MCPs, `cora-searxng`. `gh` NOT installed; plain `git`. `.env` gitignored (never echo).
+- Pre-existing working-tree items to LEAVE: staged deletion of `HANDOFF_CALENDAR_INBOX_SESSION.md`,
+  untracked `HANDOFF_CHAT_VLLM_SESSION.md`.
+- **DGX SSH works** (Tailscale SSH re-authed this session; check period may lapse again → the operator
+  must approve the printed login.tailscale.com link):
+  `ssh -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -i /home/owner/.ssh/id_dgx_spark fpokrzywa@spark-a84c '<cmd>'`.
+  `docker` no sudo; `sudo -n systemctl` WORKS passwordless. **Remote writes to the DGX + credential
+  installs are permission-gated** — get the operator's explicit go-ahead phrase first (precedent:
+  "deploy the voice swap").
 
-## Currently LIVE config (in `.env`, NOT in git)
-- **All inference on vLLM/gpt-oss-120b** (unchanged): `DGX_CHAT_BACKEND=openai`, `DGX_AGENT_BACKEND=openai`,
-  `DGX_OPENAI_ENDPOINT=http://spark-a84c:8000/v1`, `DGX_OPENAI_MODEL=openai/gpt-oss-120b`. Revert text-gen
-  to the 4B Ollama with `DGX_CHAT_BACKEND=ollama` + `DGX_AGENT_BACKEND=ollama` → `up -d cora-api cora-worker`
-  (env-only; code default `ollama`). ⚠️ The DGX `vllm-oss` container MUST run with
-  `--enable-auto-tool-choice --tool-call-parser openai` or agent tool calls don't parse. See `dgx_inference_backends`.
-- **Agent flags ON:** `AGENT_RUNTIME_ENABLED`, `AGENT_DELEGATION_ENABLED`, `AGENT_WRITE_ENABLED`,
-  `AGENT_INTERRUPT_ENABLED`, `AGENT_EVAL_ENABLED`, `AGENT_EVAL_GATE_ENABLED`, `AGENT_DELEGATION_MAX_PARALLEL=3`.
-- **OFF (the outward kill switch that matters):** `AGENT_EXECUTION_ENABLED` (agent master gate — the agent
-  STAGES + pauses but FIRES nothing while off). `EXTERNAL_EXECUTION_ENABLED` off (email). `calendar_execution_enabled`
-  is ON via DB runtime override + per-provider `calendar_write` on for google + microsoft — so the ONLY thing
-  gating an agent calendar write is `AGENT_EXECUTION_ENABLED`. Email send is hard-disabled regardless.
-- **Opt-in request flags (default OFF — text UI unchanged):** `ChatRequest.stream` (SSE) and
-  `ChatRequest.speakable` (TTS-friendly reply). The voice UI sets these per turn (mic → stream; voice toggle
-  → speakable).
-- **Feature flags (default OFF; compose passthrough wired for cora-api + cora-worker):**
-  `SEMANTIC_ROUTING_ENABLED` (LLM routing fallback) and `PLAN_EXECUTION_ENABLED` (whole-plan run). Flip to
-  `true` in `.env` + `up -d cora-api cora-worker` to enable.
+## The voice stack as deployed (all LIVE right now)
+- **Browser** (`https://cora.tail343b33.ts.net:10000`, or `http://ui2.cora.local.arpa` sans mic) →
+  WebRTC → **DGX `cora-voice.service`** (`~/cora`, Pipecat 1.1.0): Silero VAD (`CORA_VAD_STOP_SECS`,
+  default 0.4) → **local Whisper large-v3-turbo** (~155ms; `CORA_STT_PROVIDER=whisper`, flip-back
+  `=deepgram` one-liner) → `OpenAILLMService` → **cora-api façade** `POST /v1/chat/completions`
+  (`https://cora.tail343b33.ts.net:8443/v1`, 365d JWT as api_key, `X-Cora-Session-Id` per connection +
+  `X-Cora-Speakable` via env-gated `CORA_LLM_SESSION_HEADERS=1`) → Kokoro TTS (af_heart). Transcript
+  cleanup OFF (`CORA_CLEANUP_ENABLED=0`).
+- **Façade** (`app/routers/openai_compat.py`): full pipeline per turn (routing/memory/governance/traces);
+  handler short-circuits delivered as one-shot chunks; list-like voice replies rewritten to spoken prose
+  on the DGX-local 4B (`VOICE_REWRITE_MODEL=cora-qwen3:4b`, `/no_think`, fail-open `to_speakable`).
+- **Voice acts as `freddie@3cpublish.com`** (the memories account) — voice sessions appear in that
+  account's conversation list; one cora-api session per WebRTC connection.
+- **tailscale serve** on this host (`cora`): 443 is BLOCKED by NPM's wildcard bind (don't retry without
+  freeing it); `:10000` → 127.0.0.1:8082 (cora-ui2), `:8443` → 127.0.0.1:8000 (cora-api).
+- **Backout paths** (all env-only, documented in `infra/dgx-voice/README.md`): DGX env backups
+  `~/.config/cora/env.bak-*`, pipeline backups `~/cora/*.bak-pre-cora-api`, restart `cora-voice`.
+- Measured server-side TTFB (post-overhaul): general ~2.0-2.3s, calendar ~1.0-1.2s, briefing ~3.4-3.7s,
+  inbox ~5s (slowest provider bound). Timing harness: scratchpad `time_turns.py` pattern (docker cp +
+  exec in cora-api; self-cleans its conversation).
 
-## What shipped this session — DON'T rebuild (all on `main`)
-Reference, don't re-derive. Each built → compile → `compose build`+`up -d` → in-container `verify_*` (or
-tsc for UI) → committed → pushed.
-1. **Semantic routing fallback** (`f5c9676`) — keyword routing scores 0 + no intent override → one LLM
-   classification (`routing.semantic_route`) picks a specialist. Opt-in `SEMANTIC_ROUTING_ENABLED`, fail-open,
-   never overrides a deterministic match. Embeddings measured + rejected (flat nomic-embed baseline). gpt-oss
-   needs a 256-token budget. `verify_semantic_routing.py`.
-2. **Memory cleanup + spoken disambiguation** (`8c704f0` + live DB fix) — 3 personal facts re-scoped
-   `global → user` under `freddie@3cpublish.com`; 15 test-junk globals deleted. Same-title/different-content
-   recall asks ONE "which?" (`app/memory/disambiguation.py` → `_format_memory_block`; high-precision).
-   `verify_memory_disambiguation.py`.
-3. **Barge-in / generation cancellation** (`47e4481`) — a mid-stream disconnect → `_event_stream` catches
-   `asyncio.CancelledError` → `_finalize_cancelled` (shielded): aborts upstream gen, writes a `cancelled`
-   trace, persists the partial. `verify_chat_cancel.py`.
-4. **Whole-plan sequential execution** (`aaba2a9`) — `POST /plans/{id}/execute` (behind `PLAN_EXECUTION_ENABLED`)
-   enqueues one `execution_plan` job; the worker `execute_plan` runs steps in order through the EXISTING
-   governed `execute_plan_step` (a tool-less template step simulates), `planned → running → completed`,
-   halt-on-failure, idempotent/resumable. Distinct from the model-driven `agent_runtime` (runs a defined,
-   editable plan). `verify_plan_execution.py`.
-5. **Voice-first UI v1** (`0294803`) — talk + hear, with barge-in, on the browser Web Speech API behind a
-   swappable wrapper (`apps/cora-ui/src/voice/speech.ts`). 🎤 mic (tap-to-talk → STT → send), 🔈 voice toggle
-   (spoken replies → `speakable:true` + TTS read-aloud), barge-in (a new turn / mic tap aborts the in-flight
-   stream via `sendChatStream`'s new `AbortSignal` + cancels speech). Controls render only where supported;
-   text UX unchanged when off. tsc-clean; mic/TTS is in-browser (Chromium/Safari).
-6. **Voice UI v2 — streaming TTS + interim transcript** (`d201f55`, 2026-07-01) — `createSpeechStream`
-   chunks SSE deltas at sentence boundaries onto the `speechSynthesis` queue (speech starts at the first
-   complete sentence, not on `done`; `finish(finalText)` flushes the tail + unstreamed suffix, no
-   double-speak on divergence; barge-in cancels the queue silently). `createRecognizer` gained `onInterim`
-   → the status line shows the live transcript while listening. Frontend-only, tsc-clean; chunker logic
-   verified by a 7-case standalone mirror test (node:20-alpine).
+## Currently LIVE config deltas (this session)
+- **cora-api/.env & compose:** unchanged flags from before, plus compose passthrough
+  `VOICE_REWRITE_MODEL` (default `cora-qwen3:4b`); `cora-ui2` service env `CORA_API_URL`
+  (default `https://cora.tail343b33.ts.net:8443`); cora-api CORS now allows `ui2.cora.local.arpa`,
+  `cora.tail343b33.ts.net`(+`:10000`). Embeddings pin `keep_alive=24h`, timeout 8s.
+- **DGX `~/.config/cora/env`** (NOT in git; token inside — never print): `CORA_LLM_*` → façade,
+  `CORA_LLM_SESSION_HEADERS=1`, `CORA_CLEANUP_BASE_URL=http://localhost:11434`,
+  `CORA_CLEANUP_MODEL=cora-qwen3:4b`, `CORA_CLEANUP_ENABLED=0`, `CORA_STT_PROVIDER=whisper`.
+- **vLLM (`vllm-oss` on DGX):** UNCHANGED this session — prefix caching was already on (V1 default);
+  the required `--enable-auto-tool-choice --tool-call-parser openai` flags remain load-bearing.
+- **NPM:** proxy host `ui2.cora.local.arpa` → `cora-ui2:80` (operator-created; an NPM nginx reload was
+  needed once — `docker exec nginx-proxy-manager nginx -s reload` if a new host serves the default page).
 
-## 🛠️ Recommended next (operator-steered)
-The solo-buildable backlog is exhausted (incl. the v2 streaming-TTS/interim polish). The highest-value next steps:
-- **Cloud STT/TTS swap** — the browser Web Speech engines are Chromium/Safari-only and variable quality.
-  Pick a provider (e.g. Deepgram / Whisper for STT, ElevenLabs / Azure for TTS) and swap the wrapper
-  (`apps/cora-ui/src/voice/speech.ts` — already abstracted; only `createRecognizer`/`speak`/`cancelSpeech`/
-  `createSpeechStream` change). NEEDS the operator's provider choice (keys, cost).
-- **Voice UI v2 remainder** — continuous/wake-word listening, a dedicated full-screen voice mode
-  (buildable solo, but operator may prefer the cloud swap first).
-- **Operator-only:** email-send stance for voice (hard-disabled — policy call, don't flip unprompted); n8n
-  deploy (unblocks FORGE-as-executor); real `mcp-postgres`/`mcp-github` (placeholder images).
+## 🛠️ Open work (operator-steered, in rough value order)
+1. **Push decision** — 13 branch commits await "push" (FF main + push + delete branch).
+2. **Inbox drill-down** (designed, offered): "tell me more about the one from Sarah" — stash listed
+   messages as session context (mirror `chat_calendar._stash_list_context`), add follow-up detection,
+   governed single-message/thread read, spoken via the existing rewrite. Read-only, same gates.
+3. **History-order bug (correctness, awaiting greenlight)** — `chat.py` `_load_recent_history` returns
+   the OLDEST 10 messages (`ORDER BY created_at ASC LIMIT`); long chats feed the model their opening
+   turns. Fix = DESC + reverse. Changes behavior on every long session — operator must approve.
+4. **Speech-overlap tranche** (the "in the room" move): start memory recall/routing/prefill on interim
+   transcripts while the user is still speaking; spoken acknowledgments for slow handler turns need a
+   data-channel "turn in flight" signal so auto-close cooperates. Pipecat supports the pattern.
+5. **VAD 0.3** — now just `CORA_VAD_STOP_SECS=0.3` on the DGX + restart; watch for utterance-splitting.
+6. **Whisper quality watch** — if she mishears more than Deepgram did: re-enable cleanup
+   (`CORA_CLEANUP_ENABLED=1`, +~200ms) or flip back (`CORA_STT_PROVIDER=deepgram`).
+7. **NPM-443 cleanup** (port-free `https://cora.tail343b33.ts.net`) — requires editing
+   `cora-stack/docker-compose.yml` (LAN-restrict/remove NPM's 443 bind) — explicit approval required.
+8. Standing operator items: email-send stance (hard-disabled), n8n deploy, real mcp-postgres/github.
 
-## Operator-only loose ends (surface, don't do)
-- n8n `cora-health` webhook still uncreated; optional `DROP TABLE news_sources` (dead since v2.6, destructive).
-- A harmless **duplicate memory** remains after the #7 cleanup: "Family Dog" + "Our family dog" (same content),
-  both under `freddie@3cpublish.com` — deletable later (destructive — confirm).
-- Test conversations + smoke rows persist under `freddie@3cpublish.com` from live verifies (the barge-in +
-  plan-execution verifies self-clean their rows) — harmless; delete from the UI if desired.
+## Do-not-break (adds to the standing invariants — see AIOS §9 + prior prompt for the full list)
+- **Fail-closed flags unchanged**: `AGENT_EXECUTION_ENABLED`/`EXTERNAL_EXECUTION_ENABLED` off; email
+  send hard-disabled; kill switches gate everything outward. Backends env-gated + reversible.
+- **cora-ui (classic) stays intact as the default UI**; ui2 is additive. Which is "default" = NPM
+  forward-target. The ui2 shell files are VENDORED copies — keep all cora-api mapping in `adapter.js`
+  (one edit each in index.html/shell.js are annotated `cora-ui2 addition`).
+- **The façade reuses `chat()` — never fork the pipeline.** Handler short-circuits return plain
+  `ChatResponse` even with `stream:true`; every stream consumer must handle the JSON body (façade,
+  adapter, classic `api.ts` all do — keep it that way).
+- **DGX voice service**: `infra/dgx-voice/` is the source of truth; deploy via `deploy.sh` (backs up +
+  compile-checks + restarts). The voice JWT lives ONLY in the DGX env file — never in git/logs; re-mint
+  via `install-voice-token.sh`. DGX writes need operator authorization (permission-gated).
+- **Prefix-cache hygiene**: keep the prompt prefix byte-stable (system → workspace → …); the workspace
+  counts are bucketed for this reason — don't reintroduce exact/changing values early in the prompt.
+- **`docker exec` heredocs need `-i`**; container `/tmp` is wiped on recreate (re-`docker cp` scripts).
+- Don't recreate the postgres volume; don't edit `cora-stack/docker-compose.yml` unless asked.
 
-## Do-not-break (invariants)
-- **Fail-closed by flag:** every agent/execution capability is gated; the outward kill switches
-  (`AGENT_EXECUTION_ENABLED`, `EXTERNAL_EXECUTION_ENABLED`, `CALENDAR_EXECUTION_ENABLED`) default false;
-  **email send is hard-disabled**. `SEMANTIC_ROUTING_ENABLED` + `PLAN_EXECUTION_ENABLED` are opt-in (default off).
-- **Plan execution reuses governance, adds no outward path** — `execute_plan` loops the EXISTING
-  `execute_plan_step` (check_permission + dispatch_tool); `PLAN_EXECUTION_ENABLED` gates only the
-  auto-sequencing. It is NOT a second agent engine — don't merge it with `agent_runtime`.
-- **Semantic routing is opt-in + fail-open**; only fires when keyword routing scores 0 AND no intent override
-  matched; never overrides a deterministic match — only moves off the Cora persona.
-- **Voice STT/TTS is swappable** — `App`/`ChatPanel` import only from `apps/cora-ui/src/voice/speech.ts`;
-  swap providers THERE, don't scatter Web Speech calls. The backend voice contract is `stream` + `speakable`
-  + clean mid-stream cancellation; keep those stable.
-- **Streaming cancellation:** a mid-stream disconnect is a normal path — `_event_stream` catches
-  `asyncio.CancelledError` and finalizes (shielded). Don't add async cleanup under `GeneratorExit` (illegal).
-- **Backends config-gated + reversible** (code default `ollama`); `DGX_CHAT_BACKEND`/`DGX_AGENT_BACKEND` are
-  INDEPENDENT. New `DGX_*`/`AGENT_*`/feature flags need a compose passthrough (cora-api AND cora-worker).
-- **Agent loop:** hub-and-spoke (only the orchestrator gets `delegate_to`; spokes `allowed_agents`-scoped,
-  depth-1); evaluator tool-less + advisory; the eval gate blocks the DECISION, not the firing. `resolve_interrupt`
-  / `resolve_pending_for_session` fire nothing unless `AGENT_EXECUTION_ENABLED` is on.
-- **Agent prompts are runtime-versioned** (`agent_versions`, DB active version preferred via
-  `resolve_agent_prompt`/`_load_spokes`). Change a LIVE prompt via a new active version — see the idempotent
-  `registry._ensure_prompt_revision` (no-clobber; preserves routing keywords).
-- **Read-only tool args are filtered** to the advertised schema before dispatch (`_dispatch_read_only`).
-- Don't recreate the postgres volume. Don't edit `cora-stack/docker-compose.yml` unless asked. Don't
-  reintroduce `select_subagent` into `forge.py` (routing lives in `app/agents/routing.py`).
-
-## Working rules (saved feedback)
-- **No clarifying/direction-choosing questions** (incl. `AskUserQuestion` option menus) — proceed autonomously
-  from context, report tersely, no pre-action plans / interim narration. The ONLY carve-out is confirming
-  genuinely destructive/irreversible OR outward-facing actions (real calendar/inbox writes, pushing to `main`,
-  destructive DB mutations). ([[feedback_no_questions]], [[feedback_inapp_test_steps]])
-- **Per-item workflow:** build → `python3 -m py_compile` (+ `tsc -b` in the cora-ui Docker build) →
-  `docker compose build <svc> && up -d <svc>` → run the relevant `scripts/verify_*.py` IN-CONTAINER
-  (`docker cp …:/tmp/v.py && docker exec -e PYTHONPATH=/app cora-api python /tmp/v.py`) + a route smoke when it
-  touches a route → commit on a `feat/`/`fix/` branch → report with concrete in-app test steps → on **"push"**,
-  FF `main` + push + delete the branch. Frontend changes are gated by the tsc/vite build (no `verify_*.py`);
-  behavioral voice testing is in-browser (Chromium/Safari, needs a mic).
-- **37 `scripts/verify_*.py`** cover the backend suite. `/chat` behavioral testing needs an operator JWT
-  (browser DevTools → any API call's `Authorization: Bearer …`), OR mint one in-container
-  (`app.auth.create_access_token` for a real user) — `/auth/register` is admin-locked. Note: `docker exec`
-  heredocs to `python -` need `-i` or read empty stdin — use `docker cp` of a file.
-- Keep `HANDOFF_SESSION.md` + `AIOS_CORE_ARCHITECTURE.md` §9 + `VOICE_UI_READINESS.md` + these memories current.
+## Working rules (saved feedback — unchanged)
+- **No clarifying/direction-choosing questions**; proceed autonomously, report tersely, end every
+  delivery with concrete in-app test steps. Confirm only destructive/irreversible/outward actions
+  (DGX writes + credential installs + pushing `main` + NPM/cora-stack edits are in that class).
+- **Per-item workflow:** build → `py_compile`/`node --check` → `compose build && up -d` → in-container
+  `verify_*.py` (39 scripts now: +`verify_ui_prefs`, +`verify_openai_compat`) → commit on the feature
+  branch → report with test steps → on "push", FF `main` + push + delete branch.
+- Voice behavioral testing is operator-only (needs a mic); server-side timing via the `time_turns.py`
+  pattern; DGX voice log: `~/cora/logs/cora-voice.log` (banner lines `[config] …`).
+- Keep `AIOS_CORE_ARCHITECTURE.md` §9, this file, `HANDOFF_SESSION.md`, and the auto-memories current.
 
 ## Suggested skills
-- `/run` — launch/drive the app. `/verify` — confirm a change by real behavior. `/code-review` — review the
-  diff (`/code-review ultra` for a deep cloud pass). `/handoff` — regenerate this doc as work continues.
+- `/verify` — confirm changes by real behavior (route smokes, in-container scripts).
+- `/run` — launch/drive the app when a change needs eyes on it.
+- `/code-review` — review the branch diff before the operator's push (13 commits; `ultra` for depth).
+- `/handoff` — regenerate this document as the work continues.
