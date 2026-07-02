@@ -486,5 +486,86 @@
     else document.addEventListener("DOMContentLoaded", build, { once: true });
   }
 
+  // ---- settings sync -------------------------------------------------------
+  // The shell persists ALL its settings (theme, orb, main settings, voice,
+  // wake word, card positions, panel state) in localStorage — which is
+  // per-origin and gone after a site-data clear. Mirror those keys to
+  // cora-api (PUT /users/me/ui-prefs) whenever the shell writes them, and
+  // seed them back at boot, so settings follow the ACCOUNT across origins,
+  // devices and logouts. Our own cora-ui2-* keys (token/session) never sync.
+
+  const PREFS_PATH = "/users/me/ui-prefs";
+  const syncable = (k) => k.indexOf("cora-") === 0 && k.indexOf("cora-ui2-") !== 0;
+
+  function snapshotPrefs() {
+    const out = {};
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k && syncable(k)) out[k] = localStorage.getItem(k);
+    }
+    return out;
+  }
+
+  // Pushes are suppressed until the boot-time seed finishes, so a fresh
+  // browser's defaults can't overwrite the account's saved settings.
+  let prefsSeeded = false;
+  let pushPending = false;
+  let pushTimer = null;
+  function schedulePrefsPush() {
+    if (!token()) return;
+    if (!prefsSeeded) { pushPending = true; return; }
+    if (pushTimer) clearTimeout(pushTimer);
+    pushTimer = setTimeout(() => {
+      pushTimer = null;
+      api(PREFS_PATH, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prefs: snapshotPrefs() }),
+      }).catch(() => { /* offline — next change retries */ });
+    }, 800);
+  }
+
+  const realSetItem = Storage.prototype.setItem;
+  const realRemoveItem = Storage.prototype.removeItem;
+  Storage.prototype.setItem = function (k, v) {
+    realSetItem.call(this, k, v);
+    if (this === window.localStorage && syncable(String(k))) schedulePrefsPush();
+  };
+  Storage.prototype.removeItem = function (k) {
+    realRemoveItem.call(this, k);
+    if (this === window.localStorage && syncable(String(k))) schedulePrefsPush();
+  };
+
+  async function seedPrefsFromServer() {
+    if (!token()) return;
+    try {
+      const res = await api(PREFS_PATH);
+      if (!res.ok) return;
+      const data = await res.json();
+      const prefs = data && data.prefs;
+      if (!prefs || typeof prefs !== "object") return;
+      let changed = false;
+      for (const k of Object.keys(prefs)) {
+        const v = prefs[k];
+        if (!syncable(k) || typeof v !== "string") continue;
+        if (localStorage.getItem(k) !== v) {
+          realSetItem.call(localStorage, k, v);
+          changed = true;
+        }
+      }
+      // Theme/orb/background were already painted by the head scripts from
+      // the OLD local values — one reload applies the account's settings.
+      // Can't loop: after seeding, local matches server, so the next pass
+      // sees no change.
+      if (changed) window.location.reload();
+    } catch (_) {
+      // API unreachable — keep local-only behavior.
+    } finally {
+      prefsSeeded = true;
+      if (pushPending) { pushPending = false; schedulePrefsPush(); }
+    }
+  }
+  seedPrefsFromServer();
+
   if (!token()) showLogin();
 })();

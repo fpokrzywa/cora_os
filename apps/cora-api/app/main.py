@@ -45,6 +45,7 @@ from app.routers import (
     tool_admin,
     tools,
     traces,
+    ui_prefs,
     workspaces,
 )
 from app.schema import init_schema
@@ -120,6 +121,7 @@ app.include_router(health.worker_router)
 app.include_router(auth.router)
 app.include_router(chat.router, dependencies=_auth_required)
 app.include_router(conversations.router, dependencies=_auth_required)
+app.include_router(ui_prefs.router, dependencies=_auth_required)
 app.include_router(tools.router, dependencies=_auth_required)
 app.include_router(memory.router, dependencies=_auth_required)
 app.include_router(plans.router, dependencies=_auth_required)
