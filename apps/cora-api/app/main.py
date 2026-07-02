@@ -93,6 +93,7 @@ app.add_middleware(
         "http://cora.local.arpa",
         "http://api.cora.local.arpa",
         "http://ui2.cora.local.arpa",
+        "https://cora.tail343b33.ts.net",
         "http://localhost:5173",
         "http://localhost:3000",
     ],

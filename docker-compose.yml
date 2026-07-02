@@ -210,13 +210,18 @@ services:
     container_name: cora-ui2
     restart: unless-stopped
     environment:
-      CORA_API_URL: ${CORA_API_URL:-http://api.cora.local.arpa}
+      # HTTPS API base so the mic/wake-word (secure-context) page can call
+      # the API without mixed content; reachable from tailnet devices.
+      CORA_API_URL: ${CORA_UI2_API_URL:-https://cora.tail343b33.ts.net:8443}
     networks:
       cora-proxy:
         aliases:
           - cora-ui2
     expose:
       - "80"
+    ports:
+      # Loopback-only: the host-side target for `tailscale serve` (HTTPS UI).
+      - "127.0.0.1:8082:80"
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/ >/dev/null 2>&1 || exit 1"]
       interval: 30s
