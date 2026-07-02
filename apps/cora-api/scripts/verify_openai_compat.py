@@ -149,6 +149,7 @@ async def main() -> None:
             assert deltas[0].get("role") == "assistant" and text.strip(), "E: empty"
             assert body[-1]["choices"][0].get("finish_reason") == "stop"
             print(f"E) deterministic-handler one-shot OK — {len(text)} chars")
+            print(f"   spoken text: {text[:280]}")
     finally:
         for sid in sessions_to_clean:
             await db.execute("DELETE FROM messages WHERE session_id = $1", sid)

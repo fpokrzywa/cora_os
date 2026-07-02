@@ -27,6 +27,7 @@ one chat.completion object.
 
 import json
 import logging
+import re
 import time
 import uuid
 from typing import Annotated, Any, AsyncIterator, Optional
@@ -35,6 +36,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+from app import llm
 from app.auth import CurrentUser, get_current_user
 from app.routers.chat import ChatRequest, ChatResponse, chat
 from app.speakable import to_speakable
@@ -59,6 +61,59 @@ class ChatCompletionsIn(BaseModel):
     # Accepted-and-ignored OpenAI fields (tools, temperature, etc.) are
     # tolerated via extra="allow" so strict clients don't 422.
     model_config = {"extra": "allow"}
+
+
+# Deterministic handlers format for the chat bubble: numbered lists,
+# [provider] tags, email addresses, ISO-ish timestamps. Fine to read, awful
+# to hear. For the voice path, list-like/long replies get ONE fast LLM
+# rewrite into natural spoken prose; short replies ("Done.", confirmation
+# questions) pass straight through so they stay snappy.
+_VOICE_REWRITE_SYSTEM = (
+    "You rewrite an assistant's reply so it can be SPOKEN aloud naturally by "
+    "text-to-speech. Rules: plain conversational English, no lists, no "
+    "markdown, no brackets. Never read email addresses, URLs, IDs, or raw "
+    "timestamps verbatim — use people's names and natural dates/times "
+    "(\"this afternoon\", \"July 3rd at 2\"). For lists, lead with the count, "
+    "then mention the most notable two or three items conversationally. "
+    "Preserve the meaning of any question or requested confirmation exactly. "
+    "Keep it under 80 words. Reply with ONLY the rewritten text."
+)
+
+
+def _needs_voice_rewrite(text: str) -> bool:
+    if re.search(r"^\s*\d+[.)]\s", text, re.M):  # numbered list
+        return True
+    if "@" in text or "](" in text or "[" in text:
+        return True
+    return len(text) > 280
+
+
+async def _voice_rewrite(text: str) -> str:
+    """Best-effort spoken-prose rewrite; falls back to to_speakable."""
+    try:
+        rewritten = await llm.generate_text(
+            text[:4000],
+            system=_VOICE_REWRITE_SYSTEM,
+            # gpt-oss spends heavily on hidden reasoning before the final
+            # channel — a small cap yields an EMPTY answer (same lesson as
+            # semantic routing). Budget generously; output is ~80 words.
+            max_tokens=1200,
+            temperature=0.3,
+            timeout=25.0,
+        )
+        rewritten = (rewritten or "").strip()
+        if rewritten:
+            logger.info(
+                "voice rewrite: %s -> %s chars", len(text), len(rewritten)
+            )
+            return rewritten
+        logger.warning(
+            "voice rewrite returned empty (reasoning ate the budget?); "
+            "falling back to to_speakable"
+        )
+    except Exception:
+        logger.exception("voice rewrite failed; falling back to to_speakable")
+    return to_speakable(text)
 
 
 def _last_user_message(messages: list[dict[str, Any]]) -> str:
@@ -167,7 +222,12 @@ async def chat_completions(
     # the voice pipeline — never see a non-streamed body.
     if isinstance(inner, ChatResponse):
         _remember(inner.session_id)
-        text = to_speakable(inner.response) if speakable else inner.response
+        if speakable and _needs_voice_rewrite(inner.response):
+            text = await _voice_rewrite(inner.response)
+        elif speakable:
+            text = to_speakable(inner.response)
+        else:
+            text = inner.response
         if payload.stream:
             async def one_shot() -> AsyncIterator[bytes]:
                 yield _chunk(model, chunk_id, {"role": "assistant"})
