@@ -25,6 +25,7 @@ falls back to a review-only internal CHRONOS proposal. The token broker
 traced, or returned. All access is audited (`calendar_access_events`) + traced.
 """
 
+import asyncio
 import json
 import logging
 import re
@@ -902,9 +903,13 @@ async def _handle_read(providers, message, *, session_uuid, user_id, workspace_u
             session_uuid=session_uuid, user_id=user_id, workspace_uuid=workspace_uuid)
     time_min, time_max, label = resolve_read_window(message)
     merged, oks, skipped = [], [], []
-    for p in providers:
-        evs, info = await _read_one_calendar(p, time_min, time_max, session_uuid=session_uuid,
-                                             user_id=user_id, workspace_uuid=workspace_uuid)
+    # Concurrent per-provider reads (distinct connector rows; order kept via zip).
+    results = await asyncio.gather(*[
+        _read_one_calendar(p, time_min, time_max, session_uuid=session_uuid,
+                           user_id=user_id, workspace_uuid=workspace_uuid)
+        for p in providers
+    ])
+    for p, (evs, info) in zip(providers, results):
         if evs is not None:
             merged.extend(evs)
             oks.append(p)
@@ -975,9 +980,14 @@ async def gather_events_window(*, user_id, workspace_uuid, session_uuid, time_mi
     {"events", "providers_ok", "skipped"}."""
     providers = await _resolve_read_providers("", user_id)
     merged, oks, skipped = [], [], []
-    for p in providers:
-        evs, info = await _read_one_calendar(p, time_min, time_max, session_uuid=session_uuid,
-                                             user_id=user_id, workspace_uuid=workspace_uuid)
+    # Distinct connector rows per provider — read them concurrently; zip
+    # keeps provider order so oks/skipped ordering is unchanged.
+    results = await asyncio.gather(*[
+        _read_one_calendar(p, time_min, time_max, session_uuid=session_uuid,
+                           user_id=user_id, workspace_uuid=workspace_uuid)
+        for p in providers
+    ])
+    for p, (evs, info) in zip(providers, results):
         if evs is not None:
             merged.extend(evs)
             oks.append(p)

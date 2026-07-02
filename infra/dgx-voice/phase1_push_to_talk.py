@@ -269,11 +269,8 @@ CORA_ELEVENLABS_SAMPLE_RATE = _env_int("ELEVENLABS_SAMPLE_RATE", 24000)
 CORA_CLEANUP_ENABLED = _env_bool("CORA_CLEANUP_ENABLED", True)
 CORA_CLEANUP_MODEL   = _env("CORA_CLEANUP_MODEL", CORA_LLM_MODEL)
 
-# ---- cora_v2 screen-context endpoint --------------------------------------
-# The Windows machine running the cora_v2 web app, reachable on the tailnet.
-CORA_V2_URL = _env(
-    "CORA_V2_URL", "http://3cprimary.tail343b33.ts.net:8000"
-).rstrip("/")
+# (cora_v2 screen-context endpoint removed — the app is retired and its
+# fetches cost every session ~5-8s of timeout before the pipeline started.)
 
 # Log resolved config at module load so it shows up in cora-voice.log
 # right next to [startup] banners. Easy to confirm an env override
@@ -298,7 +295,6 @@ logger.info(
 logger.info(
     f"[config] cleanup enabled={CORA_CLEANUP_ENABLED} model={CORA_CLEANUP_MODEL}"
 )
-logger.info(f"[config] cora_v2_url={CORA_V2_URL}")
 
 
 # TTS sanitiser. Even with the system prompt above, Qwen3 sometimes
@@ -666,75 +662,11 @@ class CoraKokoroTTS(TTSService):
         TRACE.flush()
 
 
-async def fetch_voice_config() -> dict[str, str]:
-    """Fetch the active cora_voice agent_configs row + rendered
-    agent_prompt_examples block from cora_v2. Lets the prompt be
-    edited via the web UI / SQL without redeploying voice.
-
-    Returns {'system_prompt': str, 'examples_block': str}. Either may
-    be empty on failure or if no DB row exists; caller treats empty
-    `system_prompt` as "fall back to the hard-coded SYSTEM_PROMPT."
-    """
-    url = f"{CORA_V2_URL}/api/agents/voice-config"
-    try:
-        timeout = aiohttp.ClientTimeout(total=5.0)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(url) as resp:
-                if resp.status != 200:
-                    logger.warning(f"[voice-cfg] {url} → HTTP {resp.status}")
-                    return {"system_prompt": "", "examples_block": ""}
-                payload = await resp.json()
-                sp = (payload.get("system_prompt") or "").strip()
-                ex = (payload.get("examples_block") or "").strip()
-                logger.info(
-                    f"[voice-cfg] fetched system_prompt={len(sp)} chars, "
-                    f"examples_block={len(ex)} chars, source={payload.get('source')}"
-                )
-                return {"system_prompt": sp, "examples_block": ex}
-    except Exception as e:
-        logger.warning(
-            f"[voice-cfg] fetch failed for {url}: {type(e).__name__}: {e or '(no detail)'}"
-        )
-        return {"system_prompt": "", "examples_block": ""}
-
-
-async def fetch_screen_context() -> str:
-    """Pull the cards + activity + tasks summary from the cora_v2 web
-    app over the tailnet. Same endpoint and same content the chat path
-    uses — keeping voice and text aware of the same on-screen state.
-
-    On any failure (cora_v2 down, tailnet glitch, timeout) we return an
-    empty string and the bot just runs without screen awareness rather
-    than refusing to start. Fetched once per WebRTC connection; if the
-    user changes the screen mid-session the new state isn't picked up
-    until they reconnect.
-    """
-    # data_only=true: skip the persona block (we have our own,
-    # tailored for voice). We just want the cards/activity/tasks data.
-    url = f"{CORA_V2_URL}/api/screen-context?data_only=true"
-    # 5 s budget — tailnet roundtrip + cora_v2 first-byte (uvicorn cold
-    # path through the chat infra) can hit ~1-2 s. Anything slower than
-    # 5 s probably means cora_v2 isn't actually listening, and we'd
-    # rather degrade to no-context than hang the WebRTC handshake.
-    try:
-        timeout = aiohttp.ClientTimeout(total=5.0)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(url) as resp:
-                if resp.status != 200:
-                    logger.warning(f"[ctx] {url} → HTTP {resp.status}")
-                    return ""
-                payload = await resp.json()
-                snap = (payload.get("snapshot") or "").strip()
-                if snap:
-                    logger.info(f"[ctx] fetched {len(snap)} chars of screen context")
-                else:
-                    logger.warning(f"[ctx] {url} → empty snapshot")
-                return snap
-    except Exception as e:
-        logger.warning(
-            f"[ctx] fetch failed for {url}: {type(e).__name__}: {e or '(no detail)'}"
-        )
-        return ""
+# fetch_voice_config / fetch_screen_context removed (cora-ai-os brain swap):
+# both fetched from the RETIRED cora_v2 web app and blocked every WebRTC
+# session ~5-8s timing out before the pipeline could start — and the cora-api
+# facade ignores the locally-built system prompt anyway. run_bot now uses
+# instant empty fallbacks (hard-coded SYSTEM_PROMPT, no screen context).
 
 
 def _build_stt():
@@ -1310,20 +1242,11 @@ async def run_bot(
     # that later) the user's task list — same content the chat side
     # already injects as a developer message.
     #
-    # We combine the voice-tone instructions and the screen context
-    # into a SINGLE system message rather than two. Qwen3 4B
-    # (smaller models in general) tends to weight only the first
-    # system message; concatenating ensures the screen state is
-    # actually consumed instead of silently dropped.
-    # Two parallel HTTP fetches at session start: the screen snapshot
-    # AND the live cora_voice prompt config. The DB-driven prompt
-    # (migrations 022/023) lets Freddie edit the system prompt and
-    # add few-shot examples without redeploying voice; if it's empty
-    # we fall back to the hard-coded SYSTEM_PROMPT.
-    screen_ctx, voice_cfg = await asyncio.gather(
-        fetch_screen_context(),
-        fetch_voice_config(),
-    )
+    # Screen-context / DB-prompt fetches removed (retired cora_v2 app;
+    # the cora-api facade ignores this prompt anyway) — instant fallbacks
+    # instead of ~5-8s of guaranteed timeout per session.
+    screen_ctx = ""
+    voice_cfg = {"system_prompt": "", "examples_block": ""}
     base_prompt = voice_cfg["system_prompt"] or SYSTEM_PROMPT
     examples_block = voice_cfg["examples_block"]
     logger.info(
@@ -1418,10 +1341,17 @@ async def run_bot(
     # sure, THEN runs STT). Tightened to 0.4s — snappier turnaround at
     # the cost of cutting off long mid-sentence pauses. start_secs is
     # the onset threshold; default 0.2s is fine.
+    # CORA_VAD_STOP_SECS makes the tail env-tunable (0.3 shaves 100ms/turn
+    # but splits more mid-sentence pauses; don't go below 0.3 with plain
+    # Silero — sub-0.3 needs semantic turn detection).
+    try:
+        _stop_secs = float(_env("CORA_VAD_STOP_SECS", "0.4"))
+    except ValueError:
+        _stop_secs = 0.4
     _vad_params = VADParams(
         confidence=0.7,
         start_secs=0.2,
-        stop_secs=0.4,
+        stop_secs=_stop_secs,
         min_volume=0.6,
     )
     user_agg, assistant_agg = LLMContextAggregatorPair(

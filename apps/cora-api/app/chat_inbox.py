@@ -15,6 +15,7 @@ performed; "draft a reply" creates an INTERNAL SIGNAL draft only, linked to the
 source email. Inbox access is audited (inbox_access_events) + traced.
 """
 
+import asyncio
 import logging
 import re
 import uuid
@@ -414,9 +415,13 @@ async def _handle_inbox_multi(kind, query, providers, *, unread=False, session_u
     await _trace(session_uuid, user_id, workspace_uuid, trace_type=TRACE_LISTED, status="ok",
                  result={"providers": providers, "kind": kind, "query": query, "unread": unread})
     merged, oks, skipped = [], [], []
-    for p in providers:
-        msgs, info = await _read_one_inbox(p, kind, query, unread=unread, session_uuid=session_uuid,
-                                           user_id=user_id, workspace_uuid=workspace_uuid)
+    # Concurrent per-mailbox reads (distinct connector rows; order kept via zip).
+    results = await asyncio.gather(*[
+        _read_one_inbox(p, kind, query, unread=unread, session_uuid=session_uuid,
+                        user_id=user_id, workspace_uuid=workspace_uuid)
+        for p in providers
+    ])
+    for p, (msgs, info) in zip(providers, results):
         if msgs is not None:
             merged.extend(msgs)
             oks.append(p)
@@ -442,9 +447,13 @@ async def gather_inbox_highlights(*, user_id, workspace_uuid, session_uuid, limi
     {"messages", "providers_ok", "skipped"}."""
     providers = await _resolve_read_providers("", user_id)
     merged, oks, skipped = [], [], []
-    for p in providers:
-        msgs, info = await _read_one_inbox(p, "list", None, session_uuid=session_uuid,
-                                           user_id=user_id, workspace_uuid=workspace_uuid)
+    # Distinct connector rows per mailbox — read them concurrently (zip keeps order).
+    results = await asyncio.gather(*[
+        _read_one_inbox(p, "list", None, session_uuid=session_uuid,
+                        user_id=user_id, workspace_uuid=workspace_uuid)
+        for p in providers
+    ])
+    for p, (msgs, info) in zip(providers, results):
         if msgs is not None:
             merged.extend(msgs)
             oks.append(p)

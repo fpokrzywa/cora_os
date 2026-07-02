@@ -68,6 +68,9 @@ class CoraDeepgramSTT(SegmentedSTTService):
         self._api_key = api_key
         self._model = model or DEEPGRAM_MODEL
         self._language = language or DEEPGRAM_LANGUAGE
+        # Reused across utterances — a fresh ClientSession per call paid a
+        # full TCP+TLS handshake to api.deepgram.com every turn (~100-300ms).
+        self._session: aiohttp.ClientSession | None = None
 
     async def run_stt(self, audio: bytes) -> AsyncGenerator[Frame | None, None]:
         t0 = time.monotonic()
@@ -85,25 +88,27 @@ class CoraDeepgramSTT(SegmentedSTTService):
             # to declare it, but being explicit is friendlier to debug.
             "Content-Type": "audio/wav",
         }
-        timeout = aiohttp.ClientTimeout(total=DEEPGRAM_TIMEOUT_S)
         text = ""
         try:
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(
-                    DEEPGRAM_URL,
-                    params=params,
-                    headers=headers,
-                    data=audio,
-                ) as resp:
-                    if resp.status != 200:
-                        body = await resp.text()
-                        logger.warning(
-                            f"[stt-deepgram] HTTP {resp.status}: "
-                            f"{body[:200]}"
-                        )
-                        return
-                    payload = await resp.json()
-                    logger.info(f"[stt-deepgram] raw response: {payload}")
+            if self._session is None or self._session.closed:
+                self._session = aiohttp.ClientSession(
+                    timeout=aiohttp.ClientTimeout(total=DEEPGRAM_TIMEOUT_S)
+                )
+            async with self._session.post(
+                DEEPGRAM_URL,
+                params=params,
+                headers=headers,
+                data=audio,
+            ) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    logger.warning(
+                        f"[stt-deepgram] HTTP {resp.status}: "
+                        f"{body[:200]}"
+                    )
+                    return
+                payload = await resp.json()
+                logger.info(f"[stt-deepgram] raw response: {payload}")
         except asyncio.TimeoutError:
             logger.warning(
                 f"[stt-deepgram] timeout after {DEEPGRAM_TIMEOUT_S}s"

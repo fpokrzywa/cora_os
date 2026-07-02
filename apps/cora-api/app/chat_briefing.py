@@ -14,6 +14,7 @@ already-ingested news; ask PULSE separately for an analytical summary). Generati
 is audited via a runtime trace (counts only — no message/event content).
 """
 
+import asyncio
 import logging
 import uuid
 from typing import Optional
@@ -119,13 +120,18 @@ async def handle_briefing_command(
 ) -> tuple[bool, Optional[str]]:
     """Compose the read-only daily digest. Each section fails soft independently;
     the briefing always renders. Returns (True, text)."""
-    schedule = await chat_calendar.gather_day_events(
-        user_id=user_id, workspace_uuid=workspace_uuid, session_uuid=session_uuid)
-    inbox = await chat_inbox.gather_inbox_highlights(
-        user_id=user_id, workspace_uuid=workspace_uuid, session_uuid=session_uuid)
-    news = await news_briefing.gather_briefing(
-        workspace_id=workspace_uuid, since_hours=NEWS_SINCE_HOURS,
-        max_articles=NEWS_MAX_ARTICLES, source_name=None)
+    # The three sections are independent reads (each fails soft internally) —
+    # fetch them concurrently so inbox+news hide behind the calendar read
+    # instead of stacking (~3-4s off a two-provider briefing).
+    schedule, inbox, news = await asyncio.gather(
+        chat_calendar.gather_day_events(
+            user_id=user_id, workspace_uuid=workspace_uuid, session_uuid=session_uuid),
+        chat_inbox.gather_inbox_highlights(
+            user_id=user_id, workspace_uuid=workspace_uuid, session_uuid=session_uuid),
+        news_briefing.gather_briefing(
+            workspace_id=workspace_uuid, since_hours=NEWS_SINCE_HOURS,
+            max_articles=NEWS_MAX_ARTICLES, source_name=None),
+    )
 
     lines = ["# ☀️ Your Daily Briefing", ""]
     lines += _render_schedule(schedule)

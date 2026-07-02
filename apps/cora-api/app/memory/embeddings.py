@@ -23,7 +23,9 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
-EMBEDDING_TIMEOUT_SECONDS = 30.0
+# Tight timeout: keyword recall is the built-in fallback, so a hung Ollama
+# must not stall the chat turn (was 30s — a voice turn would die first).
+EMBEDDING_TIMEOUT_SECONDS = 8.0
 # Cap the text sent to the embedding model. nomic-embed-text (and similar)
 # 500 / truncate when the input exceeds their context window; long URL/PDF
 # ingests blow past it. ~8000 chars (~2k tokens) embeds the document head,
@@ -55,7 +57,10 @@ async def generate_embedding(text: str) -> Optional[list[float]]:
         settings.embedding_endpoint or settings.dgx_model_endpoint
     ).rstrip("/")
     model = settings.embedding_model_name
-    payload = {"model": model, "prompt": text}
+    # keep_alive pins the embedding model in Ollama's memory — without it the
+    # model unloads between bursts and every "cold" chat turn pays a
+    # ~1.2-1.4s reload before recall can even start (measured; warm is ~40ms).
+    payload = {"model": model, "prompt": text, "keep_alive": "24h"}
     started = time.perf_counter()
     try:
         async with httpx.AsyncClient(timeout=EMBEDDING_TIMEOUT_SECONDS) as client:
