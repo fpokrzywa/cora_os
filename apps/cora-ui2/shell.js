@@ -4298,6 +4298,31 @@ if (settingsBtn) {
   let autoCloseTimer = null;
   let hasSpokenOnce  = false;
 
+  // cora-ui2 addition: the auto-close above only arms AFTER Cora's first
+  // reply — if she never says anything (pipeline down, or the user goes
+  // quiet), the session listened forever. This guard closes a session
+  // that has produced no reply audio within IDLE_GUARD_MS of (re)arming.
+  const IDLE_GUARD_MS = 30000;
+  let idleGuardTimer = null;
+
+  function clearIdleGuard() {
+    if (idleGuardTimer) {
+      clearTimeout(idleGuardTimer);
+      idleGuardTimer = null;
+    }
+  }
+
+  function armIdleGuard() {
+    clearIdleGuard();
+    idleGuardTimer = setTimeout(() => {
+      idleGuardTimer = null;
+      if (typeof setListening === 'function' && listening && !hasSpokenOnce) {
+        console.log(`[voice] idle guard: no reply audio within ${IDLE_GUARD_MS}ms — closing`);
+        setListening(false);
+      }
+    }, IDLE_GUARD_MS);
+  }
+
   function getAutoCloseMs() {
     try {
       const raw = localStorage.getItem('cora-voice-auto-close-ms');
@@ -4369,7 +4394,7 @@ if (settingsBtn) {
       const SPEAK_THRESH = 0.04;
       if (level > SPEAK_THRESH) {
         lastSpeakAt = now;
-        if (!hasSpokenOnce) hasSpokenOnce = true;
+        if (!hasSpokenOnce) { hasSpokenOnce = true; clearIdleGuard(); }
         document.documentElement.dataset.voiceState = 'speaking';
         // Cora is talking — cancel any pending auto-close.
         clearAutoClose();
@@ -4386,9 +4411,11 @@ if (settingsBtn) {
       levelRafId = requestAnimationFrame(frame);
     }
     levelRafId = requestAnimationFrame(frame);
+    armIdleGuard();
   }
 
   function stopLevelLoop() {
+    clearIdleGuard();
     if (levelRafId) cancelAnimationFrame(levelRafId);
     levelRafId = 0;
     if (audioCtx) {
@@ -4602,6 +4629,7 @@ if (settingsBtn) {
     try { audio.pause(); } catch (_) {}
     setMicEnabled(false);
     clearAutoClose();
+    clearIdleGuard();
     hasSpokenOnce = false;
     document.documentElement.dataset.voiceState = 'idle';
   }
@@ -4609,6 +4637,7 @@ if (settingsBtn) {
   function exitIdle() {
     setMicEnabled(true);
     hasSpokenOnce = false;
+    armIdleGuard();
     document.documentElement.dataset.voiceState = 'listening';
     // Resume playback on the inbound audio element — enterIdle paused
     // it to cut off any in-flight TTS, so we need to un-pause for the
