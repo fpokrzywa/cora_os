@@ -293,6 +293,18 @@ export async function sendChatStream(
     throw new Error(`${res.status} ${detail}`);
   }
 
+  // Deterministic handlers (calendar, inbox, briefing, memory commands)
+  // short-circuit the pipeline and return a plain ChatResponse JSON body
+  // even when stream:true — deliver it through onDone so the bubble still
+  // renders (and voice mode still speaks it).
+  const contentType = res.headers.get("content-type") ?? "";
+  if (contentType.includes("application/json")) {
+    const data = (await res.json()) as ChatResponse;
+    handlers.onMeta?.(data.session_id, data.selected_agent);
+    handlers.onDone(data);
+    return;
+  }
+
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buf = "";

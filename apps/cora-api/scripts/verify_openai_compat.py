@@ -135,6 +135,20 @@ async def main() -> None:
             r = await c.post(PATH, json=_payload("hi"))
             assert r.status_code in (401, 403), f"anon: {r.status_code}"
             print("D) auth gate OK")
+
+            # E) deterministic short-circuit (briefing handler returns a plain
+            # ChatResponse even with stream=true) → must still arrive as
+            # OpenAI chunks. This was the live voice failure mode.
+            chunks = await _stream_chunks(
+                c, _payload("brief me on my day"), headers
+            )
+            assert chunks and chunks[-1].get("done_marker"), "E: missing [DONE]"
+            body = [ch for ch in chunks if not ch.get("done_marker")]
+            deltas = [ch["choices"][0]["delta"] for ch in body]
+            text = "".join(d.get("content") or "" for d in deltas)
+            assert deltas[0].get("role") == "assistant" and text.strip(), "E: empty"
+            assert body[-1]["choices"][0].get("finish_reason") == "stop"
+            print(f"E) deterministic-handler one-shot OK — {len(text)} chars")
     finally:
         for sid in sessions_to_clean:
             await db.execute("DELETE FROM messages WHERE session_id = $1", sid)

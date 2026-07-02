@@ -228,6 +228,24 @@
     });
     if (!res.ok || !res.body) return res;
 
+    // Deterministic handlers (calendar, inbox, briefing, memory commands)
+    // short-circuit the pipeline and return plain JSON even when
+    // stream:true — synthesize a one-shot stream so the shell's SSE
+    // parser still renders the reply.
+    const ct = (res.headers.get("Content-Type") || "").toLowerCase();
+    if (ct.indexOf("application/json") !== -1) {
+      const data = await res.json();
+      if (data.session_id) setChatSession(data.session_id);
+      const text = String(data.response || "");
+      const body =
+        "data: " + JSON.stringify({ choices: [{ index: 0, delta: { content: text } }] }) +
+        "\n\ndata: [DONE]\n\n";
+      return new Response(body, {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+      });
+    }
+
     const enc = new TextEncoder();
     const chunk = (text) =>
       enc.encode("data: " + JSON.stringify({ choices: [{ index: 0, delta: { content: text } }] }) + "\n\n");

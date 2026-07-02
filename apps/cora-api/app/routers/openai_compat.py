@@ -36,7 +36,8 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from app.auth import CurrentUser, get_current_user
-from app.routers.chat import ChatRequest, chat
+from app.routers.chat import ChatRequest, ChatResponse, chat
+from app.speakable import to_speakable
 
 logger = logging.getLogger(__name__)
 
@@ -153,15 +154,48 @@ async def chat_completions(
         ),
         current,
     )
-    if not isinstance(inner, StreamingResponse):  # defensive; stream=True always streams
-        raise HTTPException(status_code=500, detail="chat pipeline did not stream")
-
     chunk_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     model = payload.model or "cora"
 
     def _remember(sid: Optional[str]) -> None:
         if sid:
             _SESSIONS[key] = [sid, time.time()]
+
+    # Deterministic handlers (calendar, inbox, briefing, memory commands, …)
+    # short-circuit the pipeline and return a plain ChatResponse even when
+    # stream=true. Emit it as a one-shot completion so OpenAI clients — and
+    # the voice pipeline — never see a non-streamed body.
+    if isinstance(inner, ChatResponse):
+        _remember(inner.session_id)
+        text = to_speakable(inner.response) if speakable else inner.response
+        if payload.stream:
+            async def one_shot() -> AsyncIterator[bytes]:
+                yield _chunk(model, chunk_id, {"role": "assistant"})
+                if text:
+                    yield _chunk(model, chunk_id, {"content": text})
+                yield _chunk(model, chunk_id, {}, finish="stop")
+                yield b"data: [DONE]\n\n"
+
+            return StreamingResponse(
+                one_shot(),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            )
+        return {
+            "id": chunk_id,
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": text},
+                "finish_reason": "stop",
+            }],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        }
+
+    if not isinstance(inner, StreamingResponse):  # defensive
+        raise HTTPException(status_code=500, detail="chat pipeline did not stream")
 
     if payload.stream:
         async def translate() -> AsyncIterator[bytes]:
