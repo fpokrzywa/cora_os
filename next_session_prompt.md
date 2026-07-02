@@ -1,21 +1,23 @@
 # Next Session — First Message
 
-Continuing the **Cora AI OS** build. The pre-UI capability phase is **complete** and the **voice-first UI
-v1 has shipped** — talk to Cora and hear her answer, with barge-in (browser Web Speech API). This session
-landed 5 capabilities: semantic routing fallback, memory cleanup + spoken disambiguation, barge-in
-cancellation, whole-plan execution, and the voice UI v1. Everything is on `main`. Deeper detail lives in
-code docstrings, the commits, `AIOS_CORE_ARCHITECTURE.md` §9 (entries "Whole-plan execution + voice-first
-UI v1" + "Voice-readiness close-out" + "Voice-first UI readiness"), `HANDOFF_SESSION.md`,
-`VOICE_UI_READINESS.md`, and the auto-memories `agent_runtime_build` + `dgx_inference_backends` +
-`project_voice_ui_readiness` (do NOT re-summarize or rebuild shipped work).
+Continuing the **Cora AI OS** build. The pre-UI capability phase is **complete**, the **voice-first UI
+v1 has shipped** — talk to Cora and hear her answer, with barge-in (browser Web Speech API) — and the
+**voice v2 polish has shipped too** (2026-07-01, `d201f55`): sentence-chunked TTS that speaks AS the
+reply streams (`createSpeechStream` in `apps/cora-ui/src/voice/speech.ts`) + a live interim transcript
+while listening. Earlier capabilities on `main`: semantic routing fallback, memory cleanup + spoken
+disambiguation, barge-in cancellation, whole-plan execution, and the voice UI v1. Deeper detail lives in
+code docstrings, the commits, `AIOS_CORE_ARCHITECTURE.md` §9 (entries "Voice UI v2" + "Whole-plan
+execution + voice-first UI v1" + "Voice-readiness close-out" + "Voice-first UI readiness"),
+`HANDOFF_SESSION.md`, `VOICE_UI_READINESS.md`, and the auto-memories `agent_runtime_build` +
+`dgx_inference_backends` + `project_voice_ui_readiness` (do NOT re-summarize or rebuild shipped work).
 
 ## Git / deploy state (verify first)
-- **Everything is on `main` — local `main` == `origin/main`.** This session's HEAD is **`0294803`** (voice
-  UI v1); a docs-refresh commit sits one ahead (this doc). This session's commits, newest first: `0294803`
-  voice UI v1 · `aaba2a9` whole-plan execution · `a5cefb6` docs · `47e4481` barge-in cancellation · `8c704f0`
-  memory disambiguation · `f5c9676` semantic routing. Prior session (also on main): `aebc510` … `a2721d8`
-  (the 6 voice-readiness capabilities). No feature branches remain. Quick check: `git log --oneline -12`,
-  `docker compose ps`.
+- **Everything is on `main` — local `main` == `origin/main`.** HEAD is **`d201f55`** (voice UI v2 —
+  streaming TTS + interim transcript, 2026-07-01; a docs-refresh commit may sit one ahead). Before it,
+  newest first: `5b26cb3` docs · `0294803` voice UI v1 · `aaba2a9` whole-plan execution · `a5cefb6` docs ·
+  `47e4481` barge-in cancellation · `8c704f0` memory disambiguation · `f5c9676` semantic routing. Prior
+  session (also on main): `aebc510` … `a2721d8` (the 6 voice-readiness capabilities). No feature branches
+  remain. Quick check: `git log --oneline -12`, `docker compose ps`.
 - **The deployed stack runs this code** (each item was `docker compose build` + `up -d`), so **live == `main`**.
   Stack up + healthy: `cora-api`, `cora-worker`, `cora-ui`, `cora-postgres`, MCPs (`mcp-filesystem` real,
   `mcp-postgres`/`mcp-github` placeholders), `cora-searxng`.
@@ -70,16 +72,21 @@ tsc for UI) → committed → pushed.
    (spoken replies → `speakable:true` + TTS read-aloud), barge-in (a new turn / mic tap aborts the in-flight
    stream via `sendChatStream`'s new `AbortSignal` + cancels speech). Controls render only where supported;
    text UX unchanged when off. tsc-clean; mic/TTS is in-browser (Chromium/Safari).
+6. **Voice UI v2 — streaming TTS + interim transcript** (`d201f55`, 2026-07-01) — `createSpeechStream`
+   chunks SSE deltas at sentence boundaries onto the `speechSynthesis` queue (speech starts at the first
+   complete sentence, not on `done`; `finish(finalText)` flushes the tail + unstreamed suffix, no
+   double-speak on divergence; barge-in cancels the queue silently). `createRecognizer` gained `onInterim`
+   → the status line shows the live transcript while listening. Frontend-only, tsc-clean; chunker logic
+   verified by a 7-case standalone mirror test (node:20-alpine).
 
 ## 🛠️ Recommended next (operator-steered)
-The solo-buildable backlog is exhausted; the voice UI exists. The highest-value next steps:
+The solo-buildable backlog is exhausted (incl. the v2 streaming-TTS/interim polish). The highest-value next steps:
 - **Cloud STT/TTS swap** — the browser Web Speech engines are Chromium/Safari-only and variable quality.
   Pick a provider (e.g. Deepgram / Whisper for STT, ElevenLabs / Azure for TTS) and swap the wrapper
-  (`apps/cora-ui/src/voice/speech.ts` — already abstracted; only `createRecognizer`/`speak`/`cancelSpeech`
-  change). NEEDS the operator's provider choice (keys, cost).
-- **Voice UI v2 polish (buildable solo)** — sentence-chunked TTS that speaks AS the reply streams (not on
-  `done`, the current v1 behavior), continuous/wake-word listening, a dedicated full-screen voice mode,
-  interim-transcript display while listening.
+  (`apps/cora-ui/src/voice/speech.ts` — already abstracted; only `createRecognizer`/`speak`/`cancelSpeech`/
+  `createSpeechStream` change). NEEDS the operator's provider choice (keys, cost).
+- **Voice UI v2 remainder** — continuous/wake-word listening, a dedicated full-screen voice mode
+  (buildable solo, but operator may prefer the cloud swap first).
 - **Operator-only:** email-send stance for voice (hard-disabled — policy call, don't flip unprompted); n8n
   deploy (unblocks FORGE-as-executor); real `mcp-postgres`/`mcp-github` (placeholder images).
 

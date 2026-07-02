@@ -57,14 +57,15 @@ Ranking = leverage (for voice) × effort. Effort: **S** ≈ hours, **M** ≈ ~a 
 5. **#6 routing** + **#7 memory cleanup/disambiguation**.
 6. P2 as the voice layer firms up.
 
-## Status — pre-UI phase COMPLETE + voice UI v1 SHIPPED (2026-06-30, `main` @ `0294803`)
+## Status — pre-UI phase COMPLETE + voice UI v1 SHIPPED + v2 polish SHIPPED (2026-07-01, `main` @ `d201f55`)
 P0 (#1–3), P1 (#4–7), and P2 #8 + #11 are shipped + live. **The voice-first UI v1 itself has shipped**
 (`0294803`): browser Web Speech — 🎤 mic STT, 🔈 spoken-reply toggle (`speakable:true`), barge-in — behind a
-SWAPPABLE wrapper (`apps/cora-ui/src/voice/speech.ts`). Remaining is operator-steered:
+SWAPPABLE wrapper (`apps/cora-ui/src/voice/speech.ts`). **Voice v2 polish shipped (`d201f55`):**
+sentence-chunked TTS (`createSpeechStream` — Cora speaks as the reply streams, not on `done`; barge-in
+silences the queue) + a live interim transcript while listening. Remaining is operator-steered:
 - **Cloud STT/TTS swap** — browser engines are Chromium/Safari-only + variable quality; swap the wrapper
   (needs a provider choice + keys).
-- **Voice v2 polish (buildable solo)** — sentence-chunked TTS (speak as it streams, not on `done`),
-  continuous/wake-word listening, full-screen voice mode, interim-transcript display.
+- **Voice v2 remainder** — continuous/wake-word listening, full-screen voice mode.
 - **#9** email-send stance (policy call — still hard-disabled), **#10** MCP postgres/github (placeholder
   images), **n8n not deployed** (keeps FORGE an inspector, not an n8n executor).
 
