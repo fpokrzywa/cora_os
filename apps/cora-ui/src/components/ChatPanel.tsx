@@ -43,6 +43,8 @@ export function ChatPanel({
   const [screenImage, setScreenImage] = useState<string | null>(null);
   const [capturing, setCapturing] = useState(false);
   const [listening, setListening] = useState(false);
+  // Live in-progress transcript shown while the mic is open.
+  const [interim, setInterim] = useState("");
   const recognizerRef = useRef<Recognizer | null>(null);
   const listRef = useRef<HTMLDivElement>(null);
 
@@ -60,12 +62,15 @@ export function ChatPanel({
     if (sending || speaking) onBargeIn();
     const rec = createRecognizer({
       onFinal: (text) => onSend(text),
+      onInterim: setInterim,
       onEnd: () => {
         setListening(false);
+        setInterim("");
         recognizerRef.current = null;
       },
       onError: () => {
         setListening(false);
+        setInterim("");
         recognizerRef.current = null;
       },
     });
@@ -200,7 +205,17 @@ export function ChatPanel({
 
       {(listening || speaking) && (
         <div className="chat__voice-status">
-          {listening ? "● Listening…" : "🔊 Cora is speaking — tap the mic to interrupt"}
+          {listening ? (
+            interim ? (
+              <>
+                ● <em className="chat__voice-interim">{interim}</em>
+              </>
+            ) : (
+              "● Listening…"
+            )
+          ) : (
+            "🔊 Cora is speaking — tap the mic to interrupt"
+          )}
         </div>
       )}
 

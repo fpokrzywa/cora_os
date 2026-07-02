@@ -1,5 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { speak, cancelSpeech, ttsSupported } from "./voice/speech";
+import {
+  cancelSpeech,
+  createSpeechStream,
+  ttsSupported,
+  type SpeechStream,
+} from "./voice/speech";
 import { Sidebar, type SidebarTab } from "./components/Sidebar";
 import { ChatPanel } from "./components/ChatPanel";
 import { MemoryViewer } from "./components/MemoryViewer";
@@ -49,6 +54,8 @@ export function App() {
   const [speaking, setSpeaking] = useState(false);
   // Tracks the in-flight stream so a barge-in can abort it mid-reply.
   const streamAbortRef = useRef<AbortController | null>(null);
+  // Tracks the incremental TTS queue so a barge-in / new turn can silence it.
+  const speechStreamRef = useRef<SpeechStream | null>(null);
   const [loadingConvo, setLoadingConvo] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [sidebarError, setSidebarError] = useState<string | null>(null);
@@ -231,10 +238,19 @@ export function App() {
         created_at: new Date().toISOString(),
       };
       // A new turn supersedes any reply Cora is still speaking.
+      speechStreamRef.current?.cancel();
+      speechStreamRef.current = null;
       cancelSpeech();
       setSpeaking(false);
       const controller = new AbortController();
       streamAbortRef.current = controller;
+      // Voice mode: speak sentence-by-sentence as the reply streams in, not
+      // after the last token.
+      const speech =
+        voiceMode && ttsSupported()
+          ? createSpeechStream({ onEnd: () => setSpeaking(false) })
+          : null;
+      speechStreamRef.current = speech;
       setMessages((prev) => [...prev, optimisticUser]);
       // Append/extend the trailing assistant bubble as deltas stream in; the
       // bubble is created on the first delta so the typing indicator can show
@@ -264,15 +280,21 @@ export function App() {
             setSessionId(sid);
             setSelectedAgent(agent);
           },
-          onDelta: (text) => appendAssistant(text, false),
+          onDelta: (text) => {
+            appendAssistant(text, false);
+            if (speech) {
+              setSpeaking(true);
+              speech.push(text);
+            }
+          },
           onDone: (res) => {
             setSessionId(res.session_id);
             setSelectedAgent(res.selected_agent);
             appendAssistant(res.response, true);
             refreshConversations();
-            if (voiceMode && ttsSupported()) {
+            if (speech) {
               setSpeaking(true);
-              speak(res.response, { onEnd: () => setSpeaking(false) });
+              speech.finish(res.response);
             }
           },
           onError: (msg) => setError(msg),
@@ -280,6 +302,9 @@ export function App() {
       } catch (err) {
         setError(err instanceof Error ? err.message : "Request failed");
       } finally {
+        // No-op after a normal done/cancel; on an error path it flushes what
+        // streamed and lets onEnd release the speaking state.
+        speech?.finish();
         setSending(false);
         streamAbortRef.current = null;
       }
@@ -291,6 +316,8 @@ export function App() {
   // can talk over her. The backend cleans up the aborted stream.
   const handleBargeIn = useCallback(() => {
     streamAbortRef.current?.abort();
+    speechStreamRef.current?.cancel();
+    speechStreamRef.current = null;
     cancelSpeech();
     setSpeaking(false);
   }, []);

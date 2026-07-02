@@ -789,6 +789,11 @@ button {
   color: var(--muted, #6b7280);
 }
 
+.chat__voice-interim {
+  font-style: italic;
+  color: var(--text, #111827);
+}
+
 .composer__attachment {
   display: flex;
   align-items: center;
