@@ -240,9 +240,17 @@ async def get_chat_context(
         if len(description) > 280:
             description = description[:280].rstrip() + "…"
         lines.append(f"Description: {description}")
+    # Bucketed, not exact: this block sits near the top of EVERY chat prompt,
+    # and vLLM's automatic prefix caching only reuses the KV cache up to the
+    # first changed byte — exact counts (jobs_active flips on every scheduled
+    # job) invalidated the cached prefix all day. Buckets keep the line
+    # byte-stable; the model never needed exact counts here.
+    def _approx(n: int) -> str:
+        return "<10" if n < 10 else f"~{round(n, -1)}"
+
     lines.append(
-        f"Memory: {memory_total} entries ({memory_embedded} embedded). "
-        f"Active plans: {plans_active}. Active jobs: {jobs_active}."
+        f"Memory: {_approx(memory_total)} entries ({_approx(memory_embedded)} embedded). "
+        f"Active plans: {_approx(plans_active)}. Active jobs: {_approx(jobs_active)}."
     )
     if agents:
         lines.append(f"Agents available: {', '.join(agents)}")
