@@ -51,7 +51,7 @@ TOKEN=$(docker exec -e PYTHONPATH=/app cora-api python /tmp/mint_voice_token.py)
 docker exec cora-api rm -f /tmp/mint_voice_token.py
 [ -n "$TOKEN" ] || { echo "token mint failed" >&2; exit 1; }
 echo "token captured (${#TOKEN} chars) — validating against /auth/me"
-docker exec cora-api python - "$TOKEN" <<'PYEOF'
+docker exec -i cora-api python - "$TOKEN" <<'PYEOF'
 import json, sys, urllib.request
 req = urllib.request.Request("http://127.0.0.1:8000/auth/me")
 req.add_header("Authorization", "Bearer " + sys.argv[1])
