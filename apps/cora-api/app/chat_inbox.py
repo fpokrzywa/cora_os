@@ -101,6 +101,14 @@ def detect_inbox_command(message: str) -> Optional[tuple[str, Optional[str]]]:
     # catches "what do I have in my outlook that is unread" too.
     if "unread" in m:
         return ("list_unread", None)
+    # Plain mailbox questions — spoken phrasings that name the mailbox without
+    # a show/list verb ("what's on my email today?", "anything in my inbox?",
+    # "check my email"). Checked LAST so the specific intents above still win.
+    if ("my inbox" in m or "my email" in m or "my emails" in m or "my mail" in m) and (
+        "what's" in m or "whats" in m or "what is" in m or "what do i have" in m
+        or "anything" in m or "any new" in m or "check" in m
+    ):
+        return ("list", None)
     return None
 
 

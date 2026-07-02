@@ -27,17 +27,20 @@ one chat.completion object.
 
 import json
 import logging
+import os
 import re
 import time
 import uuid
 from typing import Annotated, Any, AsyncIterator, Optional
 
+import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from app import llm
 from app.auth import CurrentUser, get_current_user
+from app.config import settings
 from app.routers.chat import ChatRequest, ChatResponse, chat
 from app.speakable import to_speakable
 
@@ -88,8 +91,46 @@ def _needs_voice_rewrite(text: str) -> bool:
     return len(text) > 280
 
 
+# The rewrite is a mechanical transform — the small DGX-local model does it
+# in ~1-2s where the 120B (with hidden reasoning) took ~20s, which pushed
+# voice time-to-first-audio against the browser's 30s no-reply guard.
+_REWRITE_MODEL = os.environ.get("VOICE_REWRITE_MODEL", "cora-qwen3:4b")
+_THINK_RE = re.compile(r"<think>.*?</think>", re.S)
+
+
 async def _voice_rewrite(text: str) -> str:
     """Best-effort spoken-prose rewrite; falls back to to_speakable."""
+    # Fast path: small local model on the DGX Ollama.
+    base = (settings.dgx_model_endpoint or "").rstrip("/")
+    if base:
+        try:
+            async with httpx.AsyncClient(timeout=12.0) as client:
+                resp = await client.post(
+                    f"{base}/api/generate",
+                    json={
+                        "model": _REWRITE_MODEL,
+                        "system": _VOICE_REWRITE_SYSTEM,
+                        # /no_think: qwen3 soft-switch — reasoning off keeps
+                        # latency ~1-2s and the output channel clean.
+                        "prompt": text[:4000] + "\n/no_think",
+                        "stream": False,
+                        "options": {"temperature": 0.3, "num_predict": 350},
+                    },
+                )
+                resp.raise_for_status()
+                out = (resp.json().get("response") or "").strip()
+                out = _THINK_RE.sub("", out).strip()
+                if out:
+                    logger.info(
+                        "voice rewrite (fast %s): %s -> %s chars",
+                        _REWRITE_MODEL, len(text), len(out),
+                    )
+                    return out
+        except Exception:
+            logger.warning(
+                "fast voice rewrite failed; trying the chat backend",
+                exc_info=True,
+            )
     try:
         rewritten = await llm.generate_text(
             text[:4000],
