@@ -4297,6 +4297,10 @@ if (settingsBtn) {
   const AUTO_CLOSE_DEFAULT_MS = 3000;
   let autoCloseTimer = null;
   let hasSpokenOnce  = false;
+  // True while a user utterance is awaiting Cora's reply (set from the local
+  // mic level in the level loop) — suppresses the auto-close so a barge-in
+  // follow-up isn't cut off during her thinking time.
+  let pendingTurn    = false;
 
   // cora-ui2 addition: the auto-close above only arms AFTER Cora's first
   // reply — if she never says anything (pipeline down, or the user goes
@@ -4371,6 +4375,31 @@ if (settingsBtn) {
     // is via the <audio> element's srcObject (auto via WebRTC), and
     // wiring the AudioContext to destination would double the audio.
 
+    // cora-ui2 addition: a second analyser on the LOCAL mic. The auto-close
+    // timer used to hear only Cora's side, so a barge-in (her audio stops,
+    // the user is mid-question) started the close countdown and killed the
+    // session before her reply could arrive. The mic capture is browser
+    // echo-cancelled, so this level tracks the USER: while they're talking —
+    // and until Cora answers (a turn "in flight") — the session stays open.
+    let micAnalyser = null;
+    let micLevelBuf = null;
+    try {
+      if (micStream) {
+        const micSrc = audioCtx.createMediaStreamSource(micStream);
+        micAnalyser = audioCtx.createAnalyser();
+        micAnalyser.fftSize = 512;
+        micAnalyser.smoothingTimeConstant = 0.4;
+        micSrc.connect(micAnalyser);
+        micLevelBuf = new Float32Array(micAnalyser.fftSize);
+      }
+    } catch (err) {
+      console.warn('[voice] mic analyser unavailable; auto-close is Cora-side only', err);
+    }
+    // A user turn that never gets a reply shouldn't hold the session open
+    // forever — after this cap, normal close behavior resumes.
+    const PENDING_TURN_CAP_MS = 45000;
+    let pendingTurnAt = 0;
+
     levelBuf = new Float32Array(analyser.fftSize);
     let lastSpeakAt = 0;
 
@@ -4392,18 +4421,39 @@ if (settingsBtn) {
       // Speaking detector: above threshold for any frame keeps us in
       // "speaking" state; 250 ms of silence drops back to listening.
       const SPEAK_THRESH = 0.04;
+
+      // User-side detector: the user talking marks a turn in flight and
+      // holds the auto-close open through Cora's thinking time.
+      if (micAnalyser && listening && micStream &&
+          micStream.getAudioTracks().some((t) => t.enabled)) {
+        micAnalyser.getFloatTimeDomainData(micLevelBuf);
+        let msum = 0;
+        for (let i = 0; i < micLevelBuf.length; i++) {
+          const v = micLevelBuf[i];
+          msum += v * v;
+        }
+        const micLevel = Math.min(1, Math.sqrt(msum / micLevelBuf.length) * 6);
+        if (micLevel > SPEAK_THRESH) {
+          pendingTurn = true;
+          pendingTurnAt = now;
+          clearAutoClose();
+        } else if (pendingTurn && now - pendingTurnAt > PENDING_TURN_CAP_MS) {
+          pendingTurn = false; // no reply ever came — let the timers work
+        }
+      }
+
       if (level > SPEAK_THRESH) {
         lastSpeakAt = now;
         if (!hasSpokenOnce) { hasSpokenOnce = true; clearIdleGuard(); }
+        pendingTurn = false; // Cora is answering — the turn landed
         document.documentElement.dataset.voiceState = 'speaking';
         // Cora is talking — cancel any pending auto-close.
         clearAutoClose();
       } else if (now - lastSpeakAt > 250) {
         document.documentElement.dataset.voiceState = listening ? 'listening' : 'idle';
-        // Schedule auto-close once we've heard Cora speak at least
-        // once and she's now silent. Re-arming each silence transition
-        // is fine — scheduleAutoClose clears the previous one first.
-        if (hasSpokenOnce && listening && !autoCloseTimer) {
+        // Schedule auto-close once the CONVERSATION is idle: Cora has
+        // spoken, she's silent now, and no user turn is awaiting a reply.
+        if (hasSpokenOnce && listening && !autoCloseTimer && !pendingTurn) {
           scheduleAutoClose();
         }
       }
@@ -4595,6 +4645,7 @@ if (settingsBtn) {
     stopLevelLoop();
     clearAutoClose();
     hasSpokenOnce = false;
+    pendingTurn = false;
     if (pc) {
       try { pc.close(); } catch {}
       pc = null;
@@ -4631,12 +4682,14 @@ if (settingsBtn) {
     clearAutoClose();
     clearIdleGuard();
     hasSpokenOnce = false;
+    pendingTurn = false;
     document.documentElement.dataset.voiceState = 'idle';
   }
 
   function exitIdle() {
     setMicEnabled(true);
     hasSpokenOnce = false;
+    pendingTurn = false;
     armIdleGuard();
     document.documentElement.dataset.voiceState = 'listening';
     // Resume playback on the inbound audio element — enterIdle paused
