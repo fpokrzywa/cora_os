@@ -38,6 +38,7 @@ from app.routers import (
     mcp_admin,
     memory,
     oauth,
+    openai_compat,
     plans,
     provider_connectors,
     provider_execution,
@@ -122,6 +123,7 @@ app.include_router(auth.router)
 app.include_router(chat.router, dependencies=_auth_required)
 app.include_router(conversations.router, dependencies=_auth_required)
 app.include_router(ui_prefs.router, dependencies=_auth_required)
+app.include_router(openai_compat.router, dependencies=_auth_required)
 app.include_router(tools.router, dependencies=_auth_required)
 app.include_router(memory.router, dependencies=_auth_required)
 app.include_router(plans.router, dependencies=_auth_required)
